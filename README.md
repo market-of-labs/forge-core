@@ -111,10 +111,10 @@ git tag v0.1.0 && git push origin v0.1.0
 - **不推分支不影响线上。** 公有的运行器浮动取 latest，所以"哪次发布生效"完全由
   tag 决定，而不是由 push 决定。
 
-`build.yml` 里三个 action 都是**钉 commit SHA** 的（不是 `@v7`）。理由与上面那条规矩
-同源：这个 job 的产物会被带到能写 `store` 的 PAT 下执行，所以"上游往 `v7` 这个 tag 上
-推了什么"必须是一个**不会自己变**的事实。`.github/dependabot.yml` 每周开一个 PR 同时
-升 SHA 与它末尾的 `# vX.Y.Z` 注释 —— 钉 SHA 之后靠它保持不腐。Dependabot 只开 PR，
+`build.yml` 里三个 action 用的都是**主版本标签**（`@v7` / `@v3`），不钉 commit SHA ——
+所以 `.github/dependabot.yml` 每周开一个 PR 帮你跟新主版本，那也是这个取舍的配套：
+钉 SHA 更抗供应链，但每次升级都要人工去查 SHA，而 SHA 写错是**静默的**（没有任何
+东西会告诉你它指到了别处），少一道人工就多一道自动。Dependabot 只开 PR，
 **不合并、不打 tag**，所以线上仍然只由你的 tag 改变；本仓库的 workflow 又只在打 tag
 时触发，它开的 PR 跑不起来任何东西，**不花分钟数**。
 
@@ -176,8 +176,9 @@ go test ./...
 
 ## 加固
 
-触发面白名单、加固清单（十条）、凭据规格、部署前置检查 —— 都在公有仓库
+触发面白名单、加固清单、凭据规格、部署前置检查 —— 都在公有仓库
 `market-of-labs/forge` 的 README 里。本仓库额外两条：
 
 - **tag 与二进制一一对应**（上面「发布」）—— 挡住"生产代码变了而 tag 没变"。
-- **build 用的 action 钉 commit SHA**（上面「发布」）—— 挡住同一条风险的依赖侧变体。
+- **build 用的 action 不带 `# vX.Y.Z` 之类的 SHA 注释**，一律主版本标签 —— 升级靠
+  Dependabot 开 PR，人只做 review（上面「发布」）。

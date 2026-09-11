@@ -35,16 +35,16 @@ jobs:
       GOARCH: amd64
       ASSET: forge-linux-amd64
     steps:
-      # 这两个 action 钉到 commit SHA，而不是 `@v7`。理由与下面那道"一个 tag 一个
-      # 二进制"的闸门是同一条：这个 job 的产物会被带到能写 store 的 PAT 下执行，
-      # 所以"上游往 v7 这个 tag 上推了什么"必须是一个**不会自己变**的事实。SHA 是
-      # 不变的，tag 不是。末尾的 `# vX.Y.Z` 注释是给 Dependabot 认版本用的。
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # 这三个 action 都用**主版本标签**（`@v7` / `@v3`），不钉 commit SHA：
+      # 钉 SHA 更抗供应链（上游往 `v7` 上重推什么都不会影响到我们），但每一次升级
+      # 都要人工去查 SHA，而 SHA **写错是静默的** —— 没有任何东西会告诉你它指到了
+      # 别处。取舍是有意的：用版本，升级交给 `.github/dependabot.yml` 每周开 PR。
+      - uses: actions/checkout@v7
         with:
           # 本 job 后续不再需要 git 凭据（发布走 `gh` + `GH_TOKEN`），所以不落盘。
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -80,7 +80,7 @@ jobs:
       # 下"文件没找到"会**绿着**产出一个没有 asset 的 Release —— 那种"成功但空"，
       # 正是本仓库最不想要的结果。
       - name: Publish
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@v3
         with:
           # 显式写成 github.ref_name（= 本 job 的 tag），不吃 action 的默认值：默认值
           # 恰好也是它，但"恰好相同"不是契约。

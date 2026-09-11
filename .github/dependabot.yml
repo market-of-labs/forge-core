@@ -1,8 +1,8 @@
 version: 2
 
 # 两个仓库需要这个文件：
-#   - 本仓库（`forge-core`）：build.yml 里两个 action 钉 SHA + go.mod 依赖；
-#   - `store`：forward.yml 里 `actions/github-script` 钉 SHA（它自己那一份在
+#   - 本仓库（`forge-core`）：build.yml 里三个 action + go.mod 依赖；
+#   - `store`：forward.yml 里 `actions/github-script`（它自己那一份在
 #     store/.github/dependabot.yml —— 依赖在哪，升级就该配在哪）。
 #
 # 公有的 `forge` 三个 workflow 仍然一个 `uses:` 都没有（只跑 `gh` CLI 与它自己
@@ -15,8 +15,8 @@ version: 2
 # 也**不花 Actions 分钟数**：本仓库的 workflow 只在 `push: tags: ['v*']` 触发，
 # Dependabot 开的 PR 是普通 PR，跑不起来任何东西。
 updates:
-  # action 的版本是钉 SHA 的（见 build.yml），Dependabot 认末尾那行
-  # `# vX.Y.Z` 注释，会同时升 SHA 和注释 —— 这正是钉 SHA 之后还能保持不腐的方式。
+  # action 用的是主版本标签（`@v7` / `@v3`，见 build.yml），这个 update 就是
+  # 跟新主版本用的 —— 也是"不钉 SHA"这个取舍的配套：少一道人工，多一道自动。
   - package-ecosystem: github-actions
     directory: /
     schedule:

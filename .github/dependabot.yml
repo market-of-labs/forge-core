@@ -1,12 +1,15 @@
 version: 2
 
-# 两个仓库需要这个文件：
+# 三个仓库需要这个文件（依赖在哪，升级就该配在哪）：
 #   - 本仓库（`forge-core`）：build.yml 里三个 action + go.mod 依赖；
 #   - `store`：forward.yml 里 `actions/github-script`（它自己那一份在
-#     store/.github/dependabot.yml —— 依赖在哪，升级就该配在哪）。
+#     store/.github/dependabot.yml）；
+#   - 公有的 `forge`：取执行体那个 action（`robinraju/release-downloader@v1`，
+#     它自己那一份在 forge/.github/dependabot.yml）。
 #
-# 公有的 `forge` 三个 workflow 仍然一个 `uses:` 都没有（只跑 `gh` CLI 与它自己
-# 拉下来的二进制），所以那边没有可升级的东西，不需要这个文件。
+# `forge` 那边长期是"一个 `uses:` 都没有"（只跑 `gh` CLI 与它自己拉下来的二进制），
+# 取件换成 action 之后才有了这第一个、也是唯一一个依赖 —— 用的是主版本标签，所以
+# 那边从此也需要一份。
 #
 # 为什么 Dependabot 在这里不会破坏"打 tag = 上生产"：它只**开 PR**，不合并、不
 # 打 tag。合并一个 PR 只改源码，线上那份二进制仍然是上一个 tag 的产物 —— 要生效

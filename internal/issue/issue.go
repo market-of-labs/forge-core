@@ -8,17 +8,20 @@
 //
 // 表单正文（`.github/ISSUE_TEMPLATE/*.yml`）被 GitHub 渲染成这样的 markdown：
 //
-//	### 应用包名（appId）
+//	### 上游 GitHub 仓库
 //
-//	dev.imranr.obtainium
+//	ImranR98/Obtainium
 //
-//	### 显示名
+//	### 分类标签（可选）
 //
-//	Obtainium
+//	- [X] 工具
+//	- [ ] 效率
 //
 // 要点：
 //   - 标题行是 `### ` + 表单里的 **label**（不是 id！id 不出现在正文里）。
 //   - 未填的可选字段渲染成 `_No response_`，语义等于"空"。
+//   - `checkboxes` 字段渲染成**一整张任务列表**（勾中的 `- [X]`、未勾的 `- [ ]`），
+//     不是"只列出勾中的那几个" —— 取值走 Checked，不能走 List。
 //   - 用户在正文里可以随手改任何东西 —— 包括伪造出重复的 `### 应用包名（appId）`。
 //     所以这里的取值规则必须**确定**：同一个 label 出现多次时取**第一个**非空值，
 //     并把重复这件事报出来（见 Duplicates），而不是随便挑一个。
@@ -40,6 +43,17 @@ const noResponse = "_No response_"
 // 不认 `#### ` 之外的任意标题层级：issue 正文里用户自己写的 `# 标题` 很常见，
 // 把它当成字段会让取值莫名其妙地错位。
 var heading = regexp.MustCompile(`(?m)^#{2,4}[ \t]+(.+?)[ \t]*$`)
+
+// checkboxItem 匹配 checkboxes 字段里的一项。
+//
+// **不锚定行首**，因为 cleanValue 已经把换行折叠成空格了：到这里的值长这样
+//
+//   - [X] arm64-v8a - [ ] armeabi-v7a - [X] universal
+//
+// 锚定 `^` 只会取到第一项。所以改成认 `[X]` 这个标记本身，再取紧跟其后的一个词。
+// 代价是**选项标签不能含空格**（`[^\s\]]+` 会在空格处停）—— 这正是
+// `TestTemplateVocabularyMatchesGo` 顺带断言"选项里没有空格"的原因。
+var checkboxItem = regexp.MustCompile(`\[([xX ])\]\s*([^\s\]]+)`)
 
 // Form 是一份解析好的 issue 正文。
 type Form struct {
@@ -157,6 +171,26 @@ func (f *Form) List(labels ...string) []string {
 	for _, p := range parts {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// Checked 取一个 checkboxes 字段里**被勾中**的项，按出现顺序。
+//
+// 与 List 的区别：List 切分隔符，只管"用户写了什么字"；这里认的是 GitHub 渲染
+// 出来的勾选标记，所以用户没法靠打字伪造出没勾的项。返回 nil 表示"一项都没勾"
+// —— 调用方把这个状态解释成"没限制"（与模板里"一个都不勾 = 全部"的文案一致）。
+func (f *Form) Checked(labels ...string) []string {
+	raw := f.Get(labels...)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, m := range checkboxItem.FindAllStringSubmatch(raw, -1) {
+		// m[1] 是勾选标记：`x`/`X` 为勾中，空格为未勾。
+		if m[1] != " " {
+			out = append(out, m[2])
 		}
 	}
 	return out

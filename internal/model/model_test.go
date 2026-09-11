@@ -3,6 +3,7 @@ package model_test
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/market-of-labs/forge-core/internal/model"
 )
@@ -611,5 +612,75 @@ func TestSentinelURL(t *testing.T) {
 	}
 	if !strings.Contains(got, ".invalid") {
 		t.Error("哨兵地址必须用 .invalid 保留 TLD")
+	}
+}
+
+// ---- desc：显示名拼接与长度上限（D42）--------------------------------------
+
+// TestDisplayName 钉住清单里的显示名怎么拼。
+//
+// 拼法在 **manifest 合成时**才生效，`sources/` 里两者始终分开存 ——
+// 这正是"以后改分隔符不用重写数据"的前提，所以这里连"没简介时不出现光秃秃的
+// 分隔符"一起钉住（`Foo · ` 这种尾巴在列表里看起来就是个 bug）。
+func TestDisplayName(t *testing.T) {
+	withDesc := model.Source{Name: "Obtainium", Desc: "应用更新器"}
+	if got, want := withDesc.DisplayName(), "Obtainium · 应用更新器"; got != want {
+		t.Errorf("DisplayName = %q，期望 %q", got, want)
+	}
+	bare := model.Source{Name: "Obtainium"}
+	if got := bare.DisplayName(); got != "Obtainium" {
+		t.Errorf("没简介时 DisplayName = %q，期望就是 Name 本身", got)
+	}
+}
+
+// TestTruncateDescIsRuneSafe 是"不许按 byte 切"的落地检查。
+//
+// 按 byte 切会把一个汉字劈成半个，结果是**非法 UTF-8** —— 到了客户端那边
+// 是一串替换字符，而 JSON 编码会把它转义成 �，肉眼在 diff 里根本看不出来。
+func TestTruncateDescIsRuneSafe(t *testing.T) {
+	got := model.TruncateDesc(strings.Repeat("汉", model.MaxDescRunes+10))
+	if !utf8.ValidString(got) {
+		t.Fatalf("裁出来的不是合法 UTF-8：%q", got)
+	}
+	if n := len([]rune(got)); n != model.MaxDescRunes {
+		t.Fatalf("裁成 %d 个字，期望 %d", n, model.MaxDescRunes)
+	}
+
+	// 边界：正好等于上限时一个都不动。
+	exact := strings.Repeat("汉", model.MaxDescRunes)
+	if model.TruncateDesc(exact) != exact {
+		t.Error("正好等于上限时不该被改动")
+	}
+	// 空白：模板的输入框很容易多带一个空格，而它在列表里表现为"两个空格"。
+	if got := model.TruncateDesc("  去广告  "); got != "去广告" {
+		t.Errorf("首尾空白没去掉：%q", got)
+	}
+}
+
+// TestSourceValidateRejectsBadDesc 钉住**手改文件**这条路上的把关。
+//
+// issue 那条路是"裁而不拒"（往返一天，字段纯装饰）；手改文件这条路不是 ——
+// 改的人就在本地，一条立刻报出来的错误比一个被悄悄改短的值有用得多。
+func TestSourceValidateRejectsBadDesc(t *testing.T) {
+	base := model.Source{
+		ID: "com.example.app", Name: "App", Author: "Org", Source: model.SourceManual,
+	}
+
+	tooLong := base
+	tooLong.Desc = strings.Repeat("长", model.MaxDescRunes+1)
+	if err := tooLong.Validate("com.example.app.json"); err == nil {
+		t.Error("超过上限的 desc 该被拒绝")
+	}
+
+	multiline := base
+	multiline.Desc = "第一行\n第二行"
+	if err := multiline.Validate("com.example.app.json"); err == nil {
+		t.Error("含换行的 desc 该被拒绝（它在客户端是单行标题的一部分）")
+	}
+
+	ok := base
+	ok.Desc = strings.Repeat("长", model.MaxDescRunes)
+	if err := ok.Validate("com.example.app.json"); err != nil {
+		t.Errorf("正好等于上限的 desc 该通过：%v", err)
 	}
 }

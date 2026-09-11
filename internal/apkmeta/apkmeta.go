@@ -34,7 +34,17 @@ type Meta struct {
 	// ABIs 是 APK 内 lib/<abi>/ 出现过的架构目录名（已排序、去重）。
 	// 它不是"支持的 ABI"的权威声明（manifest 里没有这个东西），而是**包里实际带了哪些 native 库**。
 	ABIs []string
+	// Label 是 application/@android:label 解析出来的值，也就是**用户看到的那个应用名**。
+	//
+	// 它是 03 §2.6 "显示名由对账从 APK 派生"那条的落地处 —— 申请人不填显示名，
+	// 就靠这个读出来。取值可能为空（见 HasLabel），调用方要能接住。
+	Label string
 }
+
+// HasLabel 报告 Label 可用。空 label 是真实存在的：属性缺失，或属性是
+// `@string/app_name` 而这个 APK 里没有 resources.arsc 可供解引用
+// （androidbinary 那条路会返回 error，我们按 error 归成空）。
+func (m Meta) HasLabel() bool { return m.Label != "" }
 
 // HasVersionCode 报告 versionCode 可用。
 //
@@ -133,6 +143,15 @@ func ReadZip(r io.ReaderAt, size int64) (*Meta, error) {
 	}
 	if vn, err := mf.VersionName.String(); err == nil {
 		m.VersionName = vn
+	}
+	// label 与上面两个不同：**它的失败是常态而非异常**。`@string/app_name` 是最常见的
+	// 写法，能解出来是因为 OpenZipReader 顺手读了 resources.arsc；包小到没带 arsc 的
+	// 少数情况解不出来，那就留空 —— 由 HasLabel 兜住，调用方退到仓库名。
+	//
+	// 不去 attempt 任何"猜名字"的兜底：一个猜出来的显示名会被写进 sources/ 当成事实，
+	// 而它后面还挂着 tag、Release、设备上那一行的标题。空着退回仓库名至少是诚实的。
+	if lb, err := p.Label(nil); err == nil {
+		m.Label = strings.TrimSpace(lb)
 	}
 	return m, nil
 }

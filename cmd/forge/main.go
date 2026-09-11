@@ -238,6 +238,17 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 		}
 		return exitFailed, nil
 
+	case "scan-pending":
+		// 单独的动词：对账会顺手跑它（因为刚收录的来源要立刻被镜像），
+		// 但"只收单、不镜像"是排查时最想要的那一步 —— 它只碰 issue 与 sources/。
+		pr, err := job.ScanPendingIssues(ctx, c)
+		if err != nil {
+			return exitFailed, err
+		}
+		log("收录 %d 个（%v），待补充 %d 张单，跳过 %d 张",
+			len(pr.Landed), pr.Landed, len(pr.Held), len(pr.Skipped))
+		return exitFailed, nil
+
 	case "commit-back":
 		fs := newFlagSet(verb)
 		msg := fs.String("m", "手工回写", "提交信息（会自动追加 [skip-dispatch]）")
@@ -269,14 +280,15 @@ func newFlagSet(name string) *flag.FlagSet {
 // 一份每次顺序都不同的帮助文本没法被 diff、也没法被文档引用。
 var verbDoc = []struct{ name, doc string }{
 	{"handle-dispatch", "按 client_payload.event 分派（03 §4.3）。CI 的入口"},
-	{"intake-issue", "读 issue → 校验 → 写 sources/{appId}.json → 回评并关闭（§2.5）"},
+	{"intake-issue", "读 issue → 校验 → 变更单写 sources/{appId}.json、新增单只登记待扫（§2.5）"},
 	{"intake-incoming", "搬 _incoming 的 asset 到正式 Release 并清场（§3.2 / §4.6）"},
 	{"resolve-upstream", "只算出该镜像哪些版本，打印计划（不下载不上传）"},
 	{"mirror-upstream", "下载 → 按内容判 ABI → 改名 → 幂等上传（§4.4 第 3 步）"},
 	{"build-index", "从 Release 现状重建 store/index.json（§5.2）"},
 	{"build-manifest", "由 sources + index + endpoints 合成 apps.json（§5.1）"},
 	{"check-manifest", "对 apps.json 跑 02 §2.8 自检 + 阈值告警（§5.3）"},
-	{"reconcile", "幂等全量对账：解析 → 镜像 → 重建 → 回写（§4.4）"},
+	{"scan-pending", "扫「待收录/待补充」的 issue → 去上游读出身份 → 收录并关单（§2.5.1 拍 2）"},
+	{"reconcile", "幂等全量对账：收单 → 解析 → 镜像 → 重建 → 回写（§4.4）"},
 	{"commit-back", "把工作副本的改动按固定路径提交并推送（§5.5，自动加 [skip-dispatch]）"},
 	{"verbs", "列出全部子命令（供脚本消费）"},
 	{"help", "显示这份帮助"},

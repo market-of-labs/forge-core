@@ -199,24 +199,25 @@ func (s *Source) Validate(fileName string) error {
 	if s.Author == "" {
 		return fmt.Errorf("author 为空")
 	}
+	// desc 是可选字段，但**手改文件这条入口必须自己把关**：issue 那条路会在
+	// 解析时先裁到上限（issue 里不能拒，见 TruncateDesc），这里若也不管，
+	// 一个手写的超长 desc 会一路拼进清单，把列表标题挤成省略号。
+	if n := len([]rune(s.Desc)); n > MaxDescRunes {
+		return fmt.Errorf("desc 有 %d 个字，超过上限 %d（02 §2.3）—— "+
+			"它在客户端是列表标题的一部分，长了就显示不全", n, MaxDescRunes)
+	}
+	if strings.ContainsAny(s.Desc, "\r\n") {
+		return fmt.Errorf("desc 含换行符 —— 它在客户端是**单行**列表标题的一部分，" +
+			"换行不会渲染成两行而是被吞掉")
+	}
 
 	switch s.Source {
 	case SourceGitHub:
 		if s.Upstream == nil {
 			return fmt.Errorf("source=github 时 upstream 必填")
 		}
-		if s.Upstream.Type != UpstreamGitHubRelease {
-			return fmt.Errorf("upstream.type = %q，v1 只支持 %q", s.Upstream.Type, UpstreamGitHubRelease)
-		}
-		if err := validateRepoSlug(s.Upstream.Repo); err != nil {
-			return fmt.Errorf("upstream.repo：%w", err)
-		}
-		if s.Upstream.AssetPattern != "" {
-			// 提前在配置读取期就把正则编译一次：留到遍历上游时才发现写错，
-			// 会在"某个上游恰好发版"时才炸，排查成本高得多。
-			if _, err := compilePattern(s.Upstream.AssetPattern); err != nil {
-				return fmt.Errorf("upstream.assetPattern：%w", err)
-			}
+		if err := s.Upstream.Validate(); err != nil {
+			return err
 		}
 	case SourceManual:
 		if s.Upstream != nil {
@@ -233,6 +234,28 @@ func (s *Source) Validate(fileName string) error {
 	for _, a := range s.ABIWhitelist {
 		if !naming.IsABI(a) {
 			return fmt.Errorf("abiWhitelist 里的 %q 不在固定集 %v 内", a, naming.ABISet)
+		}
+	}
+	return nil
+}
+
+// Validate 检查一个 github 上游自身，**不涉及 appId 与文件名**。
+//
+// 从 Source.Validate 里抽出来是为了让"还没有 appId 的那半条申请"也能复用同一批规则：
+// issue 新增单里申请人只填 repo，id 要等对账从 APK 里读出来，而此刻
+// `ID == ""` 会让 Source.Validate 直接判失败。规则只写一遍，两条入口才不可能漂移。
+func (u *Upstream) Validate() error {
+	if u.Type != UpstreamGitHubRelease {
+		return fmt.Errorf("upstream.type = %q，v1 只支持 %q", u.Type, UpstreamGitHubRelease)
+	}
+	if err := validateRepoSlug(u.Repo); err != nil {
+		return fmt.Errorf("upstream.repo：%w", err)
+	}
+	if u.AssetPattern != "" {
+		// 提前在配置读取期就把正则编译一次：留到遍历上游时才发现写错，
+		// 会在"某个上游恰好发版"时才炸，排查成本高得多。
+		if _, err := compilePattern(u.AssetPattern); err != nil {
+			return fmt.Errorf("upstream.assetPattern：%w", err)
 		}
 	}
 	return nil

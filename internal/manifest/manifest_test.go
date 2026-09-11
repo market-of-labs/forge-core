@@ -274,6 +274,29 @@ func TestBuild_EmptyCategoriesIsArrayNotNull(t *testing.T) {
 	}
 }
 
+// TestBuild_DescIsAppendedToName 是 desc 的**唯一**消费点（D42）。
+//
+// sources/ 里 desc 始终是独立字段，只有到了清单这一层才拼进 name ——
+// 所以"改了分隔符不用重写数据"这句话对不对，全看这一条。
+func TestBuild_DescIsAppendedToName(t *testing.T) {
+	s := source("com.example.app")
+	s.Desc = "去广告的第三方客户端"
+	m, _ := build(t, []model.Source{s},
+		indexOf(appOf("com.example.app", version("1.0", 1, "", asset("universal")))))
+
+	want := "Example App · 去广告的第三方客户端"
+	if got := m.Apps[0].Name; got != want {
+		t.Fatalf("清单里的 name = %q，期望 %q", got, want)
+	}
+
+	// 没简介的条目不该多出一个孤零零的分隔符。
+	m2, _ := build(t, []model.Source{source("com.example.app")},
+		indexOf(appOf("com.example.app", version("1.0", 1, "", asset("universal")))))
+	if got := m2.Apps[0].Name; got != "Example App" {
+		t.Fatalf("没填简介时 name = %q，期望就是原始显示名", got)
+	}
+}
+
 // latestVersion 存的是 APK 的**原始** versionName，而 apkUrls 里的 token 是清洗后的
 // —— 两者在 versionName 含空白时必须都保留下来（03 §5.1）。
 func TestBuild_LatestVersionIsRawVersionName(t *testing.T) {

@@ -61,11 +61,11 @@ func withFields(base, extra [][2]string) [][2]string {
 }
 
 // addBody 是一份**合法**的新增申请，extra 用来覆盖已有字段或追加新字段。
-func addBody(appID string, extra ...[2]string) string {
+//
+// 只有 repo 是必填的（03 §2.6）：包名/显示名/作者都被从模板里删掉了，
+// 它们由对账阶段从 APK 里读出来 —— 所以这份"合法"的最小形态就是这么短。
+func addBody(extra ...[2]string) string {
 	base := [][2]string{
-		{issue.LabelAppID, appID},
-		{issue.LabelName, "Example App"},
-		{issue.LabelAuthor, "Example Org"},
 		{issue.LabelRepo, "example/app"},
 	}
 	return form(withFields(base, extra)...)
@@ -136,21 +136,40 @@ func mustAccept(t *testing.T, d *IntakeDecision) {
 	}
 }
 
+// mustPending 是新增申请唯一的通过形态（03 §2.6）：受理、登记、**不写文件**。
+//
+// 它顺带把所有"新增单会落盘"的回归都挡住：Pending 为真时 ID 必然是空的，
+// 而写一个 ID 为空的来源文件会覆盖掉 `sources/.json`。
+func mustPending(t *testing.T, d *IntakeDecision) {
+	t.Helper()
+	mustAccept(t, d)
+	if !d.Pending {
+		t.Fatalf("新增申请应当是 Pending（等对账去上游读身份）：\n%s", d.Reply)
+	}
+	if d.Source == nil || d.Source.ID != "" {
+		t.Fatalf("Pending 的申请不该带 appId（它还没被读出来）：%+v", d.Source)
+	}
+	if !d.Hold {
+		t.Fatal("Pending 的单必须留在打开状态 —— 关掉它，队列就丢了这张单")
+	}
+	if d.Kind != issue.KindAdd {
+		t.Fatalf("Kind = %v，期望 KindAdd", d.Kind)
+	}
+}
+
 // ---- 新增 -------------------------------------------------------------------
 
 func TestDecideIntake_AddAccepted(t *testing.T) {
 	c := ctxWith()
-	d := DecideIntake(c, addBody("com.example.newapp",
+	d := DecideIntake(c, addBody(
 		[2]string{issue.LabelAssetPat, `(?i)release\.apk$`},
-		[2]string{issue.LabelCategories, "工具, 效率"},
-		[2]string{issue.LabelABIs, "arm64-v8a、armeabi-v7a"},
+		// 勾选项的真实形状：**所有**选项都在，勾中的是大写 X。
+		[2]string{issue.LabelCategories, "- [X] 工具 - [ ] 效率 - [X] 媒体 - [ ] 通讯 - [ ] 开发 - [ ] 游戏 - [ ] 其他"},
+		[2]string{issue.LabelABIs, "- [X] arm64-v8a - [X] armeabi-v7a - [ ] x86_64 - [ ] x86 - [ ] universal"},
 	))
-	mustAccept(t, d)
+	mustPending(t, d)
 
 	s := d.Source
-	if s.ID != "com.example.newapp" || s.Name != "Example App" || s.Author != "Example Org" {
-		t.Fatalf("基本字段没落对：%+v", s)
-	}
 	// 新增一律是 github 源（§2.2：manual 没有"申请"这个动作）。
 	if s.Source != model.SourceGitHub {
 		t.Fatalf("新增来源的 source 必须是 %q，得到 %q", model.SourceGitHub, s.Source)
@@ -161,8 +180,7 @@ func TestDecideIntake_AddAccepted(t *testing.T) {
 	if s.Upstream.AssetPattern != `(?i)release\.apk$` {
 		t.Fatalf("资产正则没带上：%q", s.Upstream.AssetPattern)
 	}
-	// 中英文逗号/顿号都是分隔符（表单说明写的是"逗号分隔"，中文输入法下全角太常见）。
-	if !reflect.DeepEqual(s.Categories, []string{"工具", "效率"}) {
+	if !reflect.DeepEqual(s.Categories, []string{"工具", "媒体"}) {
 		t.Fatalf("分类解析错了：%v", s.Categories)
 	}
 	if !reflect.DeepEqual(s.ABIWhitelist, []string{"arm64-v8a", "armeabi-v7a"}) {
@@ -172,17 +190,61 @@ func TestDecideIntake_AddAccepted(t *testing.T) {
 	if s.Paused {
 		t.Fatal("新增的条目不该是 paused")
 	}
+	// 回评必须请申请人**核对**读出来的身份：仓库填错会静默收错应用，
+	// 而那条回评是唯一的发现机会（03 §2.6）。
+	if !strings.Contains(d.Reply, "核对") {
+		t.Fatalf("回评里没有请申请人核对身份：\n%s", d.Reply)
+	}
 }
 
 // `_No response_` 是 GitHub 对"可选字段留空"的渲染结果，必须等价于空。
+// TestDecideIntake_AddDescIsTruncatedNotRejected 钉住简介的**裁而不拒**（D42）。
+//
+// 上限是量出来的（model.MaxDescRunes）：它进的是 Obtainium 列表的标题行，
+// 那行是单行 + 省略号。之所以裁而不拒 —— 这个字段纯装饰，而新增单一次往返是
+// 一天（03 §2.5.1 两拍），为一个简介让人重填一整天不成比例。
+//
+// 但回评必须**说出被裁了**：默默切掉申请人写的东西、还回一句"已收到"，
+// 是这套流程里最难被发现的那种假回评（只有对账落盘时才看得见差别）。
+func TestDecideIntake_AddDescIsTruncatedNotRejected(t *testing.T) {
+	c := ctxWith()
+	long := strings.Repeat("很", model.MaxDescRunes+8)
+
+	d := DecideIntake(c, addBody([2]string{issue.LabelDesc, long}))
+	mustPending(t, d)
+	if n := len([]rune(d.Source.Desc)); n != model.MaxDescRunes {
+		t.Fatalf("简介该被裁到 %d 个字，得到 %d 个字：%q", model.MaxDescRunes, n, d.Source.Desc)
+	}
+	if !strings.Contains(d.Reply, "截断") {
+		t.Errorf("裁过却没在回评里说：\n%s", d.Reply)
+	}
+
+	// 不超限：原样保留（只去首尾空白），且不该冒出"被裁了"的噪音。
+	d2 := DecideIntake(c, addBody([2]string{issue.LabelDesc, "  去广告的第三方客户端  "}))
+	mustPending(t, d2)
+	if d2.Source.Desc != "去广告的第三方客户端" {
+		t.Fatalf("首尾空白该去掉：%q", d2.Source.Desc)
+	}
+	if strings.Contains(d2.Reply, "截断") {
+		t.Errorf("没超限却说被截断了：\n%s", d2.Reply)
+	}
+
+	// 留空 = 没有简介，清单里就只有应用名，不该出现一个空的分隔符。
+	d3 := DecideIntake(c, addBody())
+	mustPending(t, d3)
+	if d3.Source.Desc != "" || d3.Source.DisplayName() != d3.Source.Name {
+		t.Fatalf("没填简介时不该改变显示名：desc=%q name=%q", d3.Source.Desc, d3.Source.DisplayName())
+	}
+}
+
 func TestDecideIntake_AddOptionalFieldsLeftBlank(t *testing.T) {
 	c := ctxWith()
-	d := DecideIntake(c, addBody("com.example.newapp",
+	d := DecideIntake(c, addBody(
 		[2]string{issue.LabelAssetPat, "_No response_"},
 		[2]string{issue.LabelCategories, "_No response_"},
 		[2]string{issue.LabelABIs, "_No response_"},
 	))
-	mustAccept(t, d)
+	mustPending(t, d)
 
 	s := d.Source
 	if s.Upstream.AssetPattern != "" {
@@ -191,32 +253,42 @@ func TestDecideIntake_AddOptionalFieldsLeftBlank(t *testing.T) {
 	if len(s.Categories) != 0 || len(s.ABIWhitelist) != 0 {
 		t.Fatalf("留空的可选列表应当是空的：categories=%v abiWhitelist=%v", s.Categories, s.ABIWhitelist)
 	}
-	if err := s.Validate(""); err != nil {
+	// 身份还没定，所以这里能校验的只有上游那半边 —— 这正是 (*Upstream).Validate
+	// 被抽出来的原因（Source.Validate 会因 ID=="" 直接失败）。
+	if err := s.Upstream.Validate(); err != nil {
 		t.Fatalf("留空可选字段的申请必须仍然合法：%v", err)
 	}
 }
 
-// §2.5 规则 5：add 模板只用于**新** id。已存在的必须走 change 模板。
-func TestDecideIntake_AddRejectsExistingID(t *testing.T) {
+// 同仓库已有记录时**只告警**（03 §2.6）：一个仓库合法地可以发布多个不同包名的应用，
+// 所以"同仓库已存在"不等于"重复申请"。真正的把关在解析那一步 —— 多包名会被拒。
+func TestDecideIntake_AddWarnsOnSameRepo(t *testing.T) {
 	c := ctxWith(githubSource("com.example.app"))
-	mustReject(t, DecideIntake(c, addBody("com.example.app")), "change-source.yml")
+	d := DecideIntake(c, addBody())
+	mustPending(t, d)
+	if !strings.Contains(d.Reply, "已经有 1 条记录指向") {
+		t.Fatalf("同仓库已有记录时应当告警：\n%s", d.Reply)
+	}
+
+	// 不同仓库时不该有这条噪音 —— 否则每张单都带它，告警就没人看了。
+	d2 := DecideIntake(c, addBody([2]string{issue.LabelRepo, "other/app"}))
+	if strings.Contains(d2.Reply, "已经有") {
+		t.Fatalf("不同仓库不该触发查重告警：\n%s", d2.Reply)
+	}
 }
 
-func TestDecideIntake_AddRejectsMissingRequired(t *testing.T) {
+// 新增侧只剩一个必填字段（repo），而它**同时是**识别模板结构的那个字段（见
+// issue.Detect）—— 所以"缺必填"与"认不出是哪份模板"落在同一个出口上，
+// 回评只能请人走模板重来。这条测试钉的是这个重合不是巧合。
+func TestDecideIntake_AddMissingRepoIsIndistinguishableFromGarbage(t *testing.T) {
 	c := ctxWith()
-	// 缺「显示名」。
-	body := form(
-		[2]string{issue.LabelAppID, "com.example.newapp"},
-		[2]string{issue.LabelAuthor, "Example Org"},
-		[2]string{issue.LabelRepo, "example/app"},
-	)
-	mustReject(t, DecideIntake(c, body), "显示名")
+	mustReject(t, DecideIntake(c, form([2]string{issue.LabelAssetPat, `x`})), "无法判断")
 }
 
 func TestDecideIntake_AddRejectsBadRepoSlug(t *testing.T) {
 	c := ctxWith()
 	// 不是 owner/name 形状：repo 会被拼进上游 API URL，所以要在读配置时就挡掉。
-	mustReject(t, DecideIntake(c, addBody("com.example.newapp", [2]string{issue.LabelRepo, "justaname"})),
+	mustReject(t, DecideIntake(c, addBody([2]string{issue.LabelRepo, "justaname"})),
 		"申请内容不合法")
 }
 
@@ -224,20 +296,18 @@ func TestDecideIntake_AddRejectsBadRegex(t *testing.T) {
 	c := ctxWith()
 	// 正则非法必须在**收录时**就报出来。留到遍历上游才发现，会等到"某个上游恰好发版"
 	// 那一刻才炸，排查成本高得多。
-	mustReject(t, DecideIntake(c, addBody("com.example.newapp", [2]string{issue.LabelAssetPat, `[`})),
+	mustReject(t, DecideIntake(c, addBody([2]string{issue.LabelAssetPat, `[`})),
 		"申请内容不合法")
 }
 
-func TestDecideIntake_AddRejectsUnknownABI(t *testing.T) {
+func TestDecideIntake_AddRejectsUnknownVocabulary(t *testing.T) {
 	c := ctxWith()
-	mustReject(t, DecideIntake(c, addBody("com.example.newapp", [2]string{issue.LabelABIs, "riscv64"})),
+	// 勾选项是固定的：手改正文塞一个词表外的值进来要挡掉，否则它会被写进 sources/
+	// 而在 Obtainium 的筛选里变成一个空档。
+	mustReject(t, DecideIntake(c, addBody([2]string{issue.LabelCategories, "- [X] 摸鱼"})),
 		"申请内容不合法")
-}
-
-func TestDecideIntake_AddRejectsReservedID(t *testing.T) {
-	c := ctxWith()
-	// `_incoming` 是手动上传的暂存 Release 的 tag（03 §3.1），不是合法 appId。
-	mustReject(t, DecideIntake(c, addBody("_incoming")), "申请内容不合法")
+	mustReject(t, DecideIntake(c, addBody([2]string{issue.LabelABIs, "- [X] riscv64"})),
+		"申请内容不合法")
 }
 
 // 两套模板的字段混在一张单里：拒绝，不猜。猜错方向的后果是拿「目标 appId」
@@ -245,11 +315,8 @@ func TestDecideIntake_AddRejectsReservedID(t *testing.T) {
 func TestDecideIntake_RejectsMixedTemplates(t *testing.T) {
 	c := ctxWith(githubSource("com.example.app"))
 	body := form(
-		[2]string{issue.LabelAppID, "com.example.app"},
-		[2]string{issue.LabelTargetAppID, "com.example.app"},
-		[2]string{issue.LabelName, "Example App"},
-		[2]string{issue.LabelAuthor, "Example Org"},
 		[2]string{issue.LabelRepo, "example/app"},
+		[2]string{issue.LabelTargetAppID, "com.example.app"},
 		[2]string{issue.LabelAction, issue.ActionPause},
 	)
 	mustReject(t, DecideIntake(c, body), "无法判断")
@@ -268,15 +335,12 @@ func TestDecideIntake_RejectsGarbageBody(t *testing.T) {
 func TestDecideIntake_DuplicateFieldFirstWins(t *testing.T) {
 	c := ctxWith()
 	body := form(
-		[2]string{issue.LabelAppID, "com.example.real"},
-		[2]string{issue.LabelName, "Real Name"},
-		[2]string{issue.LabelAuthor, "Real Org"},
 		[2]string{issue.LabelRepo, "example/real"},
 		// 手工追加的第二段：应当被忽略，而不是覆盖上面那一项。
 		[2]string{issue.LabelRepo, "attacker/evil"},
 	)
 	d := DecideIntake(c, body)
-	mustAccept(t, d)
+	mustPending(t, d)
 	if d.Source.Upstream.Repo != "example/real" {
 		t.Fatalf("重复字段应当取第一个（用户真正填的那个）：%q", d.Source.Upstream.Repo)
 	}
@@ -362,6 +426,9 @@ func TestDecideIntake_ChangeEditTouchesOnlyRequestedFields(t *testing.T) {
 	if got.Upstream.AssetPattern != cur.Upstream.AssetPattern {
 		t.Fatalf("资产正则被顺带改了：%q → %q", cur.Upstream.AssetPattern, got.Upstream.AssetPattern)
 	}
+	if got.Desc != cur.Desc {
+		t.Fatalf("简介被顺带改了：%q → %q", cur.Desc, got.Desc)
+	}
 	if !reflect.DeepEqual(got.Categories, cur.Categories) {
 		t.Fatalf("分类被顺带改了：%v → %v", cur.Categories, got.Categories)
 	}
@@ -370,6 +437,43 @@ func TestDecideIntake_ChangeEditTouchesOnlyRequestedFields(t *testing.T) {
 	}
 	if got.Paused != cur.Paused {
 		t.Fatal("暂停状态被顺带改了")
+	}
+}
+
+// TestDecideIntake_ChangeEditDesc 覆盖"新的简介"这一格，重点是两件容易写错的事：
+// 一个是**裁而不拒**，另一个是回评里报出来的值必须是**最终生效的那个** ——
+// 申请人填了 30 个字、回评却说"简介 → 30 个字"，而文件里存的是 20 个字，
+// 这种对不上只有几个月后有人去翻 sources/ 才会发现。
+func TestDecideIntake_ChangeEditDesc(t *testing.T) {
+	cur := githubSource("com.example.app")
+	cur.Desc = "旧简介"
+	c := ctxWith(cur)
+
+	// 前 20 个字之后挂一个**只在原文里存在**的尾巴：这样"回评报的是裁过的值还是原文"
+	// 才是可判定的（两者都含那 20 个"很"，只有原文含尾巴）。
+	long := strings.Repeat("很", model.MaxDescRunes) + "尾巴在这儿"
+	d := DecideIntake(c, changeBody("com.example.app", issue.ActionEdit,
+		[2]string{issue.LabelNewDesc, long},
+	))
+	mustAccept(t, d)
+	if n := len([]rune(d.Source.Desc)); n != model.MaxDescRunes {
+		t.Fatalf("简介该被裁到 %d 个字，得到 %d：%q", model.MaxDescRunes, n, d.Source.Desc)
+	}
+	if strings.Contains(d.Reply, "尾巴在这儿") {
+		t.Errorf("回评里报的是**没裁过的**原文 —— 回评与落盘的值对不上：\n%s", d.Reply)
+	}
+	// 别动显示名：显示名是 Name，简介是 Desc，它在清单里才被拼起来。
+	if d.Source.Name != cur.Name {
+		t.Fatalf("改简介顺带改了显示名：%q → %q", cur.Name, d.Source.Name)
+	}
+
+	// 留空 = 不改（模板表达不了"清空"），旧简介原样留着。
+	d2 := DecideIntake(c, changeBody("com.example.app", issue.ActionEdit,
+		[2]string{issue.LabelNewName, "只改名字"},
+	))
+	mustAccept(t, d2)
+	if d2.Source.Desc != "旧简介" {
+		t.Fatalf("没申请改简介，它却被动了：%q", d2.Source.Desc)
 	}
 }
 
@@ -463,9 +567,9 @@ func TestDecideIntake_DoesNotMutateSources(t *testing.T) {
 
 // 同样的输入必须得到同样的结论：Go map 的遍历顺序不该漏进裁决里。
 func TestDecideIntake_Deterministic(t *testing.T) {
-	body := addBody("com.example.newapp",
-		[2]string{issue.LabelCategories, "工具, 效率, 网络"},
-		[2]string{issue.LabelABIs, "x86, arm64-v8a, universal"},
+	body := addBody(
+		[2]string{issue.LabelCategories, "- [X] 工具 - [X] 效率 - [ ] 媒体"},
+		[2]string{issue.LabelABIs, "- [X] x86 - [X] arm64-v8a - [X] universal"},
 	)
 	first := DecideIntake(ctxWith(), body)
 	for i := 0; i < 20; i++ {

@@ -118,8 +118,11 @@ func buildEntry(src *model.Source, index *model.Index, ep model.Endpoints) (*mod
 	}
 
 	e := &model.Entry{
-		ID:              src.ID,
-		Name:            src.Name,
+		ID:   src.ID,
+		Name: src.DisplayName(),
+		// 显示名 = `名字 · 简介`（D42）。拼在**这里**而不是写进 sources/：
+		// sources/ 里两者始终分开存，改分隔符不用重写数据，而"改简介"在
+		// change-source.yml 里也才是一次独立的、可撤销的修改。
 		Author:          src.Author,
 		URL:             model.SentinelURL(src.ID),
 		OverrideSource:  model.OverrideSource,

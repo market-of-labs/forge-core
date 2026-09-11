@@ -4,26 +4,22 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/market-of-labs/forge-core/internal/issue"
+	"github.com/market-of-labs/forge-core/internal/model"
+	"github.com/market-of-labs/forge-core/internal/naming"
 )
 
 // addBody 是 GitHub 把 add-source.yml 渲染出来的真实形状（照抄一份填好的 issue）。
-const addBody = `### 应用包名（appId）
-
-dev.imranr.obtainium
-
-### 显示名
-
-Obtainium
-
-### 作者 / 组织
-
-ImranR98
-
-### 上游 GitHub 仓库
+//
+// ⚠️ 勾选项那一行的形状是**实测**的：GitHub 把 checkboxes 渲染成任务列表，
+// 而且是**所有选项都在**、勾中的标 `- [X]`（大写 X）、未勾的标 `- [ ]`；
+// 随后 cleanValue 把换行折叠成空格，于是到了解析器手里是一整行。
+// 照抄时不许"顺手美化"成每项一行 —— 那测的就不是真实输入了。
+const addBody = `### 上游 GitHub 仓库
 
 ImranR98/Obtainium
 
@@ -31,13 +27,17 @@ ImranR98/Obtainium
 
 app.*\.apk$
 
+### 一句话简介（可选）
+
+去广告的第三方客户端
+
 ### 分类标签（可选）
 
-工具,效率
+- [X] 工具 - [ ] 效率 - [X] 媒体 - [ ] 通讯 - [ ] 开发 - [ ] 游戏 - [ ] 其他
 
 ### 只镜像哪些 ABI（可选）
 
-_No response_
+- [X] arm64-v8a - [ ] armeabi-v7a - [ ] x86_64 - [ ] x86 - [X] universal
 `
 
 // changeBody 同上，对应 change-source.yml，且是可选项全空的形态。
@@ -61,7 +61,11 @@ _No response_
 
 _No response_
 
-### 新的分类标签（仅「修改元数据」时填，逗号分隔）
+### 新的简介（仅「修改元数据」时填）
+
+_No response_
+
+### 新的分类标签（仅「修改元数据」时填）
 
 _No response_
 
@@ -73,15 +77,6 @@ _No response_
 func TestParseBasicFields(t *testing.T) {
 	f := issue.Parse(addBody)
 
-	if got := f.Get(issue.LabelAppID); got != "dev.imranr.obtainium" {
-		t.Errorf("appId = %q", got)
-	}
-	if got := f.Get(issue.LabelName); got != "Obtainium" {
-		t.Errorf("name = %q", got)
-	}
-	if got := f.Get(issue.LabelAuthor); got != "ImranR98" {
-		t.Errorf("author = %q", got)
-	}
 	if got := f.Get(issue.LabelRepo); got != "ImranR98/Obtainium" {
 		t.Errorf("repo = %q", got)
 	}
@@ -91,10 +86,92 @@ func TestParseBasicFields(t *testing.T) {
 	}
 }
 
-func TestNoResponseIsEmpty(t *testing.T) {
+// TestAddRequestHasNoDerivedFields 钉住"申请人不填派生字段"这条（03 §2.6）。
+//
+// 它测的是**编译期**的事：一旦有人把 AppID/Name/Author 加回 AddRequest，
+// 这里就要跟着改，改动本身就会被看见。
+func TestAddRequestHasNoDerivedFields(t *testing.T) {
+	r, err := issue.ParseAdd(issue.Parse(addBody))
+	if err != nil {
+		t.Fatalf("ParseAdd：%v", err)
+	}
+	if r.Repo != "ImranR98/Obtainium" {
+		t.Errorf("repo = %q", r.Repo)
+	}
+	if r.AssetPattern != `app.*\.apk$` {
+		t.Errorf("assetPattern = %q", r.AssetPattern)
+	}
+	// 简介同属"申请人自己知道的东西"，所以它是保留的。
+	if r.Desc != "去广告的第三方客户端" {
+		t.Errorf("desc = %q", r.Desc)
+	}
+}
+
+// TestParseChangeDesc 钉住"新的简介"在变更侧的**指针语义**：留空 = 不改。
+//
+// 这是 §2.5 规则 2（只改申请涉及的字段）在简介上的落点，也是它与
+// NewCategories（空切片 = 不改）唯一不同的一点 —— 简介是标量，必须用指针区分。
+func TestParseChangeDesc(t *testing.T) {
+	empty, err := issue.ParseChange(issue.Parse(changeBody))
+	if err != nil {
+		t.Fatalf("ParseChange：%v", err)
+	}
+	if empty.NewDesc != nil {
+		t.Errorf("模板里未填简介，NewDesc 应为 nil（= 不改），实际 %q", *empty.NewDesc)
+	}
+
+	// "新值"那批字段只在 Action == 修改元数据 时才被读，所以这里连动作一起换。
+	filled := strings.Replace(changeBody, "暂停更新", "修改元数据", 1)
+	filled = strings.Replace(filled,
+		"### 新的简介（仅「修改元数据」时填）\n\n_No response_",
+		"### 新的简介（仅「修改元数据」时填）\n\n去广告", 1)
+	if filled == changeBody {
+		t.Fatal("fixture 没有被改动 —— 两处替换都没命中，下面测的其实还是空形态")
+	}
+	r, err := issue.ParseChange(issue.Parse(filled))
+	if err != nil {
+		t.Fatalf("ParseChange：%v", err)
+	}
+	if r.NewDesc == nil || *r.NewDesc != "去广告" {
+		t.Fatalf("NewDesc = %v，期望「去广告」", r.NewDesc)
+	}
+	if !strings.Contains(r.Summary(), "简介") {
+		t.Errorf("Summary 里没提到简介：%q —— 回评会漏报这次改动", r.Summary())
+	}
+}
+
+func TestCheckedReadsTaskList(t *testing.T) {
 	f := issue.Parse(addBody)
-	if got := f.Get(issue.LabelABIs); got != "" {
-		t.Errorf("未填的 ABI 字段应当是空串，得到 %q", got)
+
+	got := f.Checked(issue.LabelCategories)
+	want := []string{"工具", "媒体"}
+	if !slices.Equal(got, want) {
+		t.Errorf("categories = %v，期望 %v", got, want)
+	}
+
+	// 小写 x 也是勾中：有人手工编辑正文时会打成小写，而 GitHub 自己渲染的是大写。
+	f2 := issue.Parse("### 分类标签（可选）\n\n- [x] 工具 - [ ] 效率\n")
+	if got := f2.Checked(issue.LabelCategories); !slices.Equal(got, []string{"工具"}) {
+		t.Errorf("小写 x 未被认作勾选：%v", got)
+	}
+
+	// 一个都没勾（或整段空着）返回 nil，而不是一个含空串的切片 ——
+	// 上层用 len()==0 判"没勾"，两种都得满足。
+	for _, body := range []string{
+		"### 分类标签（可选）\n\n- [ ] 工具 - [ ] 效率\n",
+		"### 分类标签（可选）\n\n_No response_\n",
+		"",
+	} {
+		if got := issue.Parse(body).Checked(issue.LabelCategories); got != nil {
+			t.Errorf("没有勾选时应当返回 nil，得到 %v（%q）", got, body)
+		}
+	}
+}
+
+func TestNoResponseIsEmpty(t *testing.T) {
+	// 整段是 _No response_ 的字段（这里借变更单的"说明"）应当被归成空串。
+	if got := issue.Parse(changeBody).Get(issue.LabelReason); got != "" {
+		t.Errorf("未填字段应当是空串，得到 %q", got)
 	}
 	// 但"整段的确是 _No response_"与"值里含 _No response_"是两回事。
 	f2 := issue.Parse("### 说明（可选）\n\n见 _No response_ 的说明\n")
@@ -104,12 +181,7 @@ func TestNoResponseIsEmpty(t *testing.T) {
 }
 
 func TestListSplitsBothCommaStyles(t *testing.T) {
-	f := issue.Parse(addBody)
-	got := f.List(issue.LabelCategories)
-	if len(got) != 2 || got[0] != "工具" || got[1] != "效率" {
-		t.Errorf("categories = %v", got)
-	}
-
+	// List 仍然被变更单之外的地方用着（下一行那个手工正文的场景）。
 	// 全角逗号、顿号、分号都要能分隔：中文输入法下这几个人人都会打出来。
 	f2 := issue.Parse("### 分类标签（可选）\n\n工具，效率、网络;测试\n")
 	got2 := f2.List(issue.LabelCategories)
@@ -193,7 +265,7 @@ func TestRequiredNamesTheExpectedHeading(t *testing.T) {
 		t.Fatal("缺字段时该报错")
 	}
 	// 错误信息必须告诉申请者**该看到哪个标题**，否则他无从下手。
-	if !strings.Contains(err.Error(), issue.LabelAppID) {
+	if !strings.Contains(err.Error(), issue.LabelRepo) {
 		t.Errorf("错误信息里没有点出期待的字段标题：%v", err)
 	}
 }
@@ -205,18 +277,6 @@ func TestParseIsTolerantOfUserProse(t *testing.T) {
 
 顺便说一下这个应用很好用。
 
-### 应用包名（appId）
-
-dev.imranr.obtainium
-
-### 显示名
-
-Obtainium
-
-### 作者 / 组织
-
-ImranR98
-
 ### 上游 GitHub 仓库
 
 ImranR98/Obtainium
@@ -225,27 +285,27 @@ ImranR98/Obtainium
 	if err != nil {
 		t.Fatalf("ParseAdd：%v", err)
 	}
-	if r.AppID != "dev.imranr.obtainium" {
-		t.Errorf("appId = %q", r.AppID)
+	if r.Repo != "ImranR98/Obtainium" {
+		t.Errorf("repo = %q", r.Repo)
 	}
 }
 
 func TestDuplicateLabelIsReported(t *testing.T) {
 	// 有人在正文里手工插了一段重复字段。取第一个（模板渲染的那个），
 	// 但要把这件事报到 Duplicates 上，由上层决定是否拒绝。
-	body := `### 应用包名（appId）
+	body := `### 上游 GitHub 仓库
 
-dev.real.app
+real/app
 
-### 应用包名（appId）
+### 上游 GitHub 仓库
 
-dev.evil.app
+evil/app
 `
 	f := issue.Parse(body)
-	if got := f.Get(issue.LabelAppID); got != "dev.real.app" {
+	if got := f.Get(issue.LabelRepo); got != "real/app" {
 		t.Errorf("重复字段应当取第一个，得到 %q", got)
 	}
-	if len(f.Duplicates) != 1 || f.Duplicates[0] != issue.LabelAppID {
+	if len(f.Duplicates) != 1 || f.Duplicates[0] != issue.LabelRepo {
 		t.Errorf("Duplicates = %v", f.Duplicates)
 	}
 }
@@ -261,18 +321,15 @@ func TestDetectByStructureNotTitle(t *testing.T) {
 }
 
 func TestDetectRefusesAmbiguous(t *testing.T) {
-	// 两套 appId 字段都在 = 两份模板被拼在了一起。拒绝，不猜：
+	// 两套字段都在（两份模板被拼在了一起）或一套都不在（手打的）都要拒绝，不猜：
 	// 猜错方向的后果是拿"目标 appId"去新建一个来源文件。
-	body := `### 应用包名（appId）
-
-a
-
-### 目标 appId
-
-b
-`
-	if _, ok := issue.Parse(body).Detect(); ok {
-		t.Error("两套字段同时出现时应当判定为不可识别")
+	for _, body := range []string{
+		"### 上游 GitHub 仓库\n\na/b\n\n### 目标 appId\n\nb\n",
+		"### 随便什么标题\n\n一段自由发挥的文字\n",
+	} {
+		if _, ok := issue.Parse(body).Detect(); ok {
+			t.Errorf("应当判定为不可识别：%q", body)
+		}
 	}
 }
 
@@ -308,12 +365,13 @@ func TestLabelsMatchStoreTemplates(t *testing.T) {
 		labels []string
 	}{
 		{"add-source.yml", []string{
-			issue.LabelAppID, issue.LabelName, issue.LabelAuthor, issue.LabelRepo,
-			issue.LabelAssetPat, issue.LabelCategories, issue.LabelABIs,
+			issue.LabelRepo, issue.LabelAssetPat, issue.LabelDesc,
+			issue.LabelCategories, issue.LabelABIs,
 		}},
 		{"change-source.yml", []string{
 			issue.LabelTargetAppID, issue.LabelAction, issue.LabelNewName,
-			issue.LabelNewAuthor, issue.LabelNewAssetPat, issue.LabelNewCats, issue.LabelReason,
+			issue.LabelNewAuthor, issue.LabelNewAssetPat, issue.LabelNewDesc,
+			issue.LabelNewCats, issue.LabelReason,
 		}},
 	}
 
@@ -338,6 +396,77 @@ func TestLabelsMatchStoreTemplates(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// optionLine 匹配 GitHub issue form 里 `- label: xxx` 那一行（缩进随意）。
+var optionLine = regexp.MustCompile(`(?m)^\s*-\s*label:\s*(.+?)\s*$`)
+
+// TestCheckboxVocabularyMatchesGo 钉住勾选项的词表：模板里的 options 必须正好是
+// Go 侧那两个固定集，一个不多一个不少。
+//
+// 存在的理由有两层：
+//
+//  1. 词表是**校验**用的 —— job.validateAdd 拿 model.ReviewCategories / naming.ABISet
+//     判"勾上来的这一项合不合法"。模板多一项就是"申请人能勾、但一定被拒"，
+//     少一项就是"这项其实支持，但没人勾得到"。
+//  2. 空间约束 —— issue.checkboxItem 用 `[^\s\]]+` 取选项名，所以**选项里不能有空格**。
+//     这不是理论问题：`arm64-v8a` 这种名字里若有人改成 `arm64 v8a`，解析会静默地
+//     只取到 `arm64`，然后被当成非法 ABI 拒掉。宁可在这里先炸。
+//
+// 比的是**集合**而不是切片：ABISet 的顺序是清单里 apkUrls 的排序位次（见其文档），
+// 而模板里 options 的顺序只影响表单的展示，两者没有理由被绑在一起。
+func TestCheckboxVocabularyMatchesGo(t *testing.T) {
+	dir := filepath.Join("..", "..", "..", "store", ".github", "ISSUE_TEMPLATE")
+	want := map[string]bool{}
+	for _, c := range model.ReviewCategories {
+		want[c] = true
+	}
+	for _, a := range naming.ABISet {
+		want[a] = true
+	}
+
+	for _, file := range []string{"add-source.yml", "change-source.yml"} {
+		b, err := os.ReadFile(filepath.Join(dir, file))
+		if err != nil {
+			t.Skipf("读不到 %s —— 跳过", file)
+		}
+		got := map[string]bool{}
+		for _, m := range optionLine.FindAllStringSubmatch(string(b), -1) {
+			v := unquote(m[1])
+			got[v] = true
+			if strings.ContainsAny(v, " \t") {
+				t.Errorf("%s 的选项 %q 里有空格 —— issue.checkboxItem 的 `[^\\s\\]]+` 会在空格处停下，"+
+					"解析出来的将是一个残缺的名字", file, v)
+			}
+		}
+		if len(got) == 0 {
+			t.Fatalf("%s 里一个 `- label:` 都没解析出来", file)
+		}
+
+		// **两边差集都要空**：模板多出的项 = 勾了必被拒，Go 多出的项 = 没人勾得到。
+		// 变更单只用到分类词表，所以它的选项是 want 的子集；新增单两者都有。
+		inGoNotYAML := map[string]bool{}
+		for v := range want {
+			if !got[v] {
+				inGoNotYAML[v] = true
+			}
+		}
+		for v := range got {
+			if !want[v] {
+				t.Errorf("%s 里的选项 %q 不在 Go 的固定集内 —— 勾了也会被 validateAdd 拒掉", file, v)
+			}
+		}
+		// 新增单必须**用满**整个词表；变更单只有分类那一组，它缺的项必须都是 ABI。
+		for v := range inGoNotYAML {
+			if file == "add-source.yml" {
+				t.Errorf("add-source.yml 里缺选项 %q —— 它在 Go 的固定集里，但申请人勾不到", v)
+				continue
+			}
+			if !naming.IsABI(v) {
+				t.Errorf("%s 里缺分类选项 %q", file, v)
+			}
+		}
 	}
 }
 

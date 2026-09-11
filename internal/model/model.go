@@ -6,7 +6,10 @@
 // 钉死，后者坏了不影响前者。
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // ---- 契约常量 ---------------------------------------------------------------
 //
@@ -52,6 +55,18 @@ const (
 	// （03 §3.3，GitHub 官方明文），提前在 800 报警是为了不撞顶。
 	ReleaseAssetCountWarn = 800
 )
+
+// ReviewCategories 是「分类标签」勾选项的固定词表，必须与两份 issue 模板里的
+// options 逐字一致（`TestTemplateVocabularyMatchesGo` 会直接读 yml 钉住这件事）。
+//
+// 它**刻意不参与 Source.Validate**：`sources/` 是唯一事实源（D30 入口甲），
+// 人手改文件时引入一个新分类是合法的，那属于"文件是事实"的一部分。词表只约束
+// issue 表单 —— 陌生人写字进来的那条路（入口乙）把取值锁在闭集里，清单的筛选条
+// 才不会被随手造出来的标签塞满。
+//
+// 顺序在这里**只是给回评文案用的**，不影响任何判定 —— 与 naming.ABISet 不同，
+// 那个的顺序是排序位次，动不得。
+var ReviewCategories = []string{"工具", "效率", "媒体", "通讯", "开发", "游戏", "其他"}
 
 // SentinelURL 渲染条目的哨兵源地址。
 func SentinelURL(id string) string { return SentinelHost + id }
@@ -118,9 +133,13 @@ type Entry struct {
 // Source 是一个 App 的**维护输入**。它是唯一由人维护的事实源；
 // apps.json / index.json / Release 全部可以从它 + 上游推出。
 type Source struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Author     string   `json:"author"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Author string `json:"author"`
+	// Desc 是一句话简介，可选。它**独立存**，只在合成清单时拼到 Name 后面
+	// （由 DisplayName 决定怎么拼）—— 存成拼接后的整串，将来改分隔符就得重写全部数据，
+	// 而且申请人"改简介"会变成"改显示名"。
+	Desc       string   `json:"desc,omitempty"`
 	Source     string   `json:"source"` // SourceGitHub | SourceManual
 	Paused     bool     `json:"paused"`
 	Categories []string `json:"categories,omitempty"`
@@ -131,8 +150,49 @@ type Source struct {
 	ABIWhitelist []string `json:"abiWhitelist,omitempty"`
 }
 
-// Upstream 描述 GitHub 上游（03 §2.2）。它**只存在于 forge 与 sources/**，
-// 绝不进清单 —— 清单里所有地址一律指向本市场仓库（02 规则 3）。
+// 简介的长度上限，单位是 **rune**（汉字算一个）。
+//
+// 20 这个数字是**量出来的**，不是拍的：Obtainium 列表行的标题是
+// `maxLines: 1` + `TextOverflow.ellipsis`（`app_list_tile.dart`），手机上一行
+// 连名字带简介大约放得下 17 个汉字 —— 所以 20 rune 的简介在大多数条目上不会把
+// 标题挤成省略号，而再长就一定挤。它同时也是"这是简介不是描述"的强制提醒。
+const MaxDescRunes = 20
+
+// DescSeparator 是 Name 与 Desc 之间的分隔符。
+//
+// 用中点而不是 `-`/`()`/`|`：Obtainium 的显示名里本来就允许出现后三者
+// （`app-suffix`、`Foo (Bar)`），而中点几乎不会自然出现在应用名里 ——
+// 一眼就能看出"中点两边是两个不同的字段"。
+const DescSeparator = " · "
+
+// DisplayName 是**清单里的**显示名：有简介时拼成 `名字 · 简介`。
+//
+// 这是 desc 唯一被消费的地方（D42）—— `sources/` 里两者始终分开存，
+// 于是改分隔符、改拼法都不用重写数据。
+func (s *Source) DisplayName() string {
+	if s.Desc == "" {
+		return s.Name
+	}
+	return s.Name + DescSeparator + s.Desc
+}
+
+// TruncateDesc 把一份申请里填的简介裁到 MaxDescRunes 个 rune 并去掉首尾空白。
+//
+// 按 **rune** 切，不能按 byte 切 —— 按 byte 会把一个汉字劈成半个（产生非法 UTF-8，
+// 客户端那边是一串替换字符）。首尾空白也在这里去掉：模板里的输入框很容易多带一个空格，
+// 而它在列表里表现为"名字和简介之间隔了两个空格"。
+//
+// 裁而不拒是刻意的：这个字段**纯装饰**，而新增单一次往返是**一天**
+// （03 §2.5.1 两拍）。为了一个简介让人重填一整天，代价和收益不成比例。
+func TruncateDesc(s string) string {
+	s = strings.TrimSpace(s)
+	if r := []rune(s); len(r) > MaxDescRunes {
+		return strings.TrimSpace(string(r[:MaxDescRunes]))
+	}
+	return s
+}
+
+// Upstream 描述 GitHub 上游（03 §2.2）。它**只存在于 forge 与 sources/**，// 绝不进清单 —— 清单里所有地址一律指向本市场仓库（02 规则 3）。
 type Upstream struct {
 	Type         string `json:"type"` // 只支持 UpstreamGitHubRelease
 	Repo         string `json:"repo"` // "owner/name"

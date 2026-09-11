@@ -25,6 +25,8 @@ type ReconcileResult struct {
 	Skipped  int
 	Commited bool
 	Report   *model.Report
+	// PendingLanded 是本轮从待办 issue 里收录进来的 appId（03 §2.6 拍 2）。
+	PendingLanded []string
 }
 
 // Reconcile 是 03 §4.4 的幂等全量对账，也是**唯一的"日常收敛"入口**。
@@ -56,6 +58,36 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 	// 正常路径下它是关着的，但开着的代价也只是"对确实缺元数据的版本下一份"
 	// （BuildIndex 只对 VersionName 为空的版本下载），所以宁可开。
 	hadIndex := len(c.Index.Apps) > 0
+
+	// 0 步：先把待办 issue 里已经能定出身份的申请落成 sources（03 §2.6 拍 2）。
+	//
+	// **必须在镜像之前**：这一轮的镜像要顺手把刚收录的应用的最新版本拉进来。
+	// 放到后面的话，一个申请人今天通过的应用要等到明天的 cron 才有版本 ——
+	// 而在设备端"点不动"的那一天里，没人知道该怪谁。
+	//
+	// 两个门槛：
+	//   DryRun    —— 扫描器写文件、提交、回评、关单，dry-run 一件都不能做。
+	//   OnlyID    —— 带 OnlyID 的对账语义是"只收敛这一个 appId"（一次 push 触发的），
+	//                把整条待办队列拉进来会把一次局部的收敛变成一次全局动作。
+	//                全量路径（cron / workflow_dispatch / push 退化）才是收单的地方。
+	if !opts.DryRun && opts.OnlyID == "" {
+		pr, err := ScanPendingIssues(ctx, c)
+		if err != nil {
+			// 扫描失败**不阻断镜像**：待办队列是"迟早要收的单"，而镜像的是
+			// sources 里已有的应用 —— 后者是设备端已经在用的东西，不能因为
+			// 一张新单扫不动就停摆。
+			c.Log("扫待办 issue 失败，本轮跳过（不影响镜像）：%v", err)
+		} else {
+			res.PendingLanded = pr.Landed
+			if len(pr.Landed) > 0 {
+				// 刚落了文件，内存里那份 c.Sources 已经过期。不重载的话
+				// 下面这一步会看不见新来源 —— 正是上面说的"点不动的那一天"。
+				if err := c.Load(); err != nil {
+					return res, fmt.Errorf("收录后重载工作副本：%w", err)
+				}
+			}
+		}
+	}
 
 	// 1–3 步：解析 + 镜像。
 	plans, rep, err := ResolveUpstream(ctx, c, ResolveOptions{OnlyID: opts.OnlyID})
@@ -208,7 +240,9 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 		d, err := IntakeIssue(ctx, c, res.IssueNo)
 		res.Intake = d
 		if d != nil {
-			res.Commited = d.Accept // IntakeIssue 内部已经提交过了
+			// IntakeIssue 内部已经提交过了。Pending 的单没写文件、也就没提交 ——
+			// 那不是失败，是 §2.6 的正常路径（只登记而已）。
+			res.Commited = d.Accept && !d.Pending
 		}
 		return res, err
 

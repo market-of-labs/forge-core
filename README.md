@@ -102,18 +102,26 @@ git tag v0.1.0 && git push origin v0.1.0
 
 两条规矩：
 
-- **一个 tag 只对应一个二进制。** 重跑同一个 tag 会被 workflow 拒绝 —— 因为覆写 asset
-  会让线上跑的代码变了而 tag 没变，事后无迹可查。改代码请打**新** tag；只有"Release
-  已建但 asset 没传上去"这种情况，重跑会把 asset 补上（不需要 clobber）。
+- **一个 tag 只对应一个二进制。** 覆写 asset 会让线上跑的代码变了而 tag 没变，事后
+  无迹可查 —— 所以发布那一步写的是 `overwrite_files: false`，**存量 asset 不可能被
+  替换**。改代码请打**新** tag；只有"Release 已建但 asset 没传上去"这种情况，重跑会
+  把 asset 补上。**注意与老写法的差别**：现在是"已存在就跳过并打一行日志"，不是
+  "报错退出" —— 不变量仍然成立（由"不可能覆盖"保证，而不是由"敢覆盖就报错"保证），
+  但重跑一个已发过的 tag 会**绿着**过去，不再有那条红色提示。
 - **不推分支不影响线上。** 公有的运行器浮动取 latest，所以"哪次发布生效"完全由
   tag 决定，而不是由 push 决定。
 
-`build.yml` 里那两个 action 是**钉 commit SHA** 的（不是 `@v7`）。理由与上面那条闸门
+`build.yml` 里三个 action 都是**钉 commit SHA** 的（不是 `@v7`）。理由与上面那条规矩
 同源：这个 job 的产物会被带到能写 `store` 的 PAT 下执行，所以"上游往 `v7` 这个 tag 上
 推了什么"必须是一个**不会自己变**的事实。`.github/dependabot.yml` 每周开一个 PR 同时
 升 SHA 与它末尾的 `# vX.Y.Z` 注释 —— 钉 SHA 之后靠它保持不腐。Dependabot 只开 PR，
 **不合并、不打 tag**，所以线上仍然只由你的 tag 改变；本仓库的 workflow 又只在打 tag
 时触发，它开的 PR 跑不起来任何东西，**不花分钟数**。
+
+> 发布那一步用的是第三方 action（`softprops/action-gh-release`）。这里可以接受，是因为
+> **这个 job 不握 PAT** —— 它只有本仓库的 `GITHUB_TOKEN`（`contents: write`），风险被
+> 限制在 `forge-core` 自己身上。反过来说：**公有的 `forge` 那三个 workflow 一个第三方
+> action 都没有**，因为它们的 job 里有能写三个仓库的 PAT（§6.2）。
 
 ---
 

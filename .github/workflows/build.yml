@@ -59,23 +59,35 @@ jobs:
       - name: Build
         run: go build -trimpath -o "$RUNNER_TEMP/$ASSET" ./cmd/forge
 
-      # 先挡住"同一个 tag 重跑"：一个 tag 只能对应一个二进制。
-      # 不加这道闸，重跑会把已发布的 asset 悄悄换成另一个构建产物，而 tag 没变、
-      # 公开那边的 `latest` 也没变 —— 于是 cron 跑的代码变了，但没有任何痕迹。
-      # 改代码请打新 tag；如果是上传中途失败（Release 已建但 asset 没上去），
-      # 下面的 upload 会把它补上，不需要 clobber。
+      # 发布。用现成的 action 而不是 `gh release view/create/upload`：老写法是 ~10 行
+      # 手写 shell，而"建 Release / 传 asset"本身是没有秘密的机械动作。
+      #
+      # token 不写 = 吃 action 默认的 `github.token`，正是这里要的：本 job **不需要
+      # PAT**（它只写自己这个仓库），与 §6.2 那条"PAT 只出现在需要它的地方"一致。
+      #
+      # ⚠️ 两处行为与老写法不同，是明知的取舍：
+      #
+      #   1. 老写法在"asset 已存在"时 `exit 1`（响亮地失败）；这里
+      #      `overwrite_files: false` 是**跳过并打一行日志**（已核 v3.0.2 源码
+      #      `src/github.ts:435`：返回 null，不报错）。要守的不变量 ——"一个 tag
+      #      只对应一个二进制"—— **仍然成立**，它现在由"不可能覆盖"保证，而不是
+      #      由"敢覆盖就报错"保证。丢掉的只是那条红色警告本身。
+      #   2. 老写法在 Release 已存在时**完全不碰它**；这个 action 会顺带 PATCH 一次
+      #      （name / body / generate_release_notes）。内容由 commit 区间决定，重跑
+      #      结果一致，影响仅限于此。
+      #
+      # `fail_on_unmatched_files: true` 是**必须显式写**的：它默认 false，而默认值
+      # 下"文件没找到"会**绿着**产出一个没有 asset 的 Release —— 那种"成功但空"，
+      # 正是本仓库最不想要的结果。
       - name: Publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="$GITHUB_REF_NAME"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
-               --jq '.assets[].name' | grep -qx "$ASSET"; then
-            echo "::error::$TAG 已经发布过 $ASSET 了。一个 tag 只对应一个二进制 —— 改代码请打新 tag。" >&2
-            exit 1
-          fi
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-                 --title "$TAG" --generate-notes
-          gh release upload "$TAG" "$RUNNER_TEMP/$ASSET" --repo "$GITHUB_REPOSITORY"
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          # 显式写成 github.ref_name（= 本 job 的 tag），不吃 action 的默认值：默认值
+          # 恰好也是它，但"恰好相同"不是契约。
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}   # 等价于老写法的 --title "$TAG"
+          generate_release_notes: true   # 等价于 --generate-notes
+          # ⚠️ 默认是 true —— 那个默认值正好会毁掉"一个 tag 一个二进制"，不能吃它。
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          files: ${{ runner.temp }}/${{ env.ASSET }}

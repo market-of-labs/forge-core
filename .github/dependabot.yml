@@ -1,8 +1,12 @@
 version: 2
 
-# 只有本仓库需要这个文件：公有的 `forge` 三个 workflow 里一个 `uses:` 都没有
-# （它们只跑 `gh` CLI），`store` 的 forward.yml 同样只用 `curl`。没有依赖就没有
-# 可升级的东西。
+# 两个仓库需要这个文件：
+#   - 本仓库（`forge-core`）：build.yml 里两个 action 钉 SHA + go.mod 依赖；
+#   - `store`：forward.yml 里 `actions/github-script` 钉 SHA（它自己那一份在
+#     store/.github/dependabot.yml —— 依赖在哪，升级就该配在哪）。
+#
+# 公有的 `forge` 三个 workflow 仍然一个 `uses:` 都没有（只跑 `gh` CLI 与它自己
+# 拉下来的二进制），所以那边没有可升级的东西，不需要这个文件。
 #
 # 为什么 Dependabot 在这里不会破坏"打 tag = 上生产"：它只**开 PR**，不合并、不
 # 打 tag。合并一个 PR 只改源码，线上那份二进制仍然是上一个 tag 的产物 —— 要生效

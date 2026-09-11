@@ -1,0 +1,19 @@
+# 构建产物。二进制永远不进仓库 —— 它由 workflow 每次现场 `go build`，
+# 所以仓库里没有"某个提交里的二进制与源码不一致"这种可能。
+/forge
+/forge.exe
+/dist/
+*.test
+*.out
+
+# ⚠️ 凭据一律不进仓库。forge 本来**不读**任何凭据文件（token 只从环境变量来），
+# 这几行是给"本地调试时手滑把 token 存成文件"兜底的。
+# 一旦误提交，`git rm` 是不够的 —— 必须视为已泄漏并立刻轮换（03 §6.1：90 天一轮）。
+.env
+.env.*
+token
+token.txt
+*.pat
+
+# 本地调试用的 store 工作副本
+/store-checkout/

@@ -1,0 +1,81 @@
+name: build
+
+# 唯一的发布入口：**打 tag 才构建**（`v*`）。
+#
+# 为什么不是"push 到 main 就构建"：这个 Release 里出去的二进制，会被公开的
+# `market-of-labs/forge` 拉下来、**带着能写 store 的 PAT 执行**。也就是说
+# **打 tag 等于上生产**。让"每一次提交"都具备这个能力，就等于让每一次提交
+# 都是生产发布；而 tag 是一个明确、可追溯、可拒绝的动作。
+#
+# 反过来也不给 `workflow_dispatch`：手动触发时 `GITHUB_REF_NAME` 是分支名，
+# 会造出一个叫 `main` 的 Release —— 而成品又会被当成 latest 拉去执行。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+# 同一时刻只允许一个发布在跑。两个 tag 同时推上来时排队，不要交错上传。
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # 这个二进制是**纯 Go**（APK 元数据由 github.com/shogo82148/androidbinary
+      # 解析，不需要 aapt，也没有 cgo 依赖），所以关掉 cgo 得到的是一个静态链接
+      # 的产物，不挑 runner 镜像里的 glibc。写死是为了以后万一引入 cgo 依赖时
+      # 它会**构建失败**，而不是悄悄产出一个在别处跑不起来的二进制。
+      CGO_ENABLED: '0'
+      GOOS: linux
+      GOARCH: amd64
+      ASSET: forge-linux-amd64
+    steps:
+      # 这两个 action 钉到 commit SHA，而不是 `@v7`。理由与下面那道"一个 tag 一个
+      # 二进制"的闸门是同一条：这个 job 的产物会被带到能写 store 的 PAT 下执行，
+      # 所以"上游往 v7 这个 tag 上推了什么"必须是一个**不会自己变**的事实。SHA 是
+      # 不变的，tag 不是。末尾的 `# vX.Y.Z` 注释是给 Dependabot 认版本用的。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本 job 后续不再需要 git 凭据（发布走 `gh` + `GH_TOKEN`），所以不落盘。
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # 测试放在发布**之前**，而且失败就中止。理由同上：既然打 tag 等于上生产，
+      # 那么"测试没过"就该是在生产之前拦住的事，而不是事后在 Actions 日志里发现。
+      # 这是本仓库唯一的一道闸门 —— 平时的提交不走 CI（私有仓库的分钟数要省着），
+      # 本地 `go test ./...` 仍然是你日常的检查手段。
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: go build -trimpath -o "$RUNNER_TEMP/$ASSET" ./cmd/forge
+
+      # 先挡住"同一个 tag 重跑"：一个 tag 只能对应一个二进制。
+      # 不加这道闸，重跑会把已发布的 asset 悄悄换成另一个构建产物，而 tag 没变、
+      # 公开那边的 `latest` 也没变 —— 于是 cron 跑的代码变了，但没有任何痕迹。
+      # 改代码请打新 tag；如果是上传中途失败（Release 已建但 asset 没上去），
+      # 下面的 upload 会把它补上，不需要 clobber。
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+               --jq '.assets[].name' | grep -qx "$ASSET"; then
+            echo "::error::$TAG 已经发布过 $ASSET 了。一个 tag 只对应一个二进制 —— 改代码请打新 tag。" >&2
+            exit 1
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "$TAG" --generate-notes
+          gh release upload "$TAG" "$RUNNER_TEMP/$ASSET" --repo "$GITHUB_REPOSITORY"

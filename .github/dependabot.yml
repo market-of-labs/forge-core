@@ -1,0 +1,31 @@
+version: 2
+
+# 只有本仓库需要这个文件：公有的 `forge` 三个 workflow 里一个 `uses:` 都没有
+# （它们只跑 `gh` CLI），`store` 的 forward.yml 同样只用 `curl`。没有依赖就没有
+# 可升级的东西。
+#
+# 为什么 Dependabot 在这里不会破坏"打 tag = 上生产"：它只**开 PR**，不合并、不
+# 打 tag。合并一个 PR 只改源码，线上那份二进制仍然是上一个 tag 的产物 —— 要生效
+# 还是得有人显式打新 tag。所以自动化更新与发布闸门不冲突。
+#
+# 也**不花 Actions 分钟数**：本仓库的 workflow 只在 `push: tags: ['v*']` 触发，
+# Dependabot 开的 PR 是普通 PR，跑不起来任何东西。
+updates:
+  # action 的版本是钉 SHA 的（见 build.yml），Dependabot 认末尾那行
+  # `# vX.Y.Z` 注释，会同时升 SHA 和注释 —— 这正是钉 SHA 之后还能保持不腐的方式。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # 两个 action 合成一个 PR，别把私有仓库的 PR 列表刷屏。
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      gomod:
+        patterns: ['*']

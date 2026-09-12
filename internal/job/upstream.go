@@ -306,7 +306,7 @@ func (c *Ctx) mirrorPlan(ctx context.Context, p *Plan, opts MirrorOptions, out *
 	var tokens []string
 
 	for _, a := range p.Picked {
-		meta, err := c.readAssetMeta(ctx, a)
+		meta, err := c.readAssetMeta(ctx, p.Source.Upstream.Repo, a)
 		if err != nil {
 			out.Problems.Warnf(appID, "解析 %s 失败，跳过：%v", a.Name, err)
 			out.Skipped++
@@ -370,7 +370,7 @@ func (c *Ctx) mirrorPlan(ctx context.Context, p *Plan, opts MirrorOptions, out *
 		} else if opts.DryRun {
 			c.Log("  [dry-run] %s → %s（%d 字节，内容判 %s）", a.Name, target, a.Size, contentABI)
 		} else {
-			if err := c.uploadAsset(ctx, rel, target, a); err != nil {
+			if err := c.uploadAsset(ctx, p.Source.Upstream.Repo, rel, target, a); err != nil {
 				return err
 			}
 			// 本轮的 map 里也记上，免得同一个 Release 里两个 asset 撞到同一个目标名时
@@ -473,8 +473,10 @@ func mergeAssets(old, add []model.IndexAsset) []model.IndexAsset {
 }
 
 // readAssetMeta 下载一个上游 asset 并读它的 APK 元数据。
-func (c *Ctx) readAssetMeta(ctx context.Context, a gh.Asset) (*apkmeta.Meta, error) {
-	path, cleanup, err := c.downloadToTemp(ctx, a.ID, "forge-upstream-*.apk")
+//
+// `repo` 是**上游**仓库（`a` 的出处），不是 store —— 见 downloadToTemp。
+func (c *Ctx) readAssetMeta(ctx context.Context, repo string, a gh.Asset) (*apkmeta.Meta, error) {
+	path, cleanup, err := c.downloadToTemp(ctx, repo, a.ID, "forge-upstream-*.apk")
 	if err != nil {
 		return nil, err
 	}
@@ -483,8 +485,10 @@ func (c *Ctx) readAssetMeta(ctx context.Context, a gh.Asset) (*apkmeta.Meta, err
 }
 
 // uploadAsset 把一个上游 asset 以目标名上传到内部 Release。
-func (c *Ctx) uploadAsset(ctx context.Context, rel *gh.Release, target string, a gh.Asset) error {
-	path, cleanup, err := c.downloadToTemp(ctx, a.ID, "forge-upload-*.apk")
+//
+// `repo` 是**上游**仓库：先从那儿把内容取下来，再传到 store（见 downloadToTemp）。
+func (c *Ctx) uploadAsset(ctx context.Context, repo string, rel *gh.Release, target string, a gh.Asset) error {
+	path, cleanup, err := c.downloadToTemp(ctx, repo, a.ID, "forge-upload-*.apk")
 	if err != nil {
 		return err
 	}
@@ -507,8 +511,13 @@ func (c *Ctx) uploadAsset(ctx context.Context, rel *gh.Release, target string, a
 //
 // 落盘而不是读进内存：APK 动辄上百 MB，而 apkmeta 要的是 io.ReaderAt，
 // 留在内存里等于同时占两份。
-func (c *Ctx) downloadToTemp(ctx context.Context, assetID int64, pattern string) (string, func(), error) {
-	rc, _, err := c.GH.DownloadAsset(ctx, c.Env.StoreRepo, assetID)
+//
+// ⚠️ `repo` **必须由调用方给**（store 自己的 asset 传 StoreRepo，上游 asset 传
+// 上游仓库）。asset id 是**仓库内**的编号，拿 A 仓库的 id 去 B 仓库要必然 404 ——
+// 这里曾经写死过 StoreRepo，于是"上游 asset 一个也下不下来"，而失败在镜像侧
+// 被 D44 容忍成一条 WARN，症状是"每天都是绿的、什么都没镜像"。
+func (c *Ctx) downloadToTemp(ctx context.Context, repo string, assetID int64, pattern string) (string, func(), error) {
+	rc, _, err := c.GH.DownloadAsset(ctx, repo, assetID)
 	if err != nil {
 		return "", func() {}, err
 	}

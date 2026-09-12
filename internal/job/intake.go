@@ -659,7 +659,7 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 
 // readIncomingMeta 下载 _incoming 里的一个 asset 并读元数据。
 func (c *Ctx) readIncomingMeta(ctx context.Context, a gh.Asset) (*apkmeta.Meta, error) {
-	path, cleanup, err := c.downloadToTemp(ctx, a.ID, "forge-incoming-*.apk")
+	path, cleanup, err := c.downloadToTemp(ctx, c.Env.StoreRepo, a.ID, "forge-incoming-*.apk")
 	if err != nil {
 		return nil, err
 	}
@@ -672,7 +672,7 @@ func (c *Ctx) readIncomingMeta(ctx context.Context, a gh.Asset) (*apkmeta.Meta, 
 // 注意是"下载再上传"而不是 GitHub 的某种"移动" —— Release asset 没有移动这个操作，
 // 只能复制一份再删原件。
 func (c *Ctx) moveAsset(ctx context.Context, rel *gh.Release, releaseID int64, target string, a gh.Asset) error {
-	path, cleanup, err := c.downloadToTemp(ctx, a.ID, "forge-move-*.apk")
+	path, cleanup, err := c.downloadToTemp(ctx, c.Env.StoreRepo, a.ID, "forge-move-*.apk")
 	if err != nil {
 		return err
 	}

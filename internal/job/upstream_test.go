@@ -1,7 +1,11 @@
 package job
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -271,3 +275,40 @@ func TestSortAssets_Deterministic(t *testing.T) {
 		t.Fatalf("sortAssets 就地改了入参：%+v", in)
 	}
 }
+
+// TestUpstreamAssetDownloadsUseUpstreamRepo 钉住一个真出过事的点：asset id 是
+// **仓库内**的编号，上游 asset 必须去上游仓库取。这里曾经写死 StoreRepo，于是
+// 每个上游 asset 都 404，而镜像侧把它容忍成一条 WARN —— 症状是"每天都是绿的、
+// 什么都没镜像"，新增单则一律死在"探身份"。
+func TestUpstreamAssetDownloadsUseUpstreamRepo(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		io.Copy(io.Discard, r.Body)
+		w.Write(emptyZip)
+	}))
+	defer srv.Close()
+
+	ghc, err := gh.New(gh.Config{Token: "t", BaseURL: srv.URL, UploadBaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("建客户端：%v", err)
+	}
+	c := &Ctx{Env: &Env{StoreRepo: "o/store"}, GH: ghc, Log: func(string, ...any) {}}
+
+	// 内容不是 APK，两处都必然报错 —— 本测试只问"请求打到哪个仓库"，所以忽略返回值。
+	c.readAssetMeta(context.Background(), "owner/up", gh.Asset{ID: 7, Name: "a.apk"})
+	c.uploadAsset(context.Background(), "owner/up", &gh.Release{ID: 1}, "t.apk", gh.Asset{ID: 7, Name: "a.apk"})
+
+	// 两次下载各一次请求，之后才是上传。
+	want := []string{"/repos/owner/up/releases/assets/7", "/repos/owner/up/releases/assets/7"}
+	if len(paths) < 2 || !reflect.DeepEqual(paths[:2], want) {
+		t.Fatalf("上游 asset 没去上游仓库取：want=%v got=%v（StoreRepo 是 %s）", want, paths, c.Env.StoreRepo)
+	}
+	if len(paths) > 2 && !strings.HasPrefix(paths[2], "/repos/o/store/") {
+		t.Fatalf("上传没落到 store：%s", paths[2])
+	}
+}
+
+// emptyZip 是一个零条目的合法 zip：让 apkmeta.Read 干净地报"读不出元数据"，
+// 而不是拿一段乱码去试探它的容错。
+var emptyZip = append([]byte("PK\x05\x06"), make([]byte, 18)...)

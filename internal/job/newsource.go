@@ -273,7 +273,7 @@ func (c *Ctx) probeIdentity(ctx context.Context, half *model.Source) (*model.Sou
 	}
 
 	return pickIdentityRelease(half, pattern, re, cands, func(rel gh.Release, picked []gh.Asset) []*apkmeta.Meta {
-		return c.probeMetas(ctx, rel, picked)
+		return c.probeMetas(ctx, repo, rel, picked)
 	})
 }
 
@@ -312,10 +312,10 @@ func pickIdentityRelease(half *model.Source, pattern string, re *regexp.Regexp,
 //
 // 读不动的跳过并记日志，**不中断**：一个 Release 里混着 .zip/.sha256/源码包是常态，
 // 为它们放弃整张申请不值得。而"一个都读不出来"由调用方判空处理。
-func (c *Ctx) probeMetas(ctx context.Context, rel gh.Release, picked []gh.Asset) []*apkmeta.Meta {
+func (c *Ctx) probeMetas(ctx context.Context, repo string, rel gh.Release, picked []gh.Asset) []*apkmeta.Meta {
 	out := make([]*apkmeta.Meta, 0, len(picked))
 	for _, a := range picked {
-		m, err := c.readAssetMeta(ctx, a)
+		m, err := c.readAssetMeta(ctx, repo, a)
 		if err != nil {
 			c.Log("  %s/%s：读元数据失败，跳过（%v）", rel.TagName, a.Name, err)
 			continue

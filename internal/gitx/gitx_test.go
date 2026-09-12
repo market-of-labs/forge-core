@@ -223,6 +223,61 @@ func TestTokenNeverLandsInGitConfig(t *testing.T) {
 	}
 }
 
+// TestCommitToleratesMissingPath 钉住空仓库里的第一次回写。
+//
+// `apps.json` 在**第一条来源落地之前**是不存在的，而回写的路径列表照旧带着它。
+// `git add` 是全有或全无的：那个不存在的 pathspec 会让整条命令 fatal，于是
+// "第一个被收录的应用"永远提交不了 —— 报出来的还是一句看不出所以然的
+// `pathspec 'apps.json' did not match any files`（2026-09-12 线上就是这条）。
+func TestCommitToleratesMissingPath(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t, "")
+	if err := os.MkdirAll(filepath.Join(dir, "sources"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sources", "a.json"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &gitx.Client{Dir: dir}
+	committed, err := c.Commit(ctx, gitx.DefaultIdentity, "收录 a（#1）", "sources", "apps.json")
+	if err != nil {
+		t.Fatalf("Commit：%v", err)
+	}
+	if !committed {
+		t.Fatal("有改动却没提交")
+	}
+	out, _ := exec.Command("git", "-C", dir, "show", "--name-only", "--pretty=", "HEAD").Output()
+	if !strings.Contains(string(out), "sources/a.json") {
+		t.Errorf("提交里没有新来源：%s", out)
+	}
+}
+
+// TestCommitStillStagesDeletion 是上一条的另一半：摘掉路径的判据不能把**删除**也摘掉。
+//
+// 已跟踪但工作区里没有的路径是一次删除，`git add` 会正常把它暂存；若因为
+// "文件不存在"就一并跳过，那次删除会永远留在工作区、永远提交不上去。
+func TestCommitStillStagesDeletion(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t, "")
+	if err := os.Remove(filepath.Join(dir, "seed.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &gitx.Client{Dir: dir}
+	committed, err := c.Commit(ctx, gitx.DefaultIdentity, "移除 seed", "seed.txt")
+	if err != nil {
+		t.Fatalf("Commit：%v", err)
+	}
+	if !committed {
+		t.Fatal("删除已跟踪文件却没提交")
+	}
+	out, _ := exec.Command("git", "-C", dir, "show", "--name-status", "--pretty=", "HEAD").Output()
+	if !strings.Contains(string(out), "D\tseed.txt") {
+		t.Errorf("提交里没有那次删除：%s", out)
+	}
+}
+
 func TestHasChanges(t *testing.T) {
 	ctx := context.Background()
 	dir := newRepo(t, "")

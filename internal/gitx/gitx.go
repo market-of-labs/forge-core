@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -198,7 +199,11 @@ func (c *Client) Commit(ctx context.Context, id Identity, message string, paths 
 		return false, nil
 	}
 
-	addArgs := append([]string{"add", "--"}, paths...)
+	stageable := c.stageable(ctx, paths)
+	if len(stageable) == 0 {
+		return false, nil
+	}
+	addArgs := append([]string{"add", "--"}, stageable...)
 	if _, err := c.run(ctx, addArgs...); err != nil {
 		return false, err
 	}
@@ -211,6 +216,30 @@ func (c *Client) Commit(ctx context.Context, id Identity, message string, paths 
 		return false, err
 	}
 	return true, nil
+}
+
+// stageable 摘掉"既不在工作区、也不在索引里"的路径。
+//
+// `git add` 对路径是**全有或全无**的：只要有一个 pathspec 什么都没匹配上，整条命令
+// 就以 `fatal: pathspec 'X' did not match any files` 失败，其它路径一个都不暂存。
+// 而回写的路径列表里天然带着这种路径 —— `apps.json` 在**第一次落地之前**就是
+// 这个状态（空仓库里它还不存在，第一次要提交的正是一个新来源）。不摘掉它，
+// 空仓库里的第一条来源永远提交不了，而失败信息指向的是提交而不是"文件还没有"。
+//
+// 工作区里有它 → 留着；工作区里没有但**索引里有** = 一次删除，也必须留着
+// （`git add` 会把删除正常暂存，摘掉它等于那次删除永远提交不了）。
+func (c *Client) stageable(ctx context.Context, paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, err := os.Stat(filepath.Join(c.Dir, p)); err == nil {
+			out = append(out, p)
+			continue
+		}
+		if _, err := c.run(ctx, "ls-files", "--error-unmatch", "--", p); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Push 把当前分支推到 origin。

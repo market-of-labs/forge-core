@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -379,32 +378,26 @@ func (c *Client) ListAssets(ctx context.Context, repo string, releaseID int64) (
 // 调用方负责**幂等**：上传前先 ListAssets 看目标名在不在（03 §3.1：幂等按 asset 名判断，
 // **禁止 --clobber** —— 覆盖会让正在下载的客户端拿到半个文件）。
 // 本函数不替它做这件事，因为"该不该跳过"是业务判断。
-func (c *Client) UploadAsset(ctx context.Context, repo string, releaseID int64, name string, content io.Reader) (*Asset, error) {
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-
-	go func() {
-		w, err := mw.CreateFormFile("file", name)
-		if err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		if _, err := io.Copy(w, content); err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		pw.CloseWithError(mw.Close())
-	}()
-
+//
+// ⚠️ `size` 必须如实给：uploads.github.com **拒收 chunked 请求体**，回的是
+// `400 {"message":"Bad Content-Length"}`。这里曾经用 io.Pipe 拼 multipart 边算边发 ——
+// 长度不可知，Go 就退化成 chunked，于是**一个 asset 都没上传成功过**：Release 建出来了、
+// 里面永远空着，而错误在镜像侧被 D44 容忍成一条 ERROR 而已（见 MirrorUpstream）——
+// 整轮照样是绿的。
+// multipart 的长度还得自己算，所以这里直接发裸 body（GitHub 文档里的 `--data-binary @file`），
+// 名字仍然走 query。传错了会失败得很响：Go 在 body 长度与 Content-Length 对不上时报错，
+// 不会截断成半个文件 —— 那是这条路径唯一不能出的错（03 §3.1）。
+func (c *Client) UploadAsset(ctx context.Context, repo string, releaseID int64, name string, content io.Reader, size int64) (*Asset, error) {
 	u := fmt.Sprintf("%s/repos/%s/releases/%d/assets?name=%s",
 		c.uploadBaseURL.String(), repo, releaseID, url.QueryEscape(name))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, pr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, content)
 	if err != nil {
 		return nil, err
 	}
 	c.setHeaders(req)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = size
 
 	resp, err := c.http.Do(req)
 	if err != nil {

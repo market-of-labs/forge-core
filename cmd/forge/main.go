@@ -229,10 +229,8 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 		if err := fs.Parse(args); err != nil {
 			return exitUsage, err
 		}
+		// 报告由 Reconcile 自己在出口打（放这儿只有这一个动词能打，handle-dispatch 打不着）。
 		res, err := job.Reconcile(ctx, c, job.ReconcileOptions{OnlyID: *only, DryRun: *dry})
-		if res != nil && res.Report != nil {
-			c.Reportf(res.Report)
-		}
 		if err != nil {
 			return exitFailed, err
 		}

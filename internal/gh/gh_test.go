@@ -7,11 +7,37 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/market-of-labs/forge-core/internal/gh"
 )
+
+// uploadFile 造一个**真实文件**当上传的入参 —— 生产里就是 *os.File。
+//
+// 这里不能图省事用 strings.NewReader：http.NewRequest 只对
+// *bytes.Buffer / *bytes.Reader / *strings.Reader 自动推断长度，那三种会被
+// 自动补上 Content-Length，于是**即使 UploadAsset 不设长度测试也照样通过** ——
+// 测试会把要钉的那一行完美绕过去。*os.File 不在名单里，正好与生产一致。
+func uploadFile(t *testing.T, content string) (*os.File, int64) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "a.apk")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, fi.Size()
+}
 
 // testToken 用一个明显可识别的值，好让"token 有没有漏进错误信息"这类断言好写。
 const testToken = "github_pat_11ABCDEFG_secret_value_do_not_log"
@@ -166,7 +192,7 @@ func TestErrorsNeverLeakToken(t *testing.T) {
 				io.WriteString(w, "too big")
 			},
 			call: func(c *gh.Client) error {
-				_, err := c.UploadAsset(context.Background(), "o/r", 1, "a.apk", strings.NewReader("x"))
+				_, err := c.UploadAsset(context.Background(), "o/r", 1, "a.apk", strings.NewReader("x"), 1)
 				return err
 			},
 		},
@@ -305,38 +331,63 @@ func TestRepoSlugStaysInPath(t *testing.T) {
 	}
 }
 
-func TestUploadSendsMultipartWithFilename(t *testing.T) {
+// 上传必须**自报长度**。uploads.github.com 拒收 chunked（400 "Bad Content-Length"），
+// 而 httptest 服务端对 chunked 是照单全收的 —— 所以这一条只有把 ContentLength 本身钉住
+// 才有意义：只看"服务端收到了完整 body"是钉不住的，那正是漏掉这个 bug 的原因。
+//
+// 曾经用 io.Pipe 拼 multipart 流式发送（长度不可知 → chunked），于是一个 asset 都没传上去，
+// 而 Release 建得好好的、里面永远空着。复现方式：把 ContentLength 那行删掉，
+// 这里会读到 -1（分块传输），真实环境则直接 400。
+func TestUploadSendsRawBodyWithContentLength(t *testing.T) {
+	const content = "APKDATA"
 	var gotName, gotCT string
+	var gotCL, gotLen int64
 	var gotBody string
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotName = r.URL.Query().Get("name")
 		gotCT = r.Header.Get("Content-Type")
+		gotCL = r.ContentLength
 		b, _ := io.ReadAll(r.Body)
-		gotBody = string(b)
+		gotLen, gotBody = int64(len(b)), string(b)
 		io.WriteString(w, `{"id":9,"name":"com.foo-1.0-universal.apk"}`)
 	})
 
+	f, size := uploadFile(t, content)
 	a, err := c.UploadAsset(context.Background(), "market-of-labs/store", 7,
-		"com.foo-1.0-universal.apk", strings.NewReader("APKDATA"))
+		"com.foo-1.0-universal.apk", f, size)
 	if err != nil {
 		t.Fatalf("UploadAsset：%v", err)
 	}
 	if gotName != "com.foo-1.0-universal.apk" {
 		t.Errorf("?name= 是 %q", gotName)
 	}
-	if !strings.HasPrefix(gotCT, "multipart/form-data") {
+	if gotCL != int64(len(content)) {
+		t.Errorf("Content-Length = %d（-1 表示走成了 chunked，GitHub 会回 400）：want %d",
+			gotCL, len(content))
+	}
+	if gotLen != int64(len(content)) || gotBody != content {
+		t.Errorf("body 应当就是文件本身：CL=%d body=%q", gotLen, gotBody)
+	}
+	if gotCT != "application/octet-stream" {
 		t.Errorf("Content-Type = %q", gotCT)
-	}
-	// 文件名既在 query 里也在 part 的 filename 里 —— 两者不一致时 GitHub 以 query 为准，
-	// 但只发 query 会让某些代理/日志看不出这是在传什么。
-	if !strings.Contains(gotBody, `filename="com.foo-1.0-universal.apk"`) {
-		t.Errorf("multipart 里没有 filename：%s", gotBody)
-	}
-	if !strings.Contains(gotBody, "APKDATA") {
-		t.Errorf("multipart 里没有内容：%s", gotBody)
 	}
 	if a.ID != 9 {
 		t.Errorf("返回的 asset id = %d", a.ID)
+	}
+}
+
+// 长度报错了必须**报错**，而不是悄悄传半截 —— 半个 APK 比没有更糟：
+// 客户端会当成一个能用的版本下下来。Go 的传输层在这里挡得住。
+func TestUploadRejectsShortBody(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		io.WriteString(w, `{"id":9}`)
+	})
+	f, _ := uploadFile(t, "短")
+	_, err := c.UploadAsset(context.Background(), "market-of-labs/store", 7,
+		"com.foo-1.0-universal.apk", f, 999)
+	if err == nil {
+		t.Fatal("声明的长度与 body 不符时应当报错，而不是传出去")
 	}
 }
 

@@ -58,6 +58,15 @@ type ReconcileResult struct {
 func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileResult, error) {
 	res := &ReconcileResult{Report: &model.Report{}}
 
+	// 报告在**每一个出口**都打出来，包括中途失败的那些。
+	//
+	// 为什么放在这儿而不是让调用方打：res.Report 是这一轮唯一的诊断载体，而五个调用点里
+	// 原先只有独立的 `reconcile` 动词会打它 —— 偏偏 CI 入口 `handle-dispatch` 走的不是那个。
+	// 于是镜像里记录的硬 ERROR（"上传 asset …：HTTP 400 Bad Content-Length"）整整一路
+	// 不留痕迹：workflow 是绿的，日志里只看到下游那句"apps 为空"，像另一件事。
+	// 失败被容忍（D44）本来就该靠报告被人看见，报告再没人打就等于没有。
+	defer func() { c.Reportf(res.Report) }()
+
 	// **在镜像之前**就把"索引是不是空的"记下来。镜像会往 c.Index 里追加版本，
 	// 在这里之后再看就已经不是"加载时的状态"了 —— 而自愈要判断的恰恰是后者。
 	//

@@ -500,7 +500,14 @@ func (c *Ctx) uploadAsset(ctx context.Context, repo string, rel *gh.Release, tar
 	}
 	defer f.Close()
 
-	if _, err := c.GH.UploadAsset(ctx, c.Env.StoreRepo, rel.ID, target, f); err != nil {
+	// 长度必须来自文件本身：UploadAsset 要如实报 Content-Length（见那里的 ⚠️），
+	// 而 gh.Asset.Size 是上游自己报的数，不该拿它当我们的字节数。
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	if _, err := c.GH.UploadAsset(ctx, c.Env.StoreRepo, rel.ID, target, f, fi.Size()); err != nil {
 		return fmt.Errorf("上传 %s：%w", target, err)
 	}
 	c.Log("  %s → %s（%d 字节）", a.Name, target, a.Size)

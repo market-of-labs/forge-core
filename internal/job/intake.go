@@ -684,7 +684,13 @@ func (c *Ctx) moveAsset(ctx context.Context, rel *gh.Release, releaseID int64, t
 	}
 	defer f.Close()
 
-	if _, err := c.GH.UploadAsset(ctx, c.Env.StoreRepo, releaseID, target, f); err != nil {
+	// 长度取自文件本身（UploadAsset 要如实报 Content-Length，见那里的 ⚠️）。
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	if _, err := c.GH.UploadAsset(ctx, c.Env.StoreRepo, releaseID, target, f, fi.Size()); err != nil {
 		return fmt.Errorf("搬运 %s → %s：%w", a.Name, target, err)
 	}
 	return nil

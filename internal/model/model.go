@@ -280,6 +280,18 @@ type Version struct {
 	// 一个字节都不用下。缺该字段时按"未镜像"处理（会多下一次，然后被 asset 名幂等挡住），
 	// 所以缺元数据的版本照样能读。
 	UpstreamTag string `json:"upstreamTag,omitempty"`
+	// ReleaseNote 是**上游那个 Release 的正文**（发布方写的更新说明），markdown 原文。
+	//
+	// 它是"每版一份"的东西，所以存账本；而**我们 Release 的正文**放的是上游 README
+	// （项目级、与版本无关，见 job.syncReleaseBody）。两者是不同的东西：一个是"这一版
+	// 改了什么"，一个是"这个 App 是干什么的"。
+	//
+	// 它**不在我们自己 Release 的元数据里**（那份 body 已经被 README 占了），所以和
+	// versionName/versionCode/publishedAt/upstreamTag 是同一类东西：重建账本时只能从
+	// 旧账本里继承回来，否则 build-index 会**静默**丢掉它。
+	//
+	// 暂时不进清单（`changeLog` 仍然留空，理由见 manifest.Build 里的 URI 预算）。
+	ReleaseNote string `json:"releaseNote,omitempty"`
 	// Assets 是该版本的全部分片，**顺序即 apkUrls 的顺序**（02 §2.4：universal 在前）。
 	Assets []Asset `json:"assets"`
 }

@@ -2,6 +2,8 @@ package job
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -312,3 +314,63 @@ func TestUpstreamAssetDownloadsUseUpstreamRepo(t *testing.T) {
 // emptyZip 是一个零条目的合法 zip：让 apkmeta.Read 干净地报"读不出元数据"，
 // 而不是拿一段乱码去试探它的容错。
 var emptyZip = append([]byte("PK\x05\x06"), make([]byte, 18)...)
+
+// TestSyncReleaseBodyFromUpstreamReadme 钉住"正文 = 上游 README"，以及**相同就不写**。
+//
+// 后半条不是省请求的洁癖：内部 Release 是应用级的、正文只有一份，而镜像轮次里
+// 绝大多数时候 README 一个字节都没变 —— 每轮都 PATCH 一次等于每天对每个应用写一次
+// Release，白造一堆无意义的写入。
+func TestSyncReleaseBodyFromUpstreamReadme(t *testing.T) {
+	const md = "# 上游项目\n\n这个 App 是干什么的。\n"
+	var patched []string
+	var reads int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/readme"):
+			reads++
+			io.WriteString(w, fmt.Sprintf(`{"name":"README.md","encoding":"base64","content":%q}`,
+				base64.StdEncoding.EncodeToString([]byte(md))))
+		case r.Method == http.MethodPatch:
+			var p map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+				t.Errorf("解 PATCH 体：%v", err)
+			}
+			b, _ := p["body"].(string)
+			patched = append(patched, b)
+			io.WriteString(w, `{"id":1,"tag_name":"com.x"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"message":"Not Found"}`)
+		}
+	}))
+	defer srv.Close()
+
+	ghc, err := gh.New(gh.Config{Token: "t", BaseURL: srv.URL, UploadBaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("建客户端：%v", err)
+	}
+	c := &Ctx{Env: &Env{StoreRepo: "o/store"}, GH: ghc, Log: func(string, ...any) {}}
+	ctx := context.Background()
+
+	// 现有正文与 README 不同 → 写一次。
+	rel := &gh.Release{ID: 1, TagName: "com.x", Body: "上一次同步的旧正文"}
+	if err := c.syncReleaseBody(ctx, rel, "owner/up"); err != nil {
+		t.Fatalf("syncReleaseBody：%v", err)
+	}
+	if len(patched) != 1 || patched[0] != md {
+		t.Fatalf("正文没写成上游 README：%q", patched)
+	}
+
+	// 已经一致 → 一次 PATCH 都不该有（但仍要去读 README 才知道一不一致）。
+	rel.Body = md
+	if err := c.syncReleaseBody(ctx, rel, "owner/up"); err != nil {
+		t.Fatalf("syncReleaseBody：%v", err)
+	}
+	if len(patched) != 1 {
+		t.Fatalf("正文没变却 PATCH 了 %d 次", len(patched)-1)
+	}
+	if reads != 2 {
+		t.Fatalf("README 读取次数 = %d，期望 2", reads)
+	}
+}

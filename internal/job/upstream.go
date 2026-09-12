@@ -306,6 +306,11 @@ func (c *Ctx) mirrorPlan(ctx context.Context, p *Plan, opts MirrorOptions, out *
 		if err != nil {
 			return fmt.Errorf("列 %s 的 asset：%w", appID, err)
 		}
+		// 顺手把 Release 正文刷成上游 README（D51）。只告警不返回错误：正文是展示信息，
+		// 不该让一个应用这一轮的镜像白跑（§4.4 的容忍口径），下一轮镜像时会再来一次。
+		if err := c.syncReleaseBody(ctx, rel, p.Source.Upstream.Repo); err != nil {
+			out.Problems.Warnf(appID, "%v", err)
+		}
 	}
 
 	// 这一轮为这个上游 Release 攒出的分片。key 是 version token。
@@ -439,6 +444,9 @@ func (c *Ctx) recordIndex(appID string, p *Plan, got map[string]*versionAcc, tok
 			if v.VersionCode == 0 {
 				v.VersionCode = b.versionCode
 			}
+			if v.ReleaseNote == "" {
+				v.ReleaseNote = p.Release.Body
+			}
 			v.UpstreamTag = p.Release.TagName
 			continue
 		}
@@ -451,6 +459,9 @@ func (c *Ctx) recordIndex(appID string, p *Plan, got map[string]*versionAcc, tok
 			// 是给用户看的"这个版本什么时候发的"，用镜像时间会系统性地偏晚。
 			PublishedAt: p.Release.PublishedAt,
 			UpstreamTag: p.Release.TagName,
+			// 上游那一版的更新说明。只在这一轮真的镜像了它时才拿得到，所以它随
+			// upstreamTag 一起落账本 —— 之后重建账本只能靠继承（见 index.go）。
+			ReleaseNote: p.Release.Body,
 			Assets:      assets,
 		})
 	}
@@ -487,6 +498,33 @@ func (c *Ctx) readAssetMeta(ctx context.Context, repo string, a gh.Asset) (*apkm
 	}
 	defer cleanup()
 	return apkmeta.Read(path)
+}
+
+// syncReleaseBody 把内部 Release 的正文刷成上游 README（D51）。
+//
+// # 为什么正文是 README，而版本说明进的是账本
+//
+// 内部 Release 是**一个 App 一个**（`tag = {appId}`，全部版本的 asset 都挂在同一个
+// Release 下），正文因此只有一份 —— 而"这一版改了什么"是每版一份的东西，塞进这一份
+// 正文里只会互相覆盖，所以它进账本（`model.Version.ReleaseNote`）。正文留给
+// "这个 App 是干什么的"，那正好是 README：项目级、与版本无关。
+//
+// 正文相同就不 PATCH：README 是项目级的，绝大多数轮次里它一个字节都没变，
+// 没必要每次镜像都写一次 Release（而 PATCH 改正文不产生状态跃迁，不会误发车）。
+func (c *Ctx) syncReleaseBody(ctx context.Context, rel *gh.Release, repo string) error {
+	md, err := c.GH.Readme(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("取上游 %s 的 README 失败，%s 的正文保持原样：%w", repo, rel.TagName, err)
+	}
+	if md == "" || md == rel.Body {
+		return nil
+	}
+	body := md
+	if _, err := c.GH.UpdateRelease(ctx, c.Env.StoreRepo, rel.ID, gh.ReleasePatch{Body: &body}); err != nil {
+		return fmt.Errorf("写 %s 的 Release 正文失败：%w", rel.TagName, err)
+	}
+	c.Log("  %s 的正文已同步为上游 README（%d 字节）", rel.TagName, len(md))
+	return nil
 }
 
 // uploadAsset 把一个上游 asset 以目标名上传到内部 Release。

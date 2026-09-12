@@ -15,6 +15,7 @@ package gh
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -150,6 +151,9 @@ type ReleasePatch struct {
 	Draft      *bool   `json:"draft,omitempty"`
 	Prerelease *bool   `json:"prerelease,omitempty"`
 	Name       *string `json:"name,omitempty"`
+	// Body 是 Release 正文（description）。用来把上游 README 同步过去（D51）——
+	// 改正文不产生状态跃迁，所以不会触发 `release` 事件（03 §3.2）。
+	Body *string `json:"body,omitempty"`
 	// MakeLatest 对应 API 的 make_latest（"true"/"false"/"legacy"）。
 	// 规则 4：内部 Release 操作一律 "false" —— 每次 draft→published 都会重打
 	// published_at，用 false 才不会让 Release 跳到列表顶部、让 /releases/latest 抖动。
@@ -350,6 +354,42 @@ func (c *Client) Unpublish(ctx context.Context, repo string, id int64) (*Release
 	draft := true
 	no := "false"
 	return c.UpdateRelease(ctx, repo, id, ReleasePatch{Draft: &draft, MakeLatest: &no})
+}
+
+// ---- 仓库内容 ----------------------------------------------------------------
+
+// Readme 取仓库的 README 正文（markdown 原文）。
+//
+// 走默认的 JSON 媒体类型 + 自己解 base64，而不是切到 `application/vnd.github.raw`：
+// 后者要绕开 do() 另写一条请求路径，而它换来的只有省下 33% 的传输量。
+//
+// **没有 README 时返回空串且不报错** —— 仓库可以没有 README，那是正常状态而非失败；
+// 调用方拿到空串就什么都不做。
+func (c *Client) Readme(ctx context.Context, repo string) (string, error) {
+	var r struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, c.repoURL(repo, "readme"), nil, &r); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	if r.Encoding != "base64" {
+		return "", fmt.Errorf("README 的 encoding 是 %q（只认 base64）", r.Encoding)
+	}
+	if r.Content == "" {
+		// 1MB 以上的文件在这个媒体类型下 content 是空的，只能走 raw。
+		return "", fmt.Errorf("README 内容为空（超过 1MB 的文件只走 raw 媒体类型）")
+	}
+	// base64.NewDecoder 会**忽略换行**：GitHub 的 base64 每 60 个字符插一个 \n，
+	// 直接用 base64.StdEncoding.DecodeString 会当场报错。
+	b, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, strings.NewReader(r.Content)))
+	if err != nil {
+		return "", fmt.Errorf("解 README 的 base64：%w", err)
+	}
+	return string(b), nil
 }
 
 // ---- Asset ------------------------------------------------------------------

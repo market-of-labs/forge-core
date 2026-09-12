@@ -2,6 +2,7 @@ package gh_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -435,5 +436,55 @@ func TestDownloadAssetAsksForOctetStream(t *testing.T) {
 	b, _ := io.ReadAll(rc)
 	if string(b) != "BINARY" {
 		t.Errorf("内容 = %q", b)
+	}
+}
+
+// TestReadme 钉住三件事：端点路径、**带换行的 base64** 解得开、没有 README 时是空串而非错误。
+//
+// 三条都是真会踩的：路径写错是 404（被当成"上游没写 README"而静默），base64 里每 60 个
+// 字符一个 \n（用 StdEncoding.DecodeString 会当场报错），而 404 若当成错误冒泡上去，
+// 一个没有 README 的上游会在每轮对账里刷一条 WARN。
+func TestReadme(t *testing.T) {
+	var gotPath string
+	const md = "# 示例项目\n\n一段说明。\n"
+	// 这是 GitHub 真实返回的形状：base64，且每 60 个字符插一个换行。
+	var buf strings.Builder
+	enc := base64.StdEncoding.EncodeToString([]byte(md))
+	for i := 0; i < len(enc); i += 60 {
+		end := i + 60
+		if end > len(enc) {
+			end = len(enc)
+		}
+		buf.WriteString(enc[i:end] + "\n")
+	}
+
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if strings.Contains(gotPath, "noreadme") {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
+		fmt.Fprintf(w, `{"name":"README.md","encoding":"base64","content":%q}`, buf.String())
+	})
+
+	got, err := c.Readme(context.Background(), "owner/up")
+	if err != nil {
+		t.Fatalf("Readme：%v", err)
+	}
+	if gotPath != "/repos/owner/up/readme" {
+		t.Errorf("路径 = %q", gotPath)
+	}
+	if got != md {
+		t.Errorf("正文 = %q，期望 %q", got, md)
+	}
+
+	// 上游没有 README：空串 + nil（调用方什么都不做），而**不是**一个错误。
+	empty, err := c.Readme(context.Background(), "owner/noreadme")
+	if err != nil {
+		t.Fatalf("没有 README 不该报错：%v", err)
+	}
+	if empty != "" {
+		t.Errorf("没有 README 时应为空串，得到 %q", empty)
 	}
 }

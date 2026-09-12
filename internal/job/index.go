@@ -44,8 +44,8 @@ type assetGroup struct {
 // Release 是唯一不可辩驳的事实 —— asset 名里的 `{version}` 与 `{abi}` 就是 02 §2.4
 // 那份硬依赖的全部载体。
 //
-// 但**元数据**（versionName / versionCode / publishedAt / upstreamTag）在 Release 里没有，
-// 只存在于账本自己、或 APK 内部。所以本函数对它们的策略是：
+// 但**元数据**（versionName / versionCode / publishedAt / upstreamTag / releaseNote）
+// 在 Release 里没有，只存在于账本自己、或 APK 内部。所以本函数对它们的策略是：
 //
 //	现有账本里有   → 原样保留（它记的是镜像**当时**读到的事实）
 //	现有账本里没有 → 用 APK 内容补齐（需 FetchMissing），或如实留空并告警
@@ -241,6 +241,10 @@ func buildLedger(ctx context.Context, c *Ctx, src *model.Source, groups []assetG
 			v.VersionCode = oldVer.VersionCode
 			v.PublishedAt = oldVer.PublishedAt
 			v.UpstreamTag = oldVer.UpstreamTag
+			// releaseNote 同属这一串：它只在上游的 Release 里，我们自己的 Release 元数据
+			// 里没有 —— 忘了继承，症状是"每轮重建之后更新说明就没了"，而且是静默的
+			// （清单照样合法、check-manifest 照样过）。
+			v.ReleaseNote = oldVer.ReleaseNote
 		}
 
 		if v.VersionName == "" && opts.FetchMissing {

@@ -581,12 +581,42 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 		return nil, fmt.Errorf("读 %s Release：%w", model.IncomingTag, err)
 	}
 
+	// 复位是**退出时的无条件动作**，不是"搬成功之后再做的一件事"（§3.2 / 规则 6）。
+	// 从读到这个 published 队列的那一刻起，无论从哪条路出去 —— 空队列、白名单拒绝、
+	// 全被保留、中途某个 API 报错 —— 队列都必须回到 draft。
+	//
+	// ⚠️ 少复位一次就**死锁**，而且死得静悄悄：published 的 Release 在网页上只有
+	// Update / Delete、**没有 Publish 按钮**，往它上传 APK 又不触发任何事件（§3.3）。
+	// 用户修好包名、重新上传、然后对着一个再也按不动的 Publish 发呆 —— 这一整类
+	// 卡死都是一个漏掉的出口造出来的，所以它由 defer 统一兜住，而不是逐个 return 补。
+	//
+	// 顺序上"先改 draft 再删 asset"：删到一半失败时，剩下的 asset 不会因为一次
+	// 误 Publish 而被重新解析。
+	var movedIDs []int64
+	defer func() {
+		// 收尾要给足机会：ctx 可能已经超时/被取消，而队列复位恰恰是那时最要紧的
+		// 一件事 —— 用一个不受取消影响的 ctx 去发这一步。
+		cctx := context.WithoutCancel(ctx)
+		if err := c.cleanIncoming(cctx, rel, movedIDs, len(res.Kept)); err != nil {
+			// 不复写返回值：真正的原因（上面那个 err）比收尾失败更重要，别把它盖掉。
+			// 但必须吼出来，并把手工出路写在脸上 —— 这一步失败就是上面那个死锁。
+			c.Log("⚠️ `%s` 复位回 draft 失败：%v —— 请手动 Edit → Convert to draft，"+
+				"否则之后上传的 APK 不会触发任何流程（03 §3.2）", model.IncomingTag, err)
+			return
+		}
+		res.Cleaned = true
+	}()
+
 	assets, err := c.GH.ListAssets(ctx, c.Env.StoreRepo, rel.ID)
 	if err != nil {
 		return nil, fmt.Errorf("列 %s 的 asset：%w", model.IncomingTag, err)
 	}
 	if len(assets) == 0 {
-		// 规则 3：空队列直接退出。这是重复 Publish 最常见的样子。
+		// 规则 3：空队列没有可搬的东西。这是重复 Publish 最常见的样子 ——
+		// 但"没有可搬的"不等于"可以什么都不做"：**此刻队列是 published 的**
+		// （能从 tag 读回来就说明如此），而 published 的 Release 在网页上
+		// **没有 Publish 按钮**，往它上面传 APK 又不触发任何事件（§3.3）。
+		// 所以照样要复位 —— 下面那个 defer 兜着，这里不用再写一遍。
 		c.Log("`%s` 里没有 asset，无事可做（规则 3）", model.IncomingTag)
 		return res, nil
 	}
@@ -606,7 +636,6 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 	// 这是唯一知道 versionName/versionCode 的时刻（Release 里没有它们）。
 	placed := map[string]map[string]*placedVersion{}
 
-	var movedIDs []int64
 	for _, a := range assets {
 		meta, err := c.readIncomingMeta(ctx, a)
 		if err != nil {
@@ -719,17 +748,8 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 		res.AppIDs = append(res.AppIDs, id)
 	}
 
-	// 清场：改回 draft + 删掉**已搬运**的 asset（§3.2 / 规则 6）。
-	//
-	// 顺序是"先改 draft 再删"：删到一半失败时，`_incoming` 已经是 draft 了，
-	// 剩下的 asset 不会因为一次误 Publish 而被重新解析 —— 而反过来，
-	// 删干净了却忘了改 draft，下次 Publish 会把空队列搬一遍（无害，但白跑）。
-	if len(movedIDs) > 0 {
-		if err := c.cleanIncoming(ctx, rel, movedIDs, len(res.Kept)); err != nil {
-			return res, err
-		}
-		res.Cleaned = true
-	}
+	// 清场（改回 draft + 删掉已搬运的 asset）不在这里做 —— 开头那个 defer 负责。
+	// 放在这里只能覆盖走得最顺的那条路，而漏掉的每一条出口都是一次静默死锁。
 
 	// 没能安置的留在原地，必须点名 —— 否则它们会静静地攒在 _incoming 里，
 	// 而"攒着"表现为"每次 Publish 都搬一遍同样的几个文件"。

@@ -1,9 +1,14 @@
 package job
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/market-of-labs/forge-core/internal/apkmeta"
+	"github.com/market-of-labs/forge-core/internal/gh"
 	"github.com/market-of-labs/forge-core/internal/model"
 	"github.com/market-of-labs/forge-core/internal/store"
 )
@@ -89,5 +94,80 @@ func TestCreateManualSource_RejectsReservedAppID(t *testing.T) {
 	}
 	if got, err := c.Repo.LoadSources(); err != nil || len(got) != 0 {
 		t.Errorf("失败了却写了文件：%+v（%v）", got, err)
+	}
+}
+
+// 队列**从哪条路出去都必须复位回 draft** —— 一次漏掉就是一个静默死锁：
+// published 的 Release 在网页上只有 Update / Delete、没有 Publish 按钮，
+// 而往它上传 APK 不触发任何事件（03 §3.3），于是"传了文件却没反应"，
+// 且用户没有任何按钮能把队列重新武装起来（2026-09-12 实际撞上过一次）。
+//
+// 这条链上"没搬成"比"搬成了"更常见（上传的是 APK，随手传错是常态），所以下面两个
+// 用例都是**什么都没搬成**的那种出口 —— 它们曾经一个复位都没有。
+func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
+	cases := []struct {
+		name string
+		// ListAssets 的返回。空 = 重复 Publish 最常见的样子。
+		assets []map[string]any
+	}{
+		{name: "空队列", assets: nil},
+		{name: "有 asset 但读不出 APK（全被保留）", assets: []map[string]any{
+			{"id": 9, "name": "随手传的.zip", "size": len(emptyZip)},
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var patched []map[string]any
+			var deletes int
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases/tags/_incoming":
+					// draft:false 是前提：能从 tag 读回来就说明它已 published。
+					json.NewEncoder(w).Encode(map[string]any{
+						"id": 700, "tag_name": model.IncomingTag, "draft": false})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases/700/assets":
+					json.NewEncoder(w).Encode(tc.assets)
+				case r.Method == http.MethodPatch:
+					var p map[string]any
+					json.NewDecoder(r.Body).Decode(&p)
+					patched = append(patched, p)
+					json.NewEncoder(w).Encode(map[string]any{"id": 700, "tag_name": model.IncomingTag})
+				case r.Method == http.MethodDelete:
+					deletes++
+					w.WriteHeader(http.StatusNoContent)
+				default: // asset 下载：给一段不是 APK 的内容，读元数据必失败
+					w.Write(emptyZip)
+				}
+			}))
+			defer srv.Close()
+
+			ghc, err := gh.New(gh.Config{Token: "t", BaseURL: srv.URL, UploadBaseURL: srv.URL})
+			if err != nil {
+				t.Fatalf("建客户端：%v", err)
+			}
+			c := &Ctx{Env: &Env{Token: "t", StoreRepo: "o/store"}, GH: ghc, Log: func(string, ...any) {}}
+
+			res, err := IntakeIncoming(context.Background(), c)
+			if err != nil {
+				t.Fatalf("IntakeIncoming：%v", err)
+			}
+			if len(res.Moved) != 0 {
+				t.Fatalf("这个用例不该搬成任何东西：%v", res.Moved)
+			}
+
+			// 一处 PATCH，且是 draft:true —— 队列被重新武装起来。
+			if len(patched) != 1 || patched[0]["draft"] != true {
+				t.Fatalf("队列必须被改回 draft，实际 PATCH 了 %d 次：%v", len(patched), patched)
+			}
+			if !res.Cleaned {
+				t.Error("复位成功了，res.Cleaned 该是 true")
+			}
+			// 什么都没搬成 ⇒ 一个 asset 都不许删（§3.2：不安置就不丢）。
+			if deletes != 0 {
+				t.Errorf("没搬成的 asset 被删了 %d 个", deletes)
+			}
+		})
 	}
 }

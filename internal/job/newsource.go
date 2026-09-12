@@ -55,14 +55,6 @@ func (c *Ctx) intakeNewSource(ctx context.Context, is gh.Issue, d *IntakeDecisio
 		return nil, err
 	}
 
-	if src.IsManual() {
-		// 手动源没有上游可收敛，而清单也不会为一个还没有版本的 App 出条目（§5.4）——
-		// 所以这里不跑那次单项目对账：等第一份 APK 从 `_incoming` 搬进来时，
-		// 那条链的收尾自己会重建一次清单（intake-incoming → RebuildAndCheck）。
-		// 返回 nil 而不是空结果：调用方只用它写摘要行，而这里没有同步可报。
-		return nil, c.announceLanded(ctx, is, src, c.manualLandedReply(src, d.DescNote))
-	}
-
 	// 只收敛这一个 appId（03 §4.3）：进来的是一张单，不是"该全局收敛了"。全量的成本是
 	// 遍历所有上游，而申请人只关心他提交的那一个。这一步顺带把 apps.json 重建出来，
 	// 所以新应用是"一分钟内可装"，而不是"最多一天"。
@@ -90,17 +82,11 @@ func (c *Ctx) landNewSource(ctx context.Context, is gh.Issue, d *IntakeDecision)
 		return nil, "", false, c.askForInfo(ctx, is, d.Reply)
 	}
 
-	// 手动源**没有上游可探**：身份三件套是申请人自己填的（模板里那三个「仅手动上传时填」），
-	// 所以整段探测跳过，tag 也留空 —— 回评里不会写"身份是从哪次发布读出来的"，因为不成立。
-	src, tag := d.Source, ""
-	if !src.IsManual() {
-		var err error
-		src, tag, err = c.probeIdentity(ctx, d.Source)
-		if err != nil {
-			return nil, "", false, c.askForInfo(ctx, is, fmt.Sprintf(
-				"**没能从上游确定这个应用的身份**，本次收录没有完成。\n\n%s\n\n---\n%s",
-				err, retryHint))
-		}
+	src, tag, err := c.probeIdentity(ctx, d.Source)
+	if err != nil {
+		return nil, "", false, c.askForInfo(ctx, is, fmt.Sprintf(
+			"**没能从上游确定这个应用的身份**，本次收录没有完成。\n\n%s\n\n---\n%s",
+			err, retryHint))
 	}
 
 	// 已经有同 appId 的来源。appId 现在是从 APK 里读出来的，所以这一撞一定有实据
@@ -114,17 +100,11 @@ func (c *Ctx) landNewSource(ctx context.Context, is gh.Issue, d *IntakeDecision)
 			// 真的撞了：另一份来源占着这个包名。
 			// （`old.Upstream` 可能是 nil —— 手动来源没有上游，但那不是"名字像"，
 			// 而是实实在在占了同一个安装身份，所以 originOf 会把它说清楚。）
-			head := "解析出来的包名"
-			if src.IsManual() {
-				// 手动源的包名不是解析出来的，是申请人自己填的 —— 说成"解析出来"
-				// 会让人以为是 forge 读错了包名。
-				head = "你填的包名"
-			}
 			return nil, "", false, c.askForInfo(ctx, is, fmt.Sprintf(
-				"%s是 `%s`，而 `sources/` 里**已经有**这个应用了（%s）。\n\n"+
+				"解析出来的包名是 `%s`，而 `sources/` 里**已经有**这个应用了（%s）。\n\n"+
 					"Obtainium 用包名当安装身份，所以同一个包名在本市场里只能有一条记录。\n\n"+
 					"要改它的元数据、暂停或移除，请用 **`change-source.yml`**（03 §2.5 规则 5）。",
-				head, src.ID, originOf(old)))
+				src.ID, originOf(old)))
 		}
 		// 是同一份申请（或别人重复提交了同一件事）：文件早就在了，只是上一次的收尾
 		// 没走完。当作"已落地"继续往下 —— 重写一遍是幂等的（内容没变时 CommitBack
@@ -166,13 +146,10 @@ func (c *Ctx) askForInfo(ctx context.Context, is gh.Issue, reply string) error {
 	return nil
 }
 
-// landedReply 组装**标准源**的「已收录」回评，末段如实交代**这一轮**镜像发生了什么。
+// landedReply 组装「已收录」回评，末段如实交代**这一轮**镜像发生了什么。
 //
-// 手动源走 manualLandedReply：它没有上游、也没有可交代的镜像结果，两者要说的不是同一件事。
-//
-// note 是裁决阶段攒下的提醒（简介被截断、以及标准源申请里填了不作数的身份三件套，
-// 见 decideAdd）—— 它只能从这里出去：被接受的新增单在裁决阶段没有 Reply，
-// 而原始正文只在 decideAdd 里露过一面。
+// note 是裁决阶段攒下的提醒（简介被截断，见 decideAdd）—— 它只能从这里出去：
+// 被接受的新增单在裁决阶段没有 Reply，而原始正文只在 decideAdd 里露过一面。
 func landedReply(src *model.Source, tag, note string, r *ReconcileResult, rerr error) string {
 	return fmt.Sprintf(
 		"已收录 `%s`。\n\n"+
@@ -193,33 +170,6 @@ func landedReply(src *model.Source, tag, note string, r *ReconcileResult, rerr e
 		orDefault(strings.Join(src.Categories, " / "), "未勾选"),
 		orDefault(strings.Join(src.ABIWhitelist, " / "), "全部"),
 		note, tag, model.MaxDescRunes, syncedNote(r, rerr))
-}
-
-// manualLandedReply 组装**手动源**的「已收录」回评。
-//
-// 与标准源分开写（而不是在同一段里插条件）是因为要说的不是同一件事：标准源收完就自动
-// 有了第一个版本，而手动源此刻**一个字节的二进制都还没有** —— 它进不了清单（§5.4 不写
-// 半成品条目），所以这段回评的重点是"下一步去哪传、以及哪件事会让它搬不进来"。
-func (c *Ctx) manualLandedReply(src *model.Source, note string) string {
-	return fmt.Sprintf(
-		"已收录 `%s`（**手动上传**来源）。\n\n"+
-			"| 字段 | 值 |\n|---|---|\n"+
-			"| 包名（appId） | `%s` |\n| 显示名（列表里显示的） | %s |\n| 作者 / 组织 | %s |\n"+
-			"| 来源 | 手动上传（没有上游，二进制走 `%s` 暂存区） |\n| 应用类型 | %s |\n"+
-			"| 分类标签 | %s |\n| 只镜像 ABI | %s |\n\n"+
-			"%s**它现在还不在 `apps.json` 里**：清单不收录还没有任何版本的条目（03 §5.4）。"+
-			"第一份 APK 搬进来时它才会出现，而搬进来只要三步：\n\n"+
-			"1. 打开 `%s` → **Releases** → 「`%s`」（常驻草稿）\n"+
-			"2. 把 APK 挂上去（文件名随意 —— 包名、版本、ABI 都从 APK 内容里读）\n"+
-			"3. 点 **Publish release**\n\n"+
-			"之后它会按 APK 里的 `package` 找回这条来源，搬到 tag=`%s` 的 Release 并重建清单。\n"+
-			"⚠️ 那个 APK 的 `package` 必须与上面的包名**逐字一致** —— 对不上就搬不进来"+
-			"（会留在暂存区，并回评告诉你它是哪个包名）。以后每发一版重复这三步。\n",
-		src.ID, src.ID, src.DisplayName(), src.Author, model.IncomingTag,
-		orDefault(src.Kind, "普通应用"),
-		orDefault(strings.Join(src.Categories, " / "), "未勾选"),
-		orDefault(strings.Join(src.ABIWhitelist, " / "), "全部"),
-		note, c.Env.StoreRepo, model.IncomingTag, src.ID)
 }
 
 // yesNo 把 bool 变成回评表格里的「是 / 否」。
@@ -248,25 +198,19 @@ func (c *Ctx) announceLanded(ctx context.Context, is gh.Issue, src *model.Source
 
 // sameRequest 判断一份已落地的来源是不是**这份申请自己**写出来的。
 //
-// 比的是**这份申请能决定的那一半**，两种来源各有一套：标准源比上游仓库 + 资产正则
-// （它们一起决定了"是哪个仓库的哪个 APK"），手动源比包名（它没有上游，包名是唯一由
-// 申请人主张的身份）。appId / 显示名 / 作者对标准源不参与比较 —— 那是从 APK 与仓库里
-// 探出来的，不是申请人的主张。
+// 比的是**这份申请能决定的那一半**：上游仓库 + 资产正则（它们一起决定了"是哪个仓库的
+// 哪个 APK"）。appId / 显示名 / 作者不参与比较 —— 那是从 APK 与仓库里探出来的，
+// 不是申请人的主张。
+//
+// 有一边没有 Upstream（撞上一条手动来源）时一律为 false：走这条路的新增单**永远**是
+// 标准源（手动上传不经过 issue，见 03 §3.2），所以那必然是别人的条目实实在在占了同一个
+// 安装身份 —— 该拒，该让人去用 change-source.yml。
 //
 // **拿整份文件比对是不行的**：显示名是从 APK 里读的，上游改过一次 label 就会让两份不再
 // 相等 —— 那会把"自家补跑"误判成"别人撞了包名"，正是这个函数要防的那件事。
 func sameRequest(old, half *model.Source) bool {
 	if old == nil || half == nil {
 		return false
-	}
-	if old.IsManual() || half.IsManual() {
-		// 手动源没有上游可比，而**包名就是这份申请的全部主张**：两份都是 manual 且包名
-		// 相同时，只可能是同一份申请重跑（上一次落了盘、收尾没走完）。这里返回 false 会
-		// 让那次重跑被回一句"已经有这个应用了，请用 change-source.yml" —— 对一份完全合法
-		// 的申请说错话，正是这个函数要防的那件事。
-		//
-		// 一份 manual、一份 github 时仍然为 false：那是真的占了同一个安装身份，该拒。
-		return old.IsManual() && half.IsManual() && old.ID == half.ID
 	}
 	if old.Upstream == nil || half.Upstream == nil {
 		return false

@@ -112,12 +112,13 @@ func DecideIntake(c *Ctx, body string) *IntakeDecision {
 	return d
 }
 
-// decideAdd 裁决一份新增申请（标准源或手动源）。
+// decideAdd 裁决一份新增申请。
 //
-// **它不写文件。** 标准源申请人填的只有 repo，appId 要从上游 APK 里读出来，而 DecideIntake
+// **它不写文件。** 申请人填的只有 repo，appId 要从上游 APK 里读出来，而 DecideIntake
 // 是纯函数、不许联网。所以这里只做两件不需要网络的事：取值、本地校验 —— 真正的解析与
-// 落盘紧接着在同一条链上做（见 newsource.go）。手动源没有那一步（身份三件套是申请人
-// 自己填的），所以它的决定里已经是一份完整可落盘的 Source。
+// 落盘紧接着在同一条链上做（见 newsource.go）。
+//
+// 手动上传**不经过这里**（03 §3.2）：没有「来源类型」下拉，也就没有手动源的单子。
 //
 // 这里也**不再回一段"已收到"**。那一段只是把申请人刚填的东西复述回去，而它与落盘后的
 // 「已收录」回评几乎逐行重叠 —— 一张单要读两条一样的表，还得分辨哪条是现在的。留下的
@@ -152,9 +153,6 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 			model.MaxDescRunes)
 	}
 
-	if r.Manual() {
-		return decideAddManual(r, desc, note)
-	}
 	return &IntakeDecision{
 		Accept:  true,
 		Summary: fmt.Sprintf("新增 %s", r.Repo),
@@ -176,40 +174,6 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 			ABIWhitelist: r.ABIWhitelist,
 			Desc:         desc,
 		},
-		DescNote: note + strayIdentityNote(r),
-	}
-}
-
-// decideAddManual 裁决一份手动源申请。
-//
-// 比标准源短得多，因为标准源那半条链（探身份）在它这里不存在：没有上游可读，
-// 三件套由申请人填。所以裁决阶段就拿出**一份完整的 Source** —— 落盘那一步不再需要网络，
-// 也不需要"半成品"那套交接（见 IntakeDecision.Source 的说明）。
-func decideAddManual(r *issue.AddRequest, desc, note string) *IntakeDecision {
-	src := &model.Source{
-		ID:     r.AppID,
-		Name:   r.Name,
-		Author: r.Author,
-		Source: model.SourceManual,
-		Desc:   desc,
-		// 上游那组一个都不带。`source: manual` 时长出 upstream 是**硬失败**，
-		// 由下面那次 Validate 兜住（这条路径上不可能构造出来，但校验不因此省）。
-		Categories:   r.Categories,
-		ABIWhitelist: r.ABIWhitelist,
-		Kind:         r.Kind,
-	}
-	// 唯一一处"整份校验"：id 的 charset（包名里不能有斜杠）、保留名 `_incoming`、
-	// desc 长度、kind 与 ABI 词表 —— 全部复用来源文件那条入口的规则，不另写一份。
-	// 传进去的是**裁过**的简介，所以"简介超长"不会在这里把人拒掉（裁而不拒，见 TruncateDesc）。
-	if err := src.Validate(""); err != nil {
-		return reject(fmt.Sprintf("申请内容不合法：%v", err))
-	}
-	return &IntakeDecision{
-		Accept:  true,
-		Summary: fmt.Sprintf("新增 %s（手动上传）", src.ID),
-		Source:  src,
-		// 这里只有"简介被裁过"这一句。**"下一步去传 APK"不在这一层说** —— 它属于
-		// 落盘之后的回评（manualLandedReply），因为那时"已收录"才是真话。
 		DescNote: note,
 	}
 }
@@ -220,9 +184,6 @@ func decideAddManual(r *issue.AddRequest, desc, note string) *IntakeDecision {
 // owner/name 形状与正则可编译，`naming.IsABI` 是固定 ABI 集），所以 issue 能写进来的
 // 东西不可能比手改文件能写进来的更多 —— 这里只是换个调用方式，不是第二套规则。
 func validateAdd(r *issue.AddRequest) error {
-	if r.Manual() {
-		return validateAddManual(r)
-	}
 	up := &model.Upstream{
 		Type:         model.UpstreamGitHubRelease,
 		Repo:         r.Repo,
@@ -231,59 +192,6 @@ func validateAdd(r *issue.AddRequest) error {
 	if err := up.Validate(); err != nil {
 		return err
 	}
-	return validateLists(r)
-}
-
-// validateAddManual 校验手动源申请。
-//
-// 与标准源的分工一样：这里只判"申请人写的东西自洽吗"，**不判包名是不是真的存在** ——
-// 那要等 APK 传进来才知道，判据是"`_incoming` 里那个 APK 的 package 能不能找到这条来源"
-// （找不到就留在暂存区并回评，见 intake-incoming）。所以这一层的全部工作是把话提前说清：
-// 填漏了、或者把上游那一组也填了。
-func validateAddManual(r *issue.AddRequest) error {
-	var missing []string
-	if r.AppID == "" {
-		missing = append(missing, "包名")
-	}
-	if r.Name == "" {
-		missing = append(missing, "显示名")
-	}
-	if r.Author == "" {
-		missing = append(missing, "作者 / 组织")
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("来源类型选了「%s」，但这几项是空的：%s。\n\n"+
-			"手动源没有上游，这三样无从读起 —— 只能由申请人填（03 §2.2 B）。"+
-			"其中包名会被用来把上传的 APK 认回家，必须与 APK 里的 `package` 逐字一致",
-			issue.OriginManual, strings.Join(missing, "、"))
-	}
-
-	// 上游那一组对手动源没有意义。**拒绝并点名，而不是静默忽略** —— 与 change-source.yml
-	// 拒绝「手动源改资产正则」同一个理由：让人以为改成功了，比拒绝难发现得多。
-	var stray []string
-	if r.Repo != "" {
-		stray = append(stray, issue.LabelRepo)
-	}
-	if r.AssetPattern != "" {
-		stray = append(stray, issue.LabelAssetPat)
-	}
-	if r.IncludePrerelease {
-		stray = append(stray, issue.LabelPrerelease)
-	}
-	if len(stray) > 0 {
-		return fmt.Errorf("来源类型选了「%s」（没有上游），但还填了：%s。\n\n"+
-			"这几项一起去掉再提交即可；如果它其实有上游仓库，请把来源类型改回「%s」",
-			issue.OriginManual, strings.Join(stray, "、"), issue.OriginGitHub)
-	}
-
-	return validateLists(r)
-}
-
-// validateLists 校验两组列表与 kind —— 标准源与手动源都会填的那些字段。
-//
-// 抽出来的唯一理由是避免为手动源再抄一份：词表与 kind 规则都在 model / naming 里，
-// 这里只是换个调用方式。
-func validateLists(r *issue.AddRequest) error {
 	for _, c := range r.Categories {
 		if !slices.Contains(model.ReviewCategories, c) {
 			return fmt.Errorf("分类标签 %q 不在可选范围内（%s）—— "+
@@ -299,31 +207,6 @@ func validateLists(r *issue.AddRequest) error {
 	}
 	// kind 的规则与手改文件那条入口共用同一个函数，不另写一份判断。
 	return model.ValidateKind(r.Kind)
-}
-
-// strayIdentityNote 在**标准源**申请里填了身份三件套时回一句"那几项不作数"。
-//
-// 为什么要有这句：GitHub 的表单没法按另一个字段的取值隐藏字段，所以那三个输入框
-// 在标准源申请里也照样渲染在正文中；而标准源的包名/显示名/作者一律从上游 APK 与仓库
-// 读出来。默默盖掉申请人写的值，会让"我明明填了显示名"与回评里那个名字对不上。
-// 手动源不走这里 —— 那三样对它是**必填**，填了就是真话（见 validateAddManual）。
-func strayIdentityNote(r *issue.AddRequest) string {
-	var stray []string
-	if r.AppID != "" {
-		stray = append(stray, issue.LabelAppID)
-	}
-	if r.Name != "" {
-		stray = append(stray, issue.LabelName)
-	}
-	if r.Author != "" {
-		stray = append(stray, issue.LabelAuthor)
-	}
-	if len(stray) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("⚠️ 你填的 %s **不作数**：标准源的包名、显示名、作者都是从上游 APK 与"+
-		"仓库里读出来的，以上面表里的为准（要改的话，收录之后用 `change-source.yml`）。\n\n",
-		strings.Join(stray, "、"))
 }
 
 // originOf 用一句话说明这条来源的二进制从哪来：上游仓库，或手动上传队列。
@@ -352,11 +235,10 @@ func companionConflict(c *Ctx, r *issue.AddRequest) *model.Source {
 	if r.Kind != model.KindCompanion {
 		return nil
 	}
+	// 逐条扫、**不按来源种类筛**：`kind` 只有新增单能写（D47），而手动来源没有新增单
+	// （D52），所以"有没有上游"在这里不是判据 —— 判据就是 `kind` 本身。
 	for i := range c.Sources {
 		s := &c.Sources[i]
-		// **不跳过没有上游的条目**：手动来源同样占着"全局唯一那条 companion"这个位置，
-		// 漏掉它就会让第二张 companion 申请落盘，而 02 规则 9 会让 check-manifest 硬失败 ——
-		// 整份清单推不出去，直到有人手动删掉那个文件（本函数存在的全部理由）。
 		if s.Kind != model.KindCompanion || sameCompanionRequest(s, r) {
 			continue
 		}
@@ -367,13 +249,9 @@ func companionConflict(c *Ctx, r *issue.AddRequest) *model.Source {
 
 // sameCompanionRequest 判断一条已落的 companion 来源是不是**这份申请自己**写出来的。
 //
-// 与 sameRequest 同一套思路（比"这份申请能决定的那一半"），但两者比的东西不同：
-// 此刻标准源的 appId 还没探出来，所以它比上游仓库；手动源的包名是申请人自己填的，
-// 就是它唯一的身份。
+// 与 sameRequest 同一套思路（比"这份申请能决定的那一半"）：此刻 appId 还没探出来，
+// 所以比的是上游仓库。
 func sameCompanionRequest(s *model.Source, r *issue.AddRequest) bool {
-	if r.Manual() {
-		return s.ID == r.AppID
-	}
 	return s.Upstream != nil && s.Upstream.Repo == r.Repo
 }
 
@@ -392,7 +270,9 @@ func decideChange(c *Ctx, f *issue.Form) *IntakeDecision {
 	if cur == nil {
 		return reject(fmt.Sprintf(
 			"`sources/` 里没有 `%s`。\n\n"+
-				"想新增一个来源请改用 **`add-source.yml`**（03 §2.5 规则 5）。", r.AppID))
+				"想新增一个来源请改用 **`add-source.yml`**（03 §2.5 规则 5）；"+
+				"如果这是**手动上传**的 APK，那它还没有目的地 —— 先把它传进 `_incoming`，"+
+				"条目会在搬运时按 APK 内容建出来（03 §3.2），之后再来改。", r.AppID))
 	}
 
 	// 从当前文件复制一份再改 —— §2.5 规则 2 的"只改申请涉及的字段"由此兑现：
@@ -662,9 +542,16 @@ type IncomingResult struct {
 // 它被安放的名字。这里连"文件名上的 ABI 线索"都不再比对告警 —— 手动上传的
 // 文件名本来就是人随手打的，逐条告警只会制造噪音。内容是什么就是什么。
 //
+// # 没有家的 APK 当场建条目
+//
+// `sources/` 里查不到这个包名，是**手动上传新来源**的正常样子（03 §3.2），不是错误：
+// 条目在这里按 APK 内容建出来（appId = package，显示名 = label，作者先记「未知」），
+// 于是"传一个 APK"就是收录一个新来源的全部动作。代价是这一轮会顺带写一个来源文件，
+// 与它的账本一起提交。
+//
 // # 安置不了的东西一律**留在原地**
 //
-// 删除是单向的：删掉就没了，而"这个包找不到家"正是最需要人来看一眼的情况。
+// 删除是单向的：删掉就没了，而"这个 asset 有别的问题"正是最需要人来看一眼的情况。
 // 所以本函数只删除**确认已安置**的 asset，其余的原样留在 `_incoming` 里并逐个
 // 说明原因（§3.2：不静默丢弃）。
 func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
@@ -731,14 +618,14 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 
 		src := c.Source(meta.Package)
 		if src == nil {
-			// §3.2 的"找不着家"：告警并保留。这通常是"先传了 APK 还没来得及收录"，
-			// 或者包名打错（比如把 com.example.app.debug 传上来了）。
-			res.Kept = append(res.Kept, a.Name)
-			c.LogBlock("  ", fmt.Sprintf(
-				"%s：package 是 %q，但 sources/ 里没有这个 appId —— **保留**在 _incoming。"+
-					"要收录它请先开一张「新增来源」的单（03 §2.5），或确认包名是否打错（debug 后缀？）",
-				a.Name, meta.Package))
-			continue
+			// 找不到家 = 这是一次**手动上传的新来源**（03 §3.2）：条目由这条流程当场建。
+			// 手动上传不再走新增单，所以这里没有"先去开张单"那一档。
+			var err error
+			if src, err = c.createManualSource(meta); err != nil {
+				res.Kept = append(res.Kept, a.Name)
+				c.LogBlock("  ", fmt.Sprintf("%s：%v —— **保留**在 _incoming，请人工确认", a.Name, err))
+				continue
+			}
 		}
 
 		contentABI := meta.ABIToken()
@@ -850,6 +737,44 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 		c.Log("保留在 `%s`（等待人工决定）：%s", model.IncomingTag, n)
 	}
 	return res, nil
+}
+
+// createManualSource 给一个**还没有家**的 APK 当场建一条手动来源（03 §3.2）。
+//
+// 手动上传的入口就是"把 APK 传进 `_incoming`"，没有配套的新增单 —— 所以条目在这里
+// 由流程自己建。能自动读出来的（包名 = appId、label = 显示名）就不让人再抄一遍，
+// 抄一遍只会多一个抄错的地方。
+//
+// 作者只能先记 model.AuthorUnknown：APK 里没有这个字段，也没有上游仓库可以取 owner，
+// 而 `author` 空着会让**整份清单**判失败（见那个常量的说明）。改它走 `change-source.yml`。
+//
+// 落盘但**不提交** —— 提交由调用方在账本也写完（或者自检过）之后统一做，
+// 好让"新建的来源"与它的账本进同一个提交。
+func (c *Ctx) createManualSource(meta *apkmeta.Meta) (*model.Source, error) {
+	name := meta.Label
+	if !meta.HasLabel() {
+		// 空 label 是真实存在的（属性缺失，或指向 `@string/app_name` 而解不出来）。
+		// 退到包名 —— 不好看，但**有**：空显示名在客户端里就是一行空白，而这一行
+		// 是用户唯一会扫的东西。是哪一种情况只在这句日志里说得出，所以必须说。
+		name = meta.Package
+		c.Log("  ⚠️ APK 里读不出 label，显示名先记成包名 %q，之后用 change-source.yml 改掉", name)
+	}
+	src := &model.Source{
+		ID:     meta.Package,
+		Name:   name,
+		Author: model.AuthorUnknown,
+		Source: model.SourceManual,
+	}
+	// 校验在 WriteSource 里（与手改文件那条入口同一批规则）；这里只把失败的上下文
+	// 补成"是这个 APK 的包名不能用"，因为调用点拿到的是一个要写进日志的错误。
+	if err := c.Repo.WriteSource(src); err != nil {
+		return nil, fmt.Errorf("把这个 APK 的包名 %q 当 appId 建条目失败了：%w", meta.Package, err)
+	}
+	c.Log("  新建 sources/%s.json：显示名 %q，作者先记 %q（待用 change-source.yml 补）",
+		src.ID, src.Name, model.AuthorUnknown)
+	c.Sources = append(c.Sources, *src)
+	// 重新取一次指针：append 可能换了底层数组，上面那个 `src` 已经不指向 c.Sources 了。
+	return c.Source(meta.Package), nil
 }
 
 // readIncomingMeta 下载 _incoming 里的一个 asset 并读元数据。

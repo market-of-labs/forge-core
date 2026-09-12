@@ -47,6 +47,17 @@ const (
 	// UpstreamGitHubRelease 是 v1 唯一支持的上游类型（03 §2.2）。
 	UpstreamGitHubRelease = "github-release"
 
+	// AuthorUnknown 是**自动收录**的手动来源在拿到真作者之前的占位值（03 §2.5.3 / §3.2）。
+	//
+	// 为什么必须有值、不能留空：`author` 是 02 规则 2 的必填字段，而那条规则是 **Errorf** ——
+	// 一个空 author 会让**整份清单**判失败，市场里所有条目一起下架，不是只废掉这一条。
+	// 而 `paused: true` 也救不了它（那个布尔只管"要不要去上游看新版本"，条目照样渲染）。
+	//
+	// 它只会出现在"APK 先传上来、条目由搬运流程当场建出来"这条路上：手动上传不再走新增单，
+	// 所以收录时没有人可以问作者；APK 里没有作者字段，也没有上游仓库可以取 owner。
+	// **看到这个值就等于"这条来源还在等一张 change-source.yml"** —— 它是唯一的提示信号。
+	AuthorUnknown = "未知"
+
 	// EntryCountWarn 是清单条目数的软告警阈值（03 §5.3）：全量推送把市场规模
 	// 直接暴露为设备端单次 deep-link URI 的大小（01 §3.6），超过就该警觉。
 	EntryCountWarn = 150

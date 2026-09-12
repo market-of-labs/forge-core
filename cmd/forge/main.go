@@ -192,17 +192,11 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 		if err := fs.Parse(args); err != nil {
 			return exitUsage, err
 		}
-		ix, rep, err := job.BuildIndex(ctx, c, job.BuildIndexOptions{FetchMissing: *fetch})
+		rep, err := job.BuildIndex(ctx, c, job.BuildIndexOptions{FetchMissing: *fetch})
 		if rep != nil {
 			c.Reportf(rep)
 		}
-		if err != nil {
-			return exitFailed, err
-		}
-		if err := job.WriteIndex(c, ix); err != nil {
-			return exitFailed, err
-		}
-		return exitFailed, nil
+		return exitFailed, err
 
 	case "build-manifest":
 		_, rep, err := job.BuildManifest(c)
@@ -277,8 +271,8 @@ var verbDoc = []struct{ name, doc string }{
 	{"intake-incoming", "搬 _incoming 的 asset 到正式 Release 并清场（§3.2 / §4.6）"},
 	{"resolve-upstream", "只算出该镜像哪些版本，打印计划（不下载不上传）"},
 	{"mirror-upstream", "下载 → 按内容判 ABI → 改名 → 幂等上传（§4.4 第 3 步）"},
-	{"build-index", "从 Release 现状重建 store/index.json（§5.2）"},
-	{"build-manifest", "由 sources + index + endpoints 合成 apps.json（§5.1）"},
+	{"build-index", "从 Release 现状重建各 sources 条目的 versions 账本（§5.2）"},
+	{"build-manifest", "由 sources（自带账本）+ endpoints 合成 apps.json（§5.1）"},
 	{"check-manifest", "对 apps.json 跑 02 §2.8 自检 + 阈值告警（§5.3）"},
 	{"reconcile", "幂等全量对账：解析 → 镜像 → 重建 → 回写（§4.4）"},
 	{"commit-back", "把工作副本的改动按固定路径提交并推送（§5.5，自动加 [skip-dispatch]）"},

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/market-of-labs/forge-core/internal/gh"
@@ -38,9 +37,11 @@ type Ctx struct {
 	// Log 记一行诊断。为 nil 时静默。
 	Log func(format string, a ...any)
 
-	// 以下三项由 Load 填充。
+	// 以下两项由 Load 填充。
+	//
+	// **版本账本就在 Sources 里**（`Source.Versions`）—— 它原来是一份独立的 `Index`
+	// 字段（来自 `store/index.json`），合并之后不再有第二个容器，也没有"两份要对齐"。
 	Sources   []model.Source
-	Index     *model.Index
 	Endpoints model.Endpoints
 
 	// cloned 表示工作副本是我们自己克隆的临时目录，Close 时该删掉。
@@ -110,9 +111,9 @@ func (c *Ctx) Close() {
 	}
 }
 
-// Load 从工作副本读出三份输入。
+// Load 从工作副本读出两份输入（sources 自带版本账本 + endpoints）。
 //
-// 三份都读全再返回：它们互相依赖（模板对不上会让清单整个不可信），所以"读了两个就开工"
+// 两份都读全再返回：它们互相依赖（模板对不上会让清单整个不可信），所以"读了一个就开工"
 // 只会把失败推到更晚、更难看出来的地方。
 func (c *Ctx) Load() error {
 	ep, err := c.Repo.LoadEndpoints()
@@ -126,15 +127,6 @@ func (c *Ctx) Load() error {
 		return err
 	}
 	c.Sources = srcs
-
-	ix, err := c.Repo.LoadIndex()
-	if err != nil {
-		return err
-	}
-	c.Index = ix
-	if c.Index.Apps == nil {
-		c.Index.Apps = []model.IndexApp{}
-	}
 	return nil
 }
 
@@ -154,17 +146,15 @@ func (c *Ctx) Source(id string) *model.Source {
 //
 // 刻意列出而不是 `git add .`：
 //
-//   - `sources/` 整个目录（含删除）—— issue 流程会改它，其余时候不动。
+//   - `sources/` 整个目录（含删除）—— issue 流程与对账（写 `versions` 账本）都会改它。
 //   - `apps.json` 根目录的清单，是客户端直接伺服的文件。
-//   - `store/index.json` 版本账本。
 //
-// **不含 `store/endpoints.json`**：那是人改的部署配置，forge 永远不写它。
+// **不含 `store/`**：那里只剩 endpoints.json，是人改的部署配置，forge 永远不写它。
 // 把它纳入暂存范围等于给"某次误改模板"开了一条自动提交的路。
 func (c *Ctx) TrackedPaths() []string {
 	return []string{
 		store.SourcesDirName,
 		store.ManifestName,
-		filepath.Join(store.SubDirName, store.IndexName),
 	}
 }
 

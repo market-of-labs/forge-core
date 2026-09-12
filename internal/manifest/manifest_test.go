@@ -38,16 +38,16 @@ func source(id string) model.Source {
 	}
 }
 
-func asset(abi string) model.IndexAsset {
-	return model.IndexAsset{
+func asset(abi string) model.Asset {
+	return model.Asset{
 		ABI:  abi,
 		File: "placeholder.apk", // 只用于喂给 Build，产出侧的名字由模板重算
 		Size: 1024,
 	}
 }
 
-func version(token string, code int32, published string, assets ...model.IndexAsset) model.IndexVersion {
-	return model.IndexVersion{
+func version(token string, code int32, published string, assets ...model.Asset) model.Version {
+	return model.Version{
 		Version:     token,
 		VersionName: token,
 		VersionCode: code,
@@ -56,18 +56,19 @@ func version(token string, code int32, published string, assets ...model.IndexAs
 	}
 }
 
-func indexOf(apps ...model.IndexApp) *model.Index {
-	return &model.Index{GeneratedAt: model.NowISO(), Apps: apps}
-}
-
-func appOf(id string, versions ...model.IndexVersion) model.IndexApp {
-	return model.IndexApp{ID: id, Tag: id, Versions: versions}
+// ledger 给一个来源挂上版本账本。
+//
+// 合并之后（D48）"这个 App 有哪些版本"不再来自第二个文件，所以一个用例的输入就是
+// 一组**自带账本的来源** —— 而不再是"元数据一份、账本另一份，靠 id 对齐"。
+func ledger(s model.Source, versions ...model.Version) model.Source {
+	s.Versions = versions
+	return s
 }
 
 // build 跑一次合成并断言没有硬错误。
-func build(t *testing.T, srcs []model.Source, ix *model.Index) (*model.Manifest, *model.Report) {
+func build(t *testing.T, srcs ...model.Source) (*model.Manifest, *model.Report) {
 	t.Helper()
-	m, rep, err := Build(Input{Sources: srcs, Index: ix, Endpoints: endpoints()})
+	m, rep, err := Build(Input{Sources: srcs, Endpoints: endpoints()})
 	if err != nil {
 		t.Fatalf("Build 失败：%v", err)
 	}
@@ -88,13 +89,6 @@ func refs(t *testing.T, e *model.Entry) []model.APKRef {
 }
 
 // ---- 输入前置条件 -----------------------------------------------------------
-
-func TestBuild_RequiresIndex(t *testing.T) {
-	// index.json 是版本事实的唯一来源，没有它就没有任何东西可产出。
-	if _, _, err := Build(Input{Sources: []model.Source{source("com.example.app")}, Endpoints: endpoints()}); err == nil {
-		t.Fatal("没有 index 时应当报错，而不是产出一份空清单")
-	}
-}
 
 func TestBuild_RejectsEndpointsThatDivergeFromNaming(t *testing.T) {
 	// 模板与命名契约一旦分叉就是**静默故障**：清单能生成，客户端却折叠不中 ABI。
@@ -123,7 +117,7 @@ func TestBuild_RejectsEndpointsThatDivergeFromNaming(t *testing.T) {
 	}
 	for name, ep := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, _, err := Build(Input{Index: indexOf(), Endpoints: ep}); err == nil {
+			if _, _, err := Build(Input{Endpoints: ep}); err == nil {
 				t.Fatal("模板与命名契约分叉时必须拒绝产出")
 			}
 		})
@@ -133,7 +127,7 @@ func TestBuild_RejectsEndpointsThatDivergeFromNaming(t *testing.T) {
 // ---- 03 §5.4 不写半成品 -----------------------------------------------------
 
 func TestBuild_SkipsSourceWithoutAnyVersion(t *testing.T) {
-	m, rep := build(t, []model.Source{source("com.example.app")}, indexOf())
+	m, rep := build(t, source("com.example.app"))
 	if len(m.Apps) != 0 {
 		t.Fatalf("还没有任何版本的条目不该出现在清单里：%+v", m.Apps)
 	}
@@ -142,17 +136,15 @@ func TestBuild_SkipsSourceWithoutAnyVersion(t *testing.T) {
 	}
 }
 
-// 「index 里有这个 App、但一条版本都没有」是**另一条输入**，跟「index 里没这个 App」
-// 走的是不同分支，必须各自有覆盖。
+// 跳过时的告警必须**可操作**：能定位到条目（`source=`），并说明为什么本轮不会有新版本。
 //
-// 这条是被变异测试逼出来的：原来唯一相关的用例传的是空 index（一个 App 都没有），
-// 只走到 `idxApp == nil`，`Versions` 为空那条路径没有任何用例；把 `len(idxApp.Versions) == 0`
-// 从 guard 里删掉，测试全绿。顺带查出紧随其后的 `latest == nil` 是一条死分支（Latest()
-// 自己就挡了空切片），已删。
-func TestBuild_IndexAppWithNoVersionsIsSkipped(t *testing.T) {
+// 合并之前这条钉的是"index 里有这个 App 但一条版本都没有"（与"index 里没这个 App"
+// 是两条不同的分支）。并进来源文件之后（D48）两者是同一份输入 —— 一个 `versions` 为空的
+// 来源 —— 于是两条用例并成了一条，而告警内容反而是更值得钉的那部分。
+func TestBuild_SkippedSourceWarningIsActionable(t *testing.T) {
 	src := source("com.example.app")
 	src.Paused = true
-	m, rep := build(t, []model.Source{src}, indexOf(appOf("com.example.app")))
+	m, rep := build(t, src)
 
 	if len(m.Apps) != 0 {
 		t.Fatalf("没有任何版本的条目不该进清单：%+v", m.Apps)
@@ -172,8 +164,7 @@ func TestBuild_IndexAppWithNoVersionsIsSkipped(t *testing.T) {
 }
 
 func TestBuild_SkipsVersionWithoutAssets(t *testing.T) {
-	m, rep := build(t, []model.Source{source("com.example.app")},
-		indexOf(appOf("com.example.app", version("1.0", 1, ""))))
+	m, rep := build(t, ledger(source("com.example.app"), version("1.0", 1, "")))
 	if len(m.Apps) != 0 {
 		t.Fatalf("只有版本壳、没有 asset 时不该产出条目：%+v", m.Apps)
 	}
@@ -184,12 +175,9 @@ func TestBuild_SkipsVersionWithoutAssets(t *testing.T) {
 
 // 一个 App 有问题不该带累别的 App —— 这是"跳过"而不是"整份失败"的意义。
 func TestBuild_SkipsOnlyTheBrokenApp(t *testing.T) {
-	srcs := []model.Source{source("com.example.broken"), source("com.example.good")}
-	ix := indexOf(
-		appOf("com.example.broken", version("1.0", 1, "")),
-		appOf("com.example.good", version("2.0", 20, "", asset("universal"))),
-	)
-	m, _ := build(t, srcs, ix)
+	m, _ := build(t,
+		ledger(source("com.example.broken"), version("1.0", 1, "")),
+		ledger(source("com.example.good"), version("2.0", 20, "", asset("universal"))))
 	if len(m.Apps) != 1 || m.Apps[0].ID != "com.example.good" {
 		t.Fatalf("应当只产出正常的那一条：%+v", m.Apps)
 	}
@@ -202,10 +190,7 @@ func TestBuild_EntryFields(t *testing.T) {
 	src.Categories = []string{"工具", "网络"}
 	src.Kind = model.KindCompanion
 
-	ix := indexOf(appOf("com.example.app",
-		version("1.0", 1, "2026-09-11T10:00:00Z", asset("universal"))))
-
-	m, _ := build(t, []model.Source{src}, ix)
+	m, _ := build(t, ledger(src, version("1.0", 1, "2026-09-11T10:00:00Z", asset("universal"))))
 	if len(m.Apps) != 1 {
 		t.Fatalf("应当产出 1 条：%+v", m.Apps)
 	}
@@ -255,8 +240,7 @@ func TestBuild_EntryFields(t *testing.T) {
 // categories 缺省必须渲染成 `[]` 而不是 `null`：客户端的 jsonDecode 拿到 null
 // 再 .map 会炸。
 func TestBuild_EmptyCategoriesIsArrayNotNull(t *testing.T) {
-	m, _ := build(t, []model.Source{source("com.example.app")},
-		indexOf(appOf("com.example.app", version("1.0", 1, "", asset("universal")))))
+	m, _ := build(t, ledger(source("com.example.app"), version("1.0", 1, "", asset("universal"))))
 
 	b, err := json.Marshal(m.Apps[0])
 	if err != nil {
@@ -281,8 +265,7 @@ func TestBuild_EmptyCategoriesIsArrayNotNull(t *testing.T) {
 func TestBuild_DescIsAppendedToName(t *testing.T) {
 	s := source("com.example.app")
 	s.Desc = "去广告的第三方客户端"
-	m, _ := build(t, []model.Source{s},
-		indexOf(appOf("com.example.app", version("1.0", 1, "", asset("universal")))))
+	m, _ := build(t, ledger(s, version("1.0", 1, "", asset("universal"))))
 
 	want := "Example App · 去广告的第三方客户端"
 	if got := m.Apps[0].Name; got != want {
@@ -290,8 +273,7 @@ func TestBuild_DescIsAppendedToName(t *testing.T) {
 	}
 
 	// 没简介的条目不该多出一个孤零零的分隔符。
-	m2, _ := build(t, []model.Source{source("com.example.app")},
-		indexOf(appOf("com.example.app", version("1.0", 1, "", asset("universal")))))
+	m2, _ := build(t, ledger(source("com.example.app"), version("1.0", 1, "", asset("universal"))))
 	if got := m2.Apps[0].Name; got != "Example App" {
 		t.Fatalf("没填简介时 name = %q，期望就是原始显示名", got)
 	}
@@ -300,13 +282,13 @@ func TestBuild_DescIsAppendedToName(t *testing.T) {
 // latestVersion 存的是 APK 的**原始** versionName，而 apkUrls 里的 token 是清洗后的
 // —— 两者在 versionName 含空白时必须都保留下来（03 §5.1）。
 func TestBuild_LatestVersionIsRawVersionName(t *testing.T) {
-	v := model.IndexVersion{
+	v := model.Version{
 		Version:     "1.0-beta",
 		VersionName: "1.0 beta",
 		VersionCode: 1,
-		Assets:      []model.IndexAsset{asset("universal")},
+		Assets:      []model.Asset{asset("universal")},
 	}
-	m, _ := build(t, []model.Source{source("com.example.app")}, indexOf(appOf("com.example.app", v)))
+	m, _ := build(t, ledger(source("com.example.app"), v))
 
 	e := m.Apps[0]
 	if e.LatestVersion != "1.0 beta" {
@@ -323,7 +305,7 @@ func TestBuild_LatestVersionIsRawVersionName(t *testing.T) {
 func TestBuild_ApkURLsOrderUniversalFirst(t *testing.T) {
 	v := version("1.0", 1, "",
 		asset("x86_64"), asset("x86"), asset("arm64-v8a"), asset("universal"), asset("armeabi-v7a"))
-	m, _ := build(t, []model.Source{source("com.example.app")}, indexOf(appOf("com.example.app", v)))
+	m, _ := build(t, ledger(source("com.example.app"), v))
 
 	rs := refs(t, &m.Apps[0])
 	want := []string{"universal", "arm64-v8a", "armeabi-v7a", "x86_64", "x86"}
@@ -347,9 +329,9 @@ func TestBuild_ApkURLsOrderUniversalFirst(t *testing.T) {
 // 留两个会让客户端按 ABI 折叠的结果取决于遍历顺序。
 func TestBuild_DedupesSameABI(t *testing.T) {
 	v := version("1.0", 1, "",
-		model.IndexAsset{ABI: "arm64-v8a", File: "旧名.apk"},
-		model.IndexAsset{ABI: "arm64-v8a", File: "新名.apk"})
-	m, _ := build(t, []model.Source{source("com.example.app")}, indexOf(appOf("com.example.app", v)))
+		model.Asset{ABI: "arm64-v8a", File: "旧名.apk"},
+		model.Asset{ABI: "arm64-v8a", File: "新名.apk"})
+	m, _ := build(t, ledger(source("com.example.app"), v))
 
 	rs := refs(t, &m.Apps[0])
 	if len(rs) != 1 {
@@ -359,8 +341,8 @@ func TestBuild_DedupesSameABI(t *testing.T) {
 
 // apkUrls 是**字符串**形式的 JSON 数组（02 §2.6 的双层编码）。
 func TestBuild_ApkURLsIsDoubleEncodedString(t *testing.T) {
-	m, _ := build(t, []model.Source{source("com.example.app")},
-		indexOf(appOf("com.example.app", version("1.0", 1, "", asset("universal")))))
+	m, _ := build(t,
+		ledger(source("com.example.app"), version("1.0", 1, "", asset("universal"))))
 
 	b, err := json.Marshal(m.Apps[0])
 	if err != nil {
@@ -375,8 +357,8 @@ func TestBuild_ApkURLsIsDoubleEncodedString(t *testing.T) {
 // ---- additionalSettings / releaseDate --------------------------------------
 
 func TestBuild_WritesVersionCode(t *testing.T) {
-	m, _ := build(t, []model.Source{source("com.example.app")},
-		indexOf(appOf("com.example.app", version("1.0", 42, "", asset("universal")))))
+	m, _ := build(t,
+		ledger(source("com.example.app"), version("1.0", 42, "", asset("universal"))))
 
 	code, ok := m.Apps[0].VersionCode()
 	if !ok {
@@ -390,8 +372,7 @@ func TestBuild_WritesVersionCode(t *testing.T) {
 // 拿不到 versionCode 时**不写 0**：一条缺字段的清单应当被 check-manifest 拦住
 // （规则 6），而不是带着 0 推给设备。
 func TestBuild_MissingVersionCodeWarnsAndOmitsField(t *testing.T) {
-	m, rep := build(t, []model.Source{source("com.example.app")},
-		indexOf(appOf("com.example.app", version("1.0", 0, "", asset("universal")))))
+	m, rep := build(t, ledger(source("com.example.app"), version("1.0", 0, "", asset("universal"))))
 
 	if len(m.Apps) != 1 {
 		t.Fatalf("缺 versionCode 仍然要产出条目（由 check-manifest 统一裁决）：%+v", m.Apps)
@@ -414,9 +395,8 @@ func TestBuild_MissingVersionCodeWarnsAndOmitsField(t *testing.T) {
 }
 
 func TestBuild_ReleaseDateFromPublishedAt(t *testing.T) {
-	m, _ := build(t, []model.Source{source("com.example.app")},
-		indexOf(appOf("com.example.app",
-			version("1.0", 1, "2026-09-11T10:00:00Z", asset("universal")))))
+	m, _ := build(t, ledger(source("com.example.app"),
+		version("1.0", 1, "2026-09-11T10:00:00Z", asset("universal"))))
 
 	// 期望值独立算出来，不复用 model.ReleaseDate —— 否则这条测试只是在复述实现。
 	//
@@ -435,8 +415,7 @@ func TestBuild_ReleaseDateFromPublishedAt(t *testing.T) {
 
 // publishedAt 解析不了时**留空并告警**，绝不因为一个展示字段阻断整条链。
 func TestBuild_BadPublishedAtWarnsButStillEmits(t *testing.T) {
-	m, rep := build(t, []model.Source{source("com.example.app")},
-		indexOf(appOf("com.example.app", version("1.0", 1, "昨天", asset("universal")))))
+	m, rep := build(t, ledger(source("com.example.app"), version("1.0", 1, "昨天", asset("universal"))))
 
 	if len(m.Apps) != 1 {
 		t.Fatalf("坏日期不该让条目消失：%+v", m.Apps)
@@ -451,15 +430,14 @@ func TestBuild_BadPublishedAtWarnsButStillEmits(t *testing.T) {
 
 // ---- 版本位次 ---------------------------------------------------------------
 
-// "最新"是**列表最后一个**，不是 versionCode 最大 —— index 是按时间追加的账本。
+// "最新"是**列表最后一个**，不是 versionCode 最大 —— 账本是按时间追加的。
 // 这条测试把"位次即语义"钉死，免得日后有人"顺手"改成按 versionCode 排序。
 func TestBuild_LatestIsLastNotMaxVersionCode(t *testing.T) {
 	t.Run("按时间追加时最后就是最新", func(t *testing.T) {
-		ix := indexOf(appOf("com.example.app",
+		m, _ := build(t, ledger(source("com.example.app"),
 			version("1.0", 10, "", asset("universal")),
 			version("2.0", 99, "", asset("universal")),
 		))
-		m, _ := build(t, []model.Source{source("com.example.app")}, ix)
 		if m.Apps[0].LatestVersion != "2.0" {
 			t.Fatalf("latestVersion = %q，应当是 2.0", m.Apps[0].LatestVersion)
 		}
@@ -467,11 +445,10 @@ func TestBuild_LatestIsLastNotMaxVersionCode(t *testing.T) {
 
 	t.Run("versionCode 回退时仍然按位次取", func(t *testing.T) {
 		// 上游把 versionCode 写回退了是真实存在的；位次（时间）比 versionCode 可信。
-		ix := indexOf(appOf("com.example.app",
+		m, _ := build(t, ledger(source("com.example.app"),
 			version("2.0", 99, "", asset("universal")),
 			version("1.9", 5, "", asset("universal")),
 		))
-		m, _ := build(t, []model.Source{source("com.example.app")}, ix)
 		if m.Apps[0].LatestVersion != "1.9" {
 			t.Fatalf("latestVersion = %q，应当是位次最后那个 1.9", m.Apps[0].LatestVersion)
 		}
@@ -485,8 +462,7 @@ func TestBuild_LatestIsLastNotMaxVersionCode(t *testing.T) {
 func TestBuild_PausedSourceStillEmitted(t *testing.T) {
 	src := source("com.example.app")
 	src.Paused = true
-	m, _ := build(t, []model.Source{src},
-		indexOf(appOf("com.example.app", version("1.5", 15, "", asset("universal")))))
+	m, _ := build(t, ledger(src, version("1.5", 15, "", asset("universal"))))
 
 	if len(m.Apps) != 1 {
 		t.Fatalf("paused 的条目仍然要在清单里：%+v", m.Apps)
@@ -501,42 +477,17 @@ func TestBuild_PausedSourceStillEmitted(t *testing.T) {
 	}
 }
 
-// ---- 孤儿与顺序 -------------------------------------------------------------
-
-// index 里有、sources 里没有 = 有人删了 sources 文件而 Release 还在（D13 全保留）。
-// 不是错误，但要让维护者看见"这些还在被镜像着"。
-func TestBuild_WarnsOrphanIndexApp(t *testing.T) {
-	ix := indexOf(
-		appOf("com.example.kept", version("1.0", 1, "", asset("universal"))),
-		appOf("com.example.orphan", version("1.0", 1, "", asset("universal"))),
-	)
-	m, rep := build(t, []model.Source{source("com.example.kept")}, ix)
-
-	if len(m.Apps) != 1 || m.Apps[0].ID != "com.example.kept" {
-		t.Fatalf("孤儿不该进清单：%+v", m.Apps)
-	}
-	found := false
-	for _, w := range rep.Warnings() {
-		if w.AppID == "com.example.orphan" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("孤儿应当有一条告警：%v", rep.Warnings())
-	}
-}
+// ---- 顺序 -------------------------------------------------------------------
 
 // 按 id 排序产出：清单顺序不影响语义，但稳定顺序 = 稳定 diff，
 // 否则每次重建都可能整份重排，review 就失去意义了。
 func TestBuild_SortedByID(t *testing.T) {
 	ids := []string{"com.example.z", "com.example.a", "com.example.m"}
 	srcs := make([]model.Source, 0, len(ids))
-	apps := make([]model.IndexApp, 0, len(ids))
 	for _, id := range ids {
-		srcs = append(srcs, source(id))
-		apps = append(apps, appOf(id, version("1.0", 1, "", asset("universal"))))
+		srcs = append(srcs, ledger(source(id), version("1.0", 1, "", asset("universal"))))
 	}
-	m, _ := build(t, srcs, indexOf(apps...))
+	m, _ := build(t, srcs...)
 
 	got := make([]string, 0, len(m.Apps))
 	for _, e := range m.Apps {
@@ -563,16 +514,14 @@ func TestBuild_OutputPassesManifestSelfCheck(t *testing.T) {
 	companion := source("com.example.companion")
 	companion.Kind = model.KindCompanion
 
-	srcs := []model.Source{src, companion}
-	ix := indexOf(
-		appOf("com.example.app",
+	m, _ := build(t,
+		ledger(src,
 			version("1.0", 1, "2026-09-11T10:00:00Z", asset("universal"), asset("arm64-v8a")),
 			version("1.1", 2, "2026-09-12T10:00:00Z", asset("universal"), asset("arm64-v8a")),
 		),
-		appOf("com.example.companion",
+		ledger(companion,
 			version("0.1.0", 1, "2026-09-10T10:00:00Z", asset("universal"))),
 	)
-	m, _ := build(t, srcs, ix)
 
 	rep := m.Validate(endpoints())
 	if rep.HasErrors() {
@@ -588,11 +537,11 @@ func TestBuild_OutputPassesManifestSelfCheck(t *testing.T) {
 
 // 合成的产出必须是**确定的**：同样的输入两次跑必须逐字节相同（exportedAt 除外）。
 func TestBuild_DeterministicApartFromTimestamp(t *testing.T) {
-	srcs := []model.Source{source("com.example.b"), source("com.example.a")}
-	ix := indexOf(
-		appOf("com.example.a", version("1.0", 1, "", asset("arm64-v8a"), asset("universal"))),
-		appOf("com.example.b", version("2.0", 2, "", asset("universal"))),
-	)
+	// 故意**不按 id 排序**给进去：产出顺序是 Build 自己的责任。
+	srcs := []model.Source{
+		ledger(source("com.example.b"), version("2.0", 2, "", asset("universal"))),
+		ledger(source("com.example.a"), version("1.0", 1, "", asset("arm64-v8a"), asset("universal"))),
+	}
 
 	strip := func(m *model.Manifest) string {
 		cp := *m
@@ -604,17 +553,17 @@ func TestBuild_DeterministicApartFromTimestamp(t *testing.T) {
 		return string(b)
 	}
 
-	first := strip(mustBuildRaw(t, srcs, ix))
+	first := strip(mustBuildRaw(t, srcs...))
 	for i := 0; i < 10; i++ {
-		if got := strip(mustBuildRaw(t, srcs, ix)); got != first {
+		if got := strip(mustBuildRaw(t, srcs...)); got != first {
 			t.Fatalf("第 %d 次产出不同：\n%s\n%s", i, first, got)
 		}
 	}
 }
 
-func mustBuildRaw(t *testing.T, srcs []model.Source, ix *model.Index) *model.Manifest {
+func mustBuildRaw(t *testing.T, srcs ...model.Source) *model.Manifest {
 	t.Helper()
-	m, _, err := Build(Input{Sources: srcs, Index: ix, Endpoints: endpoints()})
+	m, _, err := Build(Input{Sources: srcs, Endpoints: endpoints()})
 	if err != nil {
 		t.Fatal(err)
 	}

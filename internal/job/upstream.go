@@ -30,7 +30,7 @@ type Plan struct {
 type versionAcc struct {
 	versionName string
 	versionCode int32
-	assets      []model.IndexAsset
+	assets      []model.Asset
 }
 
 // ResolveOptions 调 resolve-upstream 的选项。
@@ -107,9 +107,10 @@ func resolveOne(ctx context.Context, c *Ctx, src *model.Source, opts ResolveOpti
 		return nil, rep, nil
 	}
 
-	cands := upstream.Releasable(rels)
+	cands := upstream.Releasable(rels, src.Upstream.IncludePrerelease)
 	if len(cands) == 0 {
-		rep.Warnf(src.ID, "上游 %s 没有可镜像的发布（全是 draft/prerelease，或一个都没有）", repo)
+		rep.Warnf(src.ID, "上游 %s 没有可镜像的发布（%s，或一个都没有）",
+			repo, upstream.ExcludedNote(src.Upstream.IncludePrerelease))
 		return nil, rep, nil
 	}
 
@@ -164,12 +165,14 @@ func pickTargets(c *Ctx, appID string, candsNewestFirst []gh.Release, rep *model
 		return nil
 	}
 
-	idxApp := c.Index.Find(appID)
+	// 账本就在来源文件里（D48）。src 为 nil 的情形（上游有、sources 里没有）走不到这儿：
+	// resolveOne 是从 c.Sources 出发的，`src` 就是它拿到的那个。
+	src := c.Source(appID)
 
 	// 从最新往下找第一个已镜像的 —— 它上面的（更新的）全都是漏掉的。
 	firstMirrored := -1
 	for i := range candsNewestFirst {
-		if idxApp != nil && idxApp.MirroredUpstreamTag(candsNewestFirst[i].TagName) {
+		if src != nil && src.MirroredUpstreamTag(candsNewestFirst[i].TagName) {
 			firstMirrored = i
 			break
 		}
@@ -268,15 +271,19 @@ func MirrorUpstream(ctx context.Context, c *Ctx, plans []Plan, opts MirrorOption
 		}
 	}
 
-	// index 在**往里面写过东西**时落盘。**必须先于 build-index** ——
+	// 账本在**往里面写过东西**时落盘。**必须先于 build-index** ——
 	// 镜像这一步是唯一知道 versionName/versionCode/upstreamTag 的地方，
 	// 而 build-index 只能从 Release 的 asset 名里读到 version 与 abi（§5.2）。
 	//
 	// 判据是 Recorded 而不是 Uploaded：一个字节都没上传也可能有东西要记 ——
-	// 索引丢了之后重跑，asset 名让每次上传都被幂等挡下，但 upstreamTag 是这一轮
+	// 账本丢了之后重跑，asset 名让每次上传都被幂等挡下，但 upstreamTag 是这一轮
 	// 重新认出来的，记下它下一轮才不会再去列一遍上游（并让水位线重新生效）。
 	if out.Recorded && !opts.DryRun {
-		if err := WriteIndex(c, c.Index); err != nil {
+		ids := make([]string, 0, len(plans))
+		for i := range plans {
+			ids = append(ids, plans[i].Source.ID)
+		}
+		if err := writeLedgers(c, ids); err != nil {
 			return out, err
 		}
 	}
@@ -385,7 +392,7 @@ func (c *Ctx) mirrorPlan(ctx context.Context, p *Plan, opts MirrorOptions, out *
 			got[version] = b
 			tokens = append(tokens, version)
 		}
-		b.assets = append(b.assets, model.IndexAsset{ABI: contentABI, File: target, Size: a.Size})
+		b.assets = append(b.assets, model.Asset{ABI: contentABI, File: target, Size: a.Size})
 	}
 
 	if opts.DryRun || len(tokens) == 0 {
@@ -396,22 +403,20 @@ func (c *Ctx) mirrorPlan(ctx context.Context, p *Plan, opts MirrorOptions, out *
 	return nil
 }
 
-// recordIndex 把这一轮镜像出的版本写进内存里的 index。
+// recordIndex 把这一轮镜像出的版本写进内存里的账本。
 //
 // 已存在的 version token 走**合并**而不是追加：同一个版本可能分几次镜像完
 // （比如上游先发 universal、几天后才补 arm64），追加会造出两条同 version 的记录，
 // 而 apkUrls 只能指向其中一条。
 func (c *Ctx) recordIndex(appID string, p *Plan, got map[string]*versionAcc, tokens []string) {
-	idxApp := c.Index.Find(appID)
-	if idxApp == nil {
-		c.Index.Apps = append(c.Index.Apps, model.IndexApp{ID: appID, Tag: appID})
-		idxApp = c.Index.Find(appID)
-	}
+	// 一定有：resolveOne / pickTargets 是从 c.Sources 出发的，能走到镜像就说明
+	// 这个 appID 有来源文件。所以这里不需要"凭空造一个"的分支。
+	src := c.Source(appID)
 
 	sort.Strings(tokens) // 只为日志稳定；真正的位次由追加顺序决定
 	for _, token := range tokens {
 		b := got[token]
-		na := make([]model.IndexAsset, 0, len(b.assets))
+		na := make([]model.Asset, 0, len(b.assets))
 		for _, a := range b.assets {
 			dup := false
 			for _, e := range na {
@@ -426,7 +431,7 @@ func (c *Ctx) recordIndex(appID string, p *Plan, got map[string]*versionAcc, tok
 		}
 		assets := sortAssets(na)
 
-		if v := idxApp.FindVersion(token); v != nil {
+		if v := src.FindVersion(token); v != nil {
 			v.Assets = mergeAssets(v.Assets, assets)
 			if v.VersionName == "" {
 				v.VersionName = b.versionName
@@ -438,7 +443,7 @@ func (c *Ctx) recordIndex(appID string, p *Plan, got map[string]*versionAcc, tok
 			continue
 		}
 
-		idxApp.Versions = append(idxApp.Versions, model.IndexVersion{
+		src.Versions = append(src.Versions, model.Version{
 			Version:     token,
 			VersionName: b.versionName,
 			VersionCode: b.versionCode,
@@ -457,15 +462,15 @@ func (c *Ctx) recordIndex(appID string, p *Plan, got map[string]*versionAcc, tok
 // 变成 fat）会让同一个 ABI 落到不同的 {version} 上 —— 那是另一个 version token，
 // 走不到这儿。真走到这儿的是"同一版本同一 ABI 但文件名变了"，极少见，
 // 此时以本轮上传的为准（它是刚刚才验证过的）。
-func mergeAssets(old, add []model.IndexAsset) []model.IndexAsset {
-	byABI := map[string]model.IndexAsset{}
+func mergeAssets(old, add []model.Asset) []model.Asset {
+	byABI := map[string]model.Asset{}
 	for _, a := range old {
 		byABI[a.ABI] = a
 	}
 	for _, a := range add {
 		byABI[a.ABI] = a
 	}
-	out := make([]model.IndexAsset, 0, len(byABI))
+	out := make([]model.Asset, 0, len(byABI))
 	for _, a := range byABI {
 		out = append(out, a)
 	}
@@ -596,33 +601,4 @@ func DescribePlans(plans []Plan) string {
 		return "（没有待镜像的版本）\n"
 	}
 	return b.String()
-}
-
-// WriteIndexIfChanged 在 index 有实质变化时落盘。给 reconcile 编排用。
-func WriteIndexIfChanged(c *Ctx, before, after *model.Index) (bool, error) {
-	if sameIndex(before, after) {
-		return false, nil
-	}
-	return true, WriteIndex(c, after)
-}
-
-// sameIndex 粗略比对两份索引（只有 App 数、版本数、asset 数相同才进一步逐项比）。
-// 用于"没事就别写文件"，所以宁可漏报相同（多写一次文件无害）也不能误报相同。
-func sameIndex(a, b *model.Index) bool {
-	if a == nil || b == nil || len(a.Apps) != len(b.Apps) {
-		return false
-	}
-	for i := range a.Apps {
-		x, y := &a.Apps[i], &b.Apps[i]
-		if x.ID != y.ID || len(x.Versions) != len(y.Versions) {
-			return false
-		}
-		for j := range x.Versions {
-			if x.Versions[j].Version != y.Versions[j].Version ||
-				len(x.Versions[j].Assets) != len(y.Versions[j].Assets) {
-				return false
-			}
-		}
-	}
-	return true
 }

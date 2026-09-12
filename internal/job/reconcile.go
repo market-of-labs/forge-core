@@ -67,16 +67,16 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 	// 失败被容忍（D44）本来就该靠报告被人看见，报告再没人打就等于没有。
 	defer func() { c.Reportf(res.Report) }()
 
-	// **在镜像之前**就把"索引是不是空的"记下来。镜像会往 c.Index 里追加版本，
-	// 在这里之后再看就已经不是"加载时的状态"了 —— 而自愈要判断的恰恰是后者。
+	// **在镜像之前**就把"有没有账本"记下来。镜像会往账本里追加版本，在这里之后
+	// 再看就已经不是"加载时的状态"了 —— 而自愈要判断的恰恰是后者。
 	//
-	// index 空了（被清空、丢失、或第一次跑）就开自愈：versionCode / versionName
+	// 一个账本都没有（被清空、丢失、或第一次跑）就开自愈：versionCode / versionName
 	// **只存在于 APK 内部**，Release 的元数据里没有，所以拿回它们的唯一途径就是
-	// 下载。代价是流量，收益是"不用人介入就能从一份空索引恢复"。
+	// 下载。代价是流量，收益是"不用人介入就能从一份空账本恢复"。
 	//
 	// 正常路径下它是关着的，但开着的代价也只是"对确实缺元数据的版本下一份"
-	// （BuildIndex 只对 VersionName 为空的版本下载），所以宁可开。
-	hadIndex := len(c.Index.Apps) > 0
+	// （buildLedger 只对 VersionName 为空的版本下载），所以宁可开。
+	hadLedger := hasAnyLedger(c.Sources)
 
 	// 1–3 步：解析 + 镜像。
 	plans, rep, err := ResolveUpstream(ctx, c, ResolveOptions{OnlyID: opts.OnlyID})
@@ -105,9 +105,9 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 		return res, nil
 	}
 
-	fetch := !hadIndex
+	fetch := !hadLedger
 	if fetch {
-		c.Log("索引为空 —— 走自愈重建，会按需下载 APK 补齐 versionCode（03 §5.2）")
+		c.Log("账本为空 —— 走自愈重建，会按需下载 APK 补齐 versionCode（03 §5.2）")
 	}
 	if err := RebuildAndCheck(ctx, c, RebuildOptions{FetchMissing: fetch}); err != nil {
 		return res, err
@@ -147,8 +147,8 @@ type RebuildOptions struct {
 //
 // 三步必须按这个顺序，且**必须一起跑**：
 //
-//	build-index     事实来自 Release，元数据来自 index 自己 → 必须先于清单
-//	build-manifest  把 sources + index + endpoints 合成 apps.json
+//	build-index     事实来自 Release，元数据来自旧账本 → 必须先于清单
+//	build-manifest  把 sources（自带账本）+ endpoints 合成 apps.json
 //	check-manifest  **读回磁盘上的** apps.json 跑 02 §2.8，是唯一的阻断点
 //
 // # 自检不过就不回写
@@ -159,21 +159,16 @@ type RebuildOptions struct {
 // 不依赖提交）。这个取舍是对的：把一份违反契约的 apps.json 推上去，会让**所有**
 // 客户端立刻拿到坏数据；而不推，最坏情况是"多跑一轮"。
 func RebuildAndCheck(ctx context.Context, c *Ctx, opts RebuildOptions) error {
-	// 索引：事实来自 Release 现状（D23：index 是派生数据，可以随时从 Release 重建）。
-	ix, ixRep, err := BuildIndex(ctx, c, BuildIndexOptions{FetchMissing: opts.FetchMissing})
+	// 账本：事实来自 Release 现状（D23：账本是派生数据，可以随时从 Release 重建）。
+	// 它**就地改写 c.Sources 并落盘**，所以下一步 build-manifest 拿到的已经是新账本 ——
+	// 这里不需要"把新值替换回内存"这一步，那正是合并（D48）消掉的东西。
+	ixRep, err := BuildIndex(ctx, c, BuildIndexOptions{FetchMissing: opts.FetchMissing})
 	if err != nil {
 		return err
 	}
-	// 注意顺序：先把 build-index 的报告打出来，再用新索引替换内存里的那份。
-	// BuildIndex 是拿 c.Index 当"旧索引"来继承元数据的，所以替换必须发生在
-	// 它返回**之后** —— 反过来会让它继承到自己刚生成的东西。
 	c.Reportf(ixRep)
-	c.Index = ix
-	if err := WriteIndex(c, ix); err != nil {
-		return err
-	}
 
-	// 清单：只需要 sources + endpoints + index。
+	// 清单：只需要 sources（自带账本）+ endpoints。
 	if _, mRep, err := BuildManifest(c); err != nil {
 		return err
 	} else {
@@ -303,10 +298,13 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 // 返回 "" 表示"应该按全量处理"：没改任何 sources/ 文件，或者改了**多个**
 // （批量改动时逐个收敛反而更慢、更容易撞上并发上传）。
 //
-// 只看 `sources/{appId}.json` 这一种形状 —— `apps.json` / `store/index.json`
-// 是 forge 自己的产物，它们的 push 只会来自 forge 自己的回写，而那已经带着
-// [skip-dispatch] 被 store 侧挡掉了（规则 7）。真收到了，说明有人在手改产物，
-// 那更该全量重算把它盖回去。
+// 只看 `sources/{appId}.json` 这一种形状 —— `apps.json` 是 forge 自己的产物，
+// 它的 push 只会来自 forge 自己的回写，而那已经带着 [skip-dispatch] 被 store 侧
+// 挡掉了（规则 7）。真收到了，说明有人在手改产物，那更该全量重算把它盖回去。
+//
+// sources/ 里的文件现在**一半是输入、一半是产物**（`versions` 账本是 forge 写的，
+// D48），所以"改了 sources"既可能是人改了元数据、也可能是 forge 回写了账本 ——
+// 两者都该收敛到这**一个** app，所以这里不需要区分。
 func affectedAppID(ctx context.Context, c *Ctx) (string, error) {
 	if c.Env.SHA == "" {
 		return "", fmt.Errorf("payload 里没有 sha")

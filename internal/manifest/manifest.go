@@ -1,13 +1,17 @@
-// Package manifest 实现 03 §5.1：把 `sources/`（静态元数据）+ `store/index.json`（版本事实）
+// Package manifest 实现 03 §5.1：把 `sources/`（元数据 + 版本账本）
 // + `store/endpoints.json`（地址模板）合成 `apps.json`。
 //
-// 三个输入的角色严格分开，本包**只读不写**其中任何一个：
+// 两个输入的角色严格分开，本包**只读不写**其中任何一个：
 //
-//	sources/{appId}.json  人维护 → 谁在清单里、叫什么、kind 是什么
-//	index.json            派生态 → 有哪些版本、每个版本有哪些 ABI 分片
-//	endpoints.json        配置   → 地址长什么样
+//	sources/{appId}.json  人填的元数据 → 谁在清单里、叫什么、kind 是什么
+//	                       forge 写的 `versions` → 有哪些版本、每个版本有哪些 ABI 分片
+//	endpoints.json        配置 → 地址长什么样
 //
-// 本包不碰网络、不读文件：三个输入由调用方准备好（这样它整条都能被单测覆盖）。
+// 版本账本曾经是第三份独立输入（`store/index.json`）。并进来源文件之后（D48），
+// "这个 App 的版本"与"这个 App 本身"在同一个文件里 —— 于是不存在"两个输入对不上"
+// 这种状态，本包也就少了一整类"孤儿"判断。
+//
+// 本包不碰网络、不读文件：输入由调用方准备好（这样它整条都能被单测覆盖）。
 package manifest
 
 import (
@@ -24,8 +28,8 @@ const GeneratedBy = "forge"
 
 // Input 是合成的全部输入。
 type Input struct {
+	// Sources 每条都自带版本账本（Source.Versions）—— 版本事实不再来自第二个文件。
 	Sources     []model.Source
-	Index       *model.Index
 	Endpoints   model.Endpoints
 	GeneratedBy string
 }
@@ -36,9 +40,6 @@ type Input struct {
 // 02 §2.8 的条目级校验由 check-manifest 独立跑一遍（那是产出后的自检，
 // 与"怎么产出"是两件事，混在一起会让两边的失败原因难以区分）。
 func Build(in Input) (*model.Manifest, *model.Report, error) {
-	if in.Index == nil {
-		return nil, nil, fmt.Errorf("index.json 未提供：它是版本事实的唯一来源")
-	}
 	// 先验模板：模板与命名契约分叉时必须**在产出前**就失败。
 	// 否则会生成一份"文件名符合模板但客户端解析不了"的清单 —— 而那是静默故障（02 §2.4）。
 	if err := in.Endpoints.Validate(); err != nil {
@@ -57,24 +58,10 @@ func Build(in Input) (*model.Manifest, *model.Report, error) {
 	copy(sources, in.Sources)
 	sort.Slice(sources, func(i, j int) bool { return sources[i].ID < sources[j].ID })
 
-	// 反向检查：index 里有、sources 里没有的 App。那意味着有人删了 sources 文件
-	// 但 Release 还在（D13 全保留）—— 不算错误，但要让维护者看见"这些还在被镜像着"。
-	want := make(map[string]bool, len(sources))
-	for i := range sources {
-		want[sources[i].ID] = true
-	}
-	for i := range in.Index.Apps {
-		if !want[in.Index.Apps[i].ID] {
-			rep.Warnf(in.Index.Apps[i].ID,
-				"index.json 里有这个 App 但 sources/ 里没有：Release 与历史 asset 仍按 D13 保留，"+
-					"清单不会收录它。若这是有意的移除，属预期（02 §2.9 移除不传播）")
-		}
-	}
-
 	apps := make([]model.Entry, 0, len(sources))
 	for i := range sources {
 		src := &sources[i]
-		entry, ok, r := buildEntry(src, in.Index, in.Endpoints)
+		entry, ok, r := buildEntry(src, in.Endpoints)
 		rep.Addf("", r)
 		if !ok {
 			continue
@@ -92,26 +79,23 @@ func Build(in Input) (*model.Manifest, *model.Report, error) {
 }
 
 // buildEntry 合成单条。ok=false 表示"这条不该进清单"。
-func buildEntry(src *model.Source, index *model.Index, ep model.Endpoints) (*model.Entry, bool, *model.Report) {
+func buildEntry(src *model.Source, ep model.Endpoints) (*model.Entry, bool, *model.Report) {
 	rep := &model.Report{}
 
-	idxApp := index.Find(src.ID)
-	if idxApp == nil || len(idxApp.Versions) == 0 {
+	latest := src.Latest()
+	if latest == nil {
 		// 03 §5.4 的原则：**不写半成品清单条目**。
 		//
 		// 一个刚收录、还没镜像出任何版本的 App，若照样出一条 apkUrls 为空的清单，
 		// 后果不是"设备端看到空条目"这么轻 —— 02 规则 4 会判它失败，
 		// 于是 check-manifest 阻断**整次回写**，连别的 App 的正常更新都推不出去。
 		// 所以宁可这一条暂时缺席（下一轮 reconcile 补齐后自然出现）。
-		rep.Warnf(src.ID, "sources/ 里有它但 index.json 里没有任何版本 —— 本轮不产出该条目（待镜像）。"+
+		rep.Warnf(src.ID, "sources/ 里有它但还没有任何已镜像的版本 —— 本轮不产出该条目（待镜像）。"+
 			"source=%s%s", src.Source, pausedHint(src))
 		return nil, false, rep
 	}
-
-	// 这里不再判 latest == nil：唯一能让 Latest() 返回 nil 的输入（Versions 为空）
-	// 已经被上面那条 guard 挡掉了，再判一次就是一条永远走不到的分支。
-	// 上面的 guard 必须留着 —— 它的告警带 source= 与 paused 提示，能定位；这条不能。
-	latest := idxApp.Latest()
+	// `Latest()` 返回 nil 的唯一输入是 Versions 为空，所以上面那条 guard 之后
+	// latest 保证非 nil —— 这里不再多判一次（那是永远走不到的分支）。
 	if len(latest.Assets) == 0 {
 		rep.Warnf(src.ID, "最新版本 %q 没有任何 asset，跳过（不写半成品条目）", latest.Version)
 		return nil, false, rep
@@ -146,8 +130,8 @@ func buildEntry(src *model.Source, index *model.Index, ep model.Endpoints) (*mod
 	}
 
 	// apkUrls：按 02 §2.4 的约定顺序列出**该版本的全部变体**。
-	// 这里自己排一遍而不是信 index 里的顺序：index 是派生数据，可能被手工改过或由
-	// rebuild-index 从 Release 的 asset 顺序重建（那个顺序是 API 返回顺序，无契约意义）。
+	// 这里自己排一遍而不是信账本里的顺序：账本是派生数据，可能被手工改过或由
+	// build-index 从 Release 的 asset 顺序重建（那个顺序是 API 返回顺序，无契约意义）。
 	refs, err := apkRefs(src.ID, latest, ep)
 	if err != nil {
 		rep.Errorf(src.ID, "%v", err)
@@ -184,7 +168,7 @@ func buildEntry(src *model.Source, index *model.Index, ep model.Endpoints) (*mod
 }
 
 // apkRefs 渲染某版本的全部 ABI 变体，顺序按 02 §2.4（universal 在前）。
-func apkRefs(appID string, v *model.IndexVersion, ep model.Endpoints) ([]model.APKRef, error) {
+func apkRefs(appID string, v *model.Version, ep model.Endpoints) ([]model.APKRef, error) {
 	seen := make(map[string]bool, len(v.Assets))
 	abis := make([]string, 0, len(v.Assets))
 	for _, a := range v.Assets {

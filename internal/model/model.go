@@ -59,10 +59,10 @@ const (
 // ReviewCategories 是「分类标签」勾选项的固定词表，必须与两份 issue 模板里的
 // options 逐字一致（`TestTemplateVocabularyMatchesGo` 会直接读 yml 钉住这件事）。
 //
-// 它**刻意不参与 Source.Validate**：`sources/` 是唯一事实源（D30 入口甲），
-// 人手改文件时引入一个新分类是合法的，那属于"文件是事实"的一部分。词表只约束
-// issue 表单 —— 陌生人写字进来的那条路（入口乙）把取值锁在闭集里，清单的筛选条
-// 才不会被随手造出来的标签塞满。
+// 它**刻意不参与 Source.Validate**：取值在**表单侧**就已经被锁在闭集里（词表与
+// 模板逐字钉死，见上），而 `sources/` 的唯一入口就是那张表单（D48 之后人不直接
+// 写数据源），所以在校验里再说一遍拦不到任何东西。词表存在的理由是**清单的筛选条
+// 不被随手造出来的标签塞满** —— 那条防线在入口处，不在出口处。
 //
 // 顺序在这里**只是给回评文案用的**，不影响任何判定 —— 与 naming.ABISet 不同，
 // 那个的顺序是排序位次，动不得。
@@ -71,7 +71,8 @@ var ReviewCategories = []string{"工具", "效率", "媒体", "通讯", "开发"
 // SentinelURL 渲染条目的哨兵源地址。
 func SentinelURL(id string) string { return SentinelHost + id }
 
-// NowISO 是 exportedAt / generatedAt 的取值格式（02 §2.1：ISO-8601 UTC）。
+// NowISO 是 exportedAt 的取值格式（02 §2.1：ISO-8601 UTC）。
+// 手动上传的版本也用它填 Version.PublishedAt（见 job.recordPlaced）。
 func NowISO() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // ReleaseDate 把发布时间转成清单 releaseDate 字段的整数形式。
@@ -130,8 +131,10 @@ type Entry struct {
 
 // ---- 03 §2.2 sources/{appId}.json ------------------------------------------
 
-// Source 是一个 App 的**维护输入**。它是唯一由人维护的事实源；
-// apps.json / index.json / Release 全部可以从它 + 上游推出。
+// Source 是一个 App 的**维护输入**。它是唯一事实源：apps.json 与 Release 现状
+// 全部可以从它 + 上游推出。
+//
+// 上半部分是人填的（走 issue 表单），下半部分的 Versions 是 forge 写的（见那里的说明）。
 type Source struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
@@ -148,6 +151,19 @@ type Source struct {
 	Upstream *Upstream `json:"upstream,omitempty"`
 	// ABIWhitelist 缺省空 = 该版本全 ABI 分片都镜像；用于控体积（D14）。
 	ABIWhitelist []string `json:"abiWhitelist,omitempty"`
+	// Versions 是**机器写的**版本账本：这个 App 已镜像了哪些版本、每个版本有哪些 ABI 分片。
+	//
+	// 它曾经是独立文件 `store/index.json`（D23），现在并进来源文件里。理由是**归属**：
+	// 账本天然属于某一个应用，而拆成两份的代价是真实的 —— 两份文件要靠 id 对齐、
+	// "移除一个来源"会在 index 里留下一段无人认领的孤儿账本、每次重建都得回答
+	// "index 里有而 sources 里没有的怎么办"。
+	//
+	// ⚠️ 上面那些字段是**人填的**（走 issue 表单），这一块是 **forge 写的** ——
+	// 每次对账都会整段重写（`BuildIndex`），手改它下一轮就被盖回去。
+	//
+	// 放在结构体最后，是为了让 JSON 里"人填的那段"始终在前面、机器那段始终在末尾，
+	// diff 里一眼能看出改的是哪一半。
+	Versions []Version `json:"versions,omitempty"`
 }
 
 // 简介的长度上限，单位是 **rune**（汉字算一个）。
@@ -197,6 +213,16 @@ type Upstream struct {
 	Type         string `json:"type"` // 只支持 UpstreamGitHubRelease
 	Repo         string `json:"repo"` // "owner/name"
 	AssetPattern string `json:"assetPattern,omitempty"`
+	// IncludePrerelease 决定上游标了 prerelease 的发布要不要一起镜像（默认否 = 只镜像正式版）。
+	//
+	// 为什么挂在 upstream 块里而不是 Source 顶层：manual 来源没有上游，也就没有这个概念。
+	//
+	// 打开之后 prerelease 与正式版**一视同仁**（同一个候选集、同一条 upstreamTag 水位线，
+	// 见 upstream.Releasable）—— 也就是说设备端会拿到比当前正式版更新的预发布版。
+	// 那是开启这个开关的**本意**，不是意外；而唯一需要它的场景是"上游把新版只发成 prerelease"。
+	// 开关只影响"进不进候选集"，**不影响** 03 §4.6 那条 `_incoming` 闸门
+	// （那个 Env.Prerelease 说的是 store 自己的暂存 Release，是另一件事）。
+	IncludePrerelease bool `json:"includePrerelease,omitempty"`
 }
 
 // ---- 03 §2.3 store/endpoints.json ------------------------------------------
@@ -209,25 +235,13 @@ type Endpoints struct {
 	AssetURLTemplate  string `json:"assetUrlTemplate"`
 }
 
-// ---- 03 §2.4 store/index.json ----------------------------------------------
+// ---- 03 §2.4 版本账本（Source.Versions） -------------------------------------
 
-// Index 是版本/asset 索引。apps.json 只描述最新版，历史版本无处存放（tag 里没有版本段），
-// 这块由 Index 补上。**它不是客户端契约**（D23）—— 伴侣应用永远不碰它，
-// 所以结构可以演进而不影响设备端。
-type Index struct {
-	GeneratedAt string     `json:"generatedAt"`
-	Apps        []IndexApp `json:"apps"`
-}
-
-// IndexApp 是一个 App 的全部已镜像版本。
-type IndexApp struct {
-	ID       string         `json:"id"`
-	Tag      string         `json:"tag"`
-	Versions []IndexVersion `json:"versions"`
-}
-
-// IndexVersion 是一个版本的全部 ABI 分片。
-type IndexVersion struct {
+// Version 是一个已镜像版本的全部 ABI 分片。apps.json 只描述最新版，历史版本无处存放
+// （tag 里没有版本段），这块由它补上。
+//
+// 整块是**机器写的**（见 Source.Versions 的说明）：每次对账都由 BuildIndex 重写。
+type Version struct {
 	// Version 是**清洗后**的 version token —— 它就是文件名里的那一段（02 §2.4）。
 	Version string `json:"version"`
 	// VersionCode 用 omitempty 落地 03 §5.2 的「拿不到时省略该字段而非写 0」——
@@ -239,13 +253,13 @@ type IndexVersion struct {
 	// （展示与判更新用，原版语义），而文件名里只有清洗后的 token。两者在
 	// versionName 含空白/斜杠时**不同**，只存 token 就永远推不回原始值。
 	//
-	// 这不违反 03 §2.4 —— 那一节明说 index.json「不是客户端契约，结构可以演进而不影响
-	// 设备端」。缺该字段时按 Version 兜底，所以现存的手写种子数据照样能读。
+	// 这一块不是客户端契约（D23），所以多存一份不违反任何东西。缺该字段时按 Version
+	// 兜底，所以缺元数据的版本照样能读。
 	VersionName string `json:"versionName,omitempty"`
 	// PublishedAt 是该版本的上游发布时间（RFC3339 UTC），用来回填清单的 releaseDate。
 	//
-	// 同上，是 index 的扩展字段：不存它，第一次重建清单就会把 releaseDate 丢掉，
-	// 而那是个**静默的数据退化** —— 清单格式合法、客户端只是不再显示日期。
+	// 不存它，第一次重建清单就会把 releaseDate 丢掉，而那是个**静默的数据退化** ——
+	// 清单格式合法、客户端只是不再显示日期。
 	PublishedAt string `json:"publishedAt,omitempty"`
 	// UpstreamTag 是产出这一版本的**上游 Release tag**，用来让对账变成一次集合差。
 	//
@@ -255,21 +269,21 @@ type IndexVersion struct {
 	// 不下载就不知道 —— 那就成了"为了判断要不要下载，先得下载"。
 	//
 	// 记录上游 tag 把这件事拆开了：镜像**当时**就知道 tag（是它触发的），记下来；
-	// 之后对账只要 `上游 latest.tag ∈ index.upstreamTag` 就能判定已镜像，
+	// 之后对账只要 `上游 latest.tag ∈ 该来源的 upstreamTag` 就能判定已镜像，
 	// 一个字节都不用下。缺该字段时按"未镜像"处理（会多下一次，然后被 asset 名幂等挡住），
-	// 所以现存的手写种子数据不受影响。
+	// 所以缺元数据的版本照样能读。
 	UpstreamTag string `json:"upstreamTag,omitempty"`
 	// Assets 是该版本的全部分片，**顺序即 apkUrls 的顺序**（02 §2.4：universal 在前）。
-	Assets []IndexAsset `json:"assets"`
+	Assets []Asset `json:"assets"`
 }
 
-// MirroredUpstreamTag 报告上游 tag 是否已经镜像过（见 UpstreamTag 的说明）。
-func (a *IndexApp) MirroredUpstreamTag(tag string) bool {
+// MirroredUpstreamTag 报告上游 tag 是否已经镜像过（见 Version.UpstreamTag 的说明）。
+func (s *Source) MirroredUpstreamTag(tag string) bool {
 	if tag == "" {
 		return false
 	}
-	for i := range a.Versions {
-		if a.Versions[i].UpstreamTag == tag {
+	for i := range s.Versions {
+		if s.Versions[i].UpstreamTag == tag {
 			return true
 		}
 	}
@@ -277,7 +291,7 @@ func (a *IndexApp) MirroredUpstreamTag(tag string) bool {
 }
 
 // DisplayVersion 返回用于清单 `latestVersion` 的原始版本名，见 VersionName 的说明。
-func (v *IndexVersion) DisplayVersion() string {
+func (v *Version) DisplayVersion() string {
 	if v.VersionName != "" {
 		return v.VersionName
 	}
@@ -285,7 +299,7 @@ func (v *IndexVersion) DisplayVersion() string {
 }
 
 // ABIs 按 assets 出现顺序返回 ABI token 列表。
-func (v *IndexVersion) ABIs() []string {
+func (v *Version) ABIs() []string {
 	out := make([]string, 0, len(v.Assets))
 	for _, a := range v.Assets {
 		out = append(out, a.ABI)
@@ -293,53 +307,21 @@ func (v *IndexVersion) ABIs() []string {
 	return out
 }
 
-// IndexAsset 是一个具体的 asset 文件。
-type IndexAsset struct {
+// Asset 是一个具体的 asset 文件。
+type Asset struct {
 	ABI  string `json:"abi"`
 	File string `json:"file"`
 	Size int64  `json:"size"`
 }
 
-// Find 按 id 取 App 的索引子树。
-func (ix *Index) Find(id string) *IndexApp {
-	for i := range ix.Apps {
-		if ix.Apps[i].ID == id {
-			return &ix.Apps[i]
-		}
-	}
-	return nil
-}
-
 // FindVersion 按 version token 取版本子树。
-func (a *IndexApp) FindVersion(version string) *IndexVersion {
-	for i := range a.Versions {
-		if a.Versions[i].Version == version {
-			return &a.Versions[i]
+func (s *Source) FindVersion(version string) *Version {
+	for i := range s.Versions {
+		if s.Versions[i].Version == version {
+			return &s.Versions[i]
 		}
 	}
 	return nil
-}
-
-// HasAsset 报告某个规范文件名是否已被索引 —— 镜像的幂等判据（03 §3.1：
-// 幂等按 asset 名判断，禁止 --clobber）。
-func (a *IndexApp) HasAsset(file string) bool {
-	for i := range a.Versions {
-		for _, as := range a.Versions[i].Assets {
-			if as.File == file {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// VersionTokens 返回该 App 已镜像的全部 version token（无序）。
-func (a *IndexApp) VersionTokens() []string {
-	out := make([]string, 0, len(a.Versions))
-	for _, v := range a.Versions {
-		out = append(out, v.Version)
-	}
-	return out
 }
 
 // Latest 返回"最新"的那个版本，供清单的 latestVersion / apkUrls 使用。
@@ -349,15 +331,15 @@ func (a *IndexApp) VersionTokens() []string {
 //	版本排序在上游之间没有统一语义。versionCode 可能被发布者写错或回退，
 //	versionName 更是自由文本（`2.0-rc1` 与 `2.0` 谁新取决于人）。
 //
-// 唯一可靠的"新"是**时间**，而 index.json 的生成方式本身就是按时间追加的账本
+// 唯一可靠的"新"是**时间**，而账本的生成方式本身就是按时间追加的
 // （reconcile 按上游发布时间顺序镜像，build-index 保留已知版本的位置、新版本追加到末尾）。
 // 所以"最后一个 = 最新"是这套写入顺序的直接推论，不需要再猜排序规则。
 //
 // check-manifest 会额外检查"最新版的 versionCode 是否是该 App 里最大的"，
 // 把反常情形作为告警暴露出来，而不是由这里悄悄替人做决定。
-func (a *IndexApp) Latest() *IndexVersion {
-	if len(a.Versions) == 0 {
+func (s *Source) Latest() *Version {
+	if len(s.Versions) == 0 {
 		return nil
 	}
-	return &a.Versions[len(a.Versions)-1]
+	return &s.Versions[len(s.Versions)-1]
 }

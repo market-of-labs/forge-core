@@ -87,7 +87,6 @@ func changeBody(appID, action string, extra ...[2]string) string {
 func ctxWith(srcs ...model.Source) *Ctx {
 	return &Ctx{
 		Sources: srcs,
-		Index:   &model.Index{Apps: []model.IndexApp{}},
 		Log:     func(string, ...any) {},
 	}
 }
@@ -292,6 +291,79 @@ func TestDecideIntake_AddRejectsUnknownVocabulary(t *testing.T) {
 		"申请内容不合法")
 	mustReject(t, DecideIntake(c, addBody([2]string{issue.LabelABIs, "- [X] riscv64"})),
 		"申请内容不合法")
+}
+
+// TestDecideIntake_AddCarriesKindAndPrerelease 钉住两个新模板字段真的接到了 Source 上。
+//
+// 它们与 repo / assetPattern 不同：那两个决定"取哪个仓库的哪个文件"，这两个改的是
+// **取哪一批**（prerelease 收不收）与**这条记录在设备端算哪一类**（kind）。少接一根线
+// 的表现是：申请人勾了、回评表格里也照样念了，而数据文件里没有 —— 静默的假回评。
+func TestDecideIntake_AddCarriesKindAndPrerelease(t *testing.T) {
+	d := DecideIntake(ctxWith(), addBody(
+		[2]string{issue.LabelKind, model.KindObtainium},
+		[2]string{issue.LabelPrerelease, "- [X] " + issue.PrereleaseOption},
+	))
+	mustAcceptAdd(t, d)
+	if d.Source.Kind != model.KindObtainium {
+		t.Errorf("kind = %q，期望 %q", d.Source.Kind, model.KindObtainium)
+	}
+	if !d.Source.Upstream.IncludePrerelease {
+		t.Error("勾了 prerelease，但 Source.Upstream.IncludePrerelease 还是 false")
+	}
+
+	// 默认形态：两个字段都不填 → 空 kind（普通应用）+ 不收 prerelease。
+	d = DecideIntake(ctxWith(), addBody())
+	mustAcceptAdd(t, d)
+	if d.Source.Kind != "" {
+		t.Errorf("下拉未选时 kind 应当是空串（普通应用），得到 %q", d.Source.Kind)
+	}
+	if d.Source.Upstream.IncludePrerelease {
+		t.Error("没勾 prerelease，但 Source.Upstream.IncludePrerelease 是 true")
+	}
+}
+
+func TestDecideIntake_AddRejectsUnknownKind(t *testing.T) {
+	// 手改正文塞一个 kind 词表外的值：挡掉。它会一路进 sources/，而 kind 是**设备端行为**
+	// （伴侣应用拿它决定要不要收进启动器候选 / 当自更新源），不是展示字段。
+	mustReject(t, DecideIntake(ctxWith(), addBody([2]string{issue.LabelKind, "companion-app"})),
+		"kind")
+}
+
+// TestDecideIntake_AddCompanionSlot 钉住「kind: companion 全局至多一条」这道闸门。
+//
+// 为什么它必须在**裁决**阶段就判：`CheckSourceSet` 有一条一模一样的规则，但它跑在文件
+// 落盘**之后** —— 那一轮的 check-manifest 会因此判硬失败，整份清单推不出去，直到有人
+// 手动删掉那个多出来的文件。也就是说一张陌生人的申请能把整个 store 卡住，这是这条流程里
+// 唯一一处"外部输入造成持续故障"的地方，堵在门口最省事。
+//
+// 放行的那两行同样重要：同一条目**重跑**（编辑正文重新发车）不能被自己挡住。
+func TestDecideIntake_AddCompanionSlot(t *testing.T) {
+	comp := githubSource("com.obtainium.companion")
+	comp.Kind = model.KindCompanion
+	comp.Upstream.Repo = "owner/companion"
+
+	// 还没有 companion：这条申请来当占用者，放行。
+	d := DecideIntake(ctxWith(), addBody([2]string{issue.LabelKind, model.KindCompanion}))
+	mustAcceptAdd(t, d)
+	if d.Source.Kind != model.KindCompanion {
+		t.Errorf("kind = %q，期望 %q", d.Source.Kind, model.KindCompanion)
+	}
+
+	// 同一个上游仓库再提交一次 = 已有的那条就是这份申请自己写的，放行。
+	d = DecideIntake(ctxWith(comp), addBody(
+		[2]string{issue.LabelRepo, "owner/companion"},
+		[2]string{issue.LabelKind, model.KindCompanion},
+	))
+	mustAcceptAdd(t, d)
+
+	// 另一个仓库想当 companion：拒。
+	mustReject(t, DecideIntake(ctxWith(comp),
+		addBody([2]string{issue.LabelKind, model.KindCompanion})), "至多一条")
+
+	// 顺带钉住这条规则**只管 companion**：obtainium 没有"至多一条"的说法，
+	// 有 companion 在场也照样放行。
+	d = DecideIntake(ctxWith(comp), addBody([2]string{issue.LabelKind, model.KindObtainium}))
+	mustAcceptAdd(t, d)
 }
 
 // 两套模板的字段混在一张单里：拒绝，不猜。猜错方向的后果是拿「目标 appId」

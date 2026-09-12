@@ -35,16 +35,12 @@ func TestGoldenRealRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读 endpoints.json：%v", err)
 	}
-	ix, err := repo.LoadIndex()
-	if err != nil {
-		t.Fatalf("读 index.json：%v", err)
-	}
 	srcs, err := repo.LoadSources()
 	if err != nil {
 		t.Fatalf("读 sources/：%v", err)
 	}
 	if len(srcs) == 0 {
-		t.Fatal("sources/ 里一个条目都没有 —— 那 index.json 里的东西就都是孤儿了")
+		t.Fatal("sources/ 里一个条目都没有 —— 那这份仓库就没有任何输入了")
 	}
 
 	want, err := repo.LoadManifest()
@@ -67,13 +63,13 @@ func TestGoldenRealRepo(t *testing.T) {
 		}
 	}
 
-	// ③ 从三个输入**重建**清单，逐条与现存文件比对。
+	// ③ 从两个输入**重建**清单，逐条与现存文件比对 —— sources 自带的版本账本
+	// 就是第三个输入，合并之后（D48）不再有独立文件。
 	//
 	// 这条断言的含义是："规范 §5.1 描述的合成规则，能复原出仓库里那份清单"。
 	// 能复原 = 我对 rules 的理解与产出它的那次人工操作一致。
 	got, rep, err := manifest.Build(manifest.Input{
 		Sources:   srcs,
-		Index:     ix,
 		Endpoints: ep,
 	})
 	if err != nil {
@@ -119,10 +115,10 @@ func TestGoldenRealRepo(t *testing.T) {
 
 // compareEntries 逐字段比对（按 id 配对后的）两条条目。
 //
-// **不比 ReleaseDate**：现存 apps.json 里的 releaseDate 是手写种子值，而 index.json
-// 里没有 publishedAt（那种子索引也是手写的），所以重建不出来。这不是 bug 而是
-// "索引缺一个可选字段"，跑一次 `build-index --from-releases` 从 Release 的
-// published_at 回填后就能对上。这条差别单独在 TestGoldenReleaseDateGap 里说明。
+// **不比 ReleaseDate**：现存 apps.json 里的 releaseDate 是手写种子值，而账本里
+// 没有 publishedAt（那份种子账本也是手写的），所以重建不出来。这不是 bug 而是
+// "账本缺一个可选字段"，跑一次 `build-index`（必要时带 `-fetch-missing`）
+// 从 Release 的 published_at 回填后就能对上。这条差别单独在 TestGoldenReleaseDateGap 里说明。
 func compareEntries(t *testing.T, got, want model.Entry) {
 	t.Helper()
 	type field struct {
@@ -155,28 +151,32 @@ func compareEntries(t *testing.T, got, want model.Entry) {
 
 // TestGoldenReleaseDateGap 把上面那条"不比 ReleaseDate"显式记录下来。
 //
-// 存在的意义是**不让一个已知的差异变成沉默的差异** —— 若哪天 index.json 里补上了
+// 存在的意义是**不让一个已知的差异变成沉默的差异** —— 若哪天账本里补上了
 // publishedAt，这条测试会失败，提示可以把 releaseDate 也纳入比对。
 func TestGoldenReleaseDateGap(t *testing.T) {
 	repo := store.Repo{Root: storeRoot(t)}
-	ix, err := repo.LoadIndex()
+	srcs, err := repo.LoadSources()
 	if err != nil {
-		t.Fatalf("读 index.json：%v", err)
+		t.Fatalf("读 sources/：%v", err)
 	}
 
-	missing := 0
-	for _, a := range ix.Apps {
-		for _, v := range a.Versions {
+	total, missing := 0, 0
+	for i := range srcs {
+		for _, v := range srcs[i].Versions {
+			total++
 			if v.PublishedAt == "" {
 				missing++
 			}
 		}
 	}
+	if total == 0 {
+		t.Fatal("sources/ 里一个版本都没有 —— 账本空着，这条测试就什么都证明不了")
+	}
 	if missing == 0 {
-		t.Errorf("index.json 里每个版本都有 publishedAt 了 —— "+
-			"可以把 releaseDate 加回 compareEntries 的比对字段（当前有 %d 个版本缺该字段）", missing)
+		t.Errorf("账本里每个版本都有 publishedAt 了 —— "+
+			"可以把 releaseDate 加回 compareEntries 的比对字段（共 %d 个版本）", total)
 	} else {
-		t.Logf("index.json 里有 %d 个版本缺 publishedAt，releaseDate 因此无法重建；"+
-			"跑 build-index --from-releases 可从 Release 的 published_at 回填", missing)
+		t.Logf("账本里有 %d/%d 个版本缺 publishedAt，releaseDate 因此无法重建；"+
+			"跑 build-index 可从 Release 的 published_at 回填", missing, total)
 	}
 }

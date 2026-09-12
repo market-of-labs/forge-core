@@ -27,6 +27,14 @@ ImranR98/Obtainium
 
 app.*\.apk$
 
+### 应用类型
+
+普通应用
+
+### 拉取预发布版本（可选）
+
+- [X] 拉取预发布版本
+
 ### 一句话简介（可选）
 
 去广告的第三方客户端
@@ -104,6 +112,61 @@ func TestAddRequestHasNoDerivedFields(t *testing.T) {
 	// 简介同属"申请人自己知道的东西"，所以它是保留的。
 	if r.Desc != "去广告的第三方客户端" {
 		t.Errorf("desc = %q", r.Desc)
+	}
+}
+
+// TestParseAddKindAndPrerelease 钉住两个新字段的取值，重点是**它们的空值**。
+//
+// 空值是这里的实质：
+//   - 下拉里的「普通应用」必须落到**空串**上（= `Source.Kind` 的零值），而不是一个叫
+//     "普通应用"的 kind —— 后者会被 ValidateKind 判成非法，于是模板的默认值本身成了陷阱。
+//   - 勾选项未勾 → GitHub 渲染成 `- [ ] xxx`（**在正文里，不是消失**）→ 必须解析成 false。
+//     写成"没出现在正文里就是 false"是错的，那等于把"用户明确没勾"和"这个字段不存在"
+//     混成一个状态，而前者在模板里永远是出现过的。
+func TestParseAddKindAndPrerelease(t *testing.T) {
+	r, err := issue.ParseAdd(issue.Parse(addBody))
+	if err != nil {
+		t.Fatalf("ParseAdd：%v", err)
+	}
+	if r.Kind != "" {
+		t.Errorf("kind = %q，期望空串（下拉默认项「普通应用」）", r.Kind)
+	}
+	if !r.IncludePrerelease {
+		t.Error("勾了 prerelease，期望 true")
+	}
+
+	// 选了 companion、且没勾 prerelease。
+	body := `### 上游 GitHub 仓库
+
+ImranR98/Obtainium
+
+### 应用类型
+
+companion
+
+### 拉取预发布版本（可选）
+
+- [ ] 拉取预发布版本
+`
+	r, err = issue.ParseAdd(issue.Parse(body))
+	if err != nil {
+		t.Fatalf("ParseAdd：%v", err)
+	}
+	if r.Kind != model.KindCompanion {
+		t.Errorf("kind = %q，期望 %q", r.Kind, model.KindCompanion)
+	}
+	if r.IncludePrerelease {
+		t.Error("没勾 prerelease，期望 false")
+	}
+
+	// 这次模板改动**之前**提交的老单子：正文里根本没有「应用类型」那一段。
+	// 它必须仍然解析成普通应用（空串），否则新模板一上线，所有已开着的单子全体失效。
+	r, err = issue.ParseAdd(issue.Parse("### 上游 GitHub 仓库\n\nImranR98/Obtainium\n"))
+	if err != nil {
+		t.Fatalf("ParseAdd：%v", err)
+	}
+	if r.Kind != "" {
+		t.Errorf("没有「应用类型」那一段时 kind = %q，期望空串", r.Kind)
 	}
 }
 
@@ -353,6 +416,7 @@ func TestLabelsMatchStoreTemplates(t *testing.T) {
 		{"add-source.yml", []string{
 			issue.LabelRepo, issue.LabelAssetPat, issue.LabelDesc,
 			issue.LabelCategories, issue.LabelABIs,
+			issue.LabelKind, issue.LabelPrerelease,
 		}},
 		{"change-source.yml", []string{
 			issue.LabelTargetAppID, issue.LabelAction, issue.LabelNewName,
@@ -411,6 +475,14 @@ func TestCheckboxVocabularyMatchesGo(t *testing.T) {
 	for _, a := range naming.ABISet {
 		want[a] = true
 	}
+	// 第三类选项：不是"取值词表"而是"开关"（勾了 = 开）。它同样必须是个 Go 常量 ——
+	// 否则下面那句 `got` 差集检查会把它判成"勾了也会被 validateAdd 拒掉"，而它其实不参与校验。
+	want[issue.PrereleaseOption] = true
+	// 变更单里**本就不该有**的选项：ABI 词表与只属于新增单的开关。
+	// 它缺的每一项都必须落在这一组里 —— 否则就是"变更单缺了个分类选项"。
+	absentFromChange := func(v string) bool {
+		return naming.IsABI(v) || v == issue.PrereleaseOption
+	}
 
 	for _, file := range []string{"add-source.yml", "change-source.yml"} {
 		b, err := os.ReadFile(filepath.Join(dir, file))
@@ -443,13 +515,14 @@ func TestCheckboxVocabularyMatchesGo(t *testing.T) {
 				t.Errorf("%s 里的选项 %q 不在 Go 的固定集内 —— 勾了也会被 validateAdd 拒掉", file, v)
 			}
 		}
-		// 新增单必须**用满**整个词表；变更单只有分类那一组，它缺的项必须都是 ABI。
+		// 新增单必须**用满**整个词表；变更单只有分类那一组，它缺的项必须都是
+		// "本来就不在它有范围内的"（ABI 词表 / 只属于新增单的开关）。
 		for v := range inGoNotYAML {
 			if file == "add-source.yml" {
 				t.Errorf("add-source.yml 里缺选项 %q —— 它在 Go 的固定集里，但申请人勾不到", v)
 				continue
 			}
-			if !naming.IsABI(v) {
+			if !absentFromChange(v) {
 				t.Errorf("%s 里缺分类选项 %q", file, v)
 			}
 		}

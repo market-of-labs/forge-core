@@ -27,19 +27,19 @@ func candidates(tags ...string) []gh.Release {
 	return out
 }
 
-// indexWith 造一个"已镜像过 upstreamTags 这些上游 Release"的索引。
+// ledgerWith 造一个工作副本，其中那条来源的账本已镜像过 upstreamTags 这些上游 Release。
 // 位次无关紧要 —— 水位线判据是集合成员，不是顺序。
-func indexWith(appID string, upstreamTags ...string) *Ctx {
-	app := model.IndexApp{ID: appID, Tag: appID}
+func ledgerWith(appID string, upstreamTags ...string) *Ctx {
+	src := model.Source{ID: appID}
 	for i, t := range upstreamTags {
-		app.Versions = append(app.Versions, model.IndexVersion{
+		src.Versions = append(src.Versions, model.Version{
 			Version:     fmt.Sprintf("1.0.%d", i),
 			UpstreamTag: t,
 		})
 	}
 	return &Ctx{
-		Index: &model.Index{Apps: []model.IndexApp{app}},
-		Log:   func(string, ...any) {},
+		Sources: []model.Source{src},
+		Log:     func(string, ...any) {},
 	}
 }
 
@@ -69,33 +69,33 @@ func pickAndCheck(t *testing.T, c *Ctx, appID string, cands []gh.Release, want .
 
 // 绝大多数轮次的正常结果：上游最新的那个已经镜像过了，什么都不做。
 func TestPickTargets_NothingToDo(t *testing.T) {
-	c := indexWith("com.example.app", "v3")
+	c := ledgerWith("com.example.app", "v3")
 	pickAndCheck(t, c, "com.example.app", candidates("v3", "v2", "v1"))
 }
 
 // §4.4 的漏跑自愈：跳过的那几天发的版本要补上，但**只补到水位线为止** ——
 // 水位线以下的（v1 及更老）属于 D33 的"不追溯"，永远不翻。
 func TestPickTargets_MissedOneDayCatchesUp(t *testing.T) {
-	c := indexWith("com.example.app", "v2")
+	c := ledgerWith("com.example.app", "v2")
 	pickAndCheck(t, c, "com.example.app", candidates("v3", "v2", "v1"), "v3")
 }
 
-// 补多个时必须是**从老到新**：index 的位次就是"追加顺序"，而
-// IndexApp.Latest() 取最后一个 —— 顺序反了会把老版本当成最新。
+// 补多个时必须是**从老到新**：账本的位次就是"追加顺序"，而
+// Source.Latest() 取最后一个 —— 顺序反了会把老版本当成最新。
 func TestPickTargets_CatchUpIsOldestFirst(t *testing.T) {
-	c := indexWith("com.example.app", "v1")
+	c := ledgerWith("com.example.app", "v1")
 	pickAndCheck(t, c, "com.example.app", candidates("v4", "v3", "v2", "v1"), "v2", "v3", "v4")
 }
 
 // D33：收录时只镜像**当刻的最新版本**，更老的版本不追溯。
 func TestPickTargets_FirstIntakeTakesOnlyNewest(t *testing.T) {
-	c := indexWith("com.example.app") // 一个版本都没有
+	c := ledgerWith("com.example.app") // 一个版本都没有
 	pickAndCheck(t, c, "com.example.app", candidates("v3", "v2", "v1"), "v3")
 }
 
-// 索引里压根没有这个 App（刚收录）—— 与"有 App 但没版本"同一条路。
+// 工作副本里压根没有这个 App（刚收录）—— 与"有 App 但没版本"同一条路。
 func TestPickTargets_UnknownAppTakesOnlyNewest(t *testing.T) {
-	c := indexWith("com.example.other", "v1")
+	c := ledgerWith("com.example.other", "v1")
 	pickAndCheck(t, c, "com.example.app", candidates("v3", "v2", "v1"), "v3")
 }
 
@@ -103,17 +103,17 @@ func TestPickTargets_UnknownAppTakesOnlyNewest(t *testing.T) {
 // 按"一个都没镜像过"处理。代价只是少补几个老版本，而不追溯本来就是既定口径 ——
 // 反过来（当成"全都镜像过"）会让这个 App 从此再也不更新。
 func TestPickTargets_WatermarkGoneTakesOnlyNewest(t *testing.T) {
-	c := indexWith("com.example.app", "v0-deleted")
+	c := ledgerWith("com.example.app", "v0-deleted")
 	pickAndCheck(t, c, "com.example.app", candidates("v3", "v2", "v1"), "v3")
 }
 
 func TestPickTargets_SingleCandidate(t *testing.T) {
 	t.Run("已镜像", func(t *testing.T) {
-		c := indexWith("com.example.app", "v1")
+		c := ledgerWith("com.example.app", "v1")
 		pickAndCheck(t, c, "com.example.app", candidates("v1"))
 	})
 	t.Run("未镜像", func(t *testing.T) {
-		c := indexWith("com.example.app")
+		c := ledgerWith("com.example.app")
 		pickAndCheck(t, c, "com.example.app", candidates("v1"), "v1")
 	})
 }
@@ -121,14 +121,14 @@ func TestPickTargets_SingleCandidate(t *testing.T) {
 // 空候选不能崩。调用方（resolveOne）在更早的地方就挡了这种情况，但那道防线在
 // 另一个函数里 —— 单独测/复用本函数时，"一个 Release 都没有"是最自然的输入之一。
 func TestPickTargets_EmptyCandidatesDoesNotPanic(t *testing.T) {
-	c := indexWith("com.example.app")
+	c := ledgerWith("com.example.app")
 	pickAndCheck(t, c, "com.example.app", []gh.Release{})
 	pickAndCheck(t, c, "com.example.app", nil)
 }
 
 // 补多个版本是要让人看见的：通常意味着前面有几天没跑成。
 func TestPickTargets_WarnsWhenCatchingUp(t *testing.T) {
-	c := indexWith("com.example.app", "v1")
+	c := ledgerWith("com.example.app", "v1")
 	rep := pickAndCheck(t, c, "com.example.app", candidates("v3", "v2", "v1"), "v2", "v3")
 	if len(rep.Warnings()) == 0 {
 		t.Fatal("补齐多个版本时应当有一条告警（让人知道前面漏跑了）")
@@ -138,7 +138,7 @@ func TestPickTargets_WarnsWhenCatchingUp(t *testing.T) {
 	}
 
 	// 只补一个（正常轮次）不该吵。
-	c2 := indexWith("com.example.app", "v2")
+	c2 := ledgerWith("com.example.app", "v2")
 	rep2 := pickAndCheck(t, c2, "com.example.app", candidates("v3", "v2"), "v3")
 	if len(rep2.Warnings()) != 0 {
 		t.Fatalf("只补一个版本不该告警：%v", rep2.Warnings())
@@ -198,7 +198,7 @@ func TestCheckIncomingGate(t *testing.T) {
 
 // ---- 分片合并 ---------------------------------------------------------------
 
-func abiSeq(as []model.IndexAsset) string {
+func abiSeq(as []model.Asset) string {
 	out := make([]string, 0, len(as))
 	for _, a := range as {
 		out = append(out, a.ABI)
@@ -209,8 +209,8 @@ func abiSeq(as []model.IndexAsset) string {
 // 02 §2.4：universal 在前，其后按固定集。
 func TestMergeAssets_OrdersByContract(t *testing.T) {
 	got := mergeAssets(
-		[]model.IndexAsset{{ABI: "x86_64", File: "a-1.0-x86_64.apk"}},
-		[]model.IndexAsset{
+		[]model.Asset{{ABI: "x86_64", File: "a-1.0-x86_64.apk"}},
+		[]model.Asset{
 			{ABI: "universal", File: "a-1.0-universal.apk"},
 			{ABI: "arm64-v8a", File: "a-1.0-arm64-v8a.apk"},
 		},
@@ -221,11 +221,11 @@ func TestMergeAssets_OrdersByContract(t *testing.T) {
 }
 
 // 同一个 ABI 在新的一批里又出现 → **新的覆盖旧的**。这不是洁癖：改名前后
-// 同一个 ABI 会有两个不同名的文件，索引里必须只留指向当前 Release 的那一个。
+// 同一个 ABI 会有两个不同名的文件，账本里必须只留指向当前 Release 的那一个。
 func TestMergeAssets_NewWinsOnSameABI(t *testing.T) {
 	got := mergeAssets(
-		[]model.IndexAsset{{ABI: "arm64-v8a", File: "旧名.apk"}},
-		[]model.IndexAsset{{ABI: "arm64-v8a", File: "新名.apk"}},
+		[]model.Asset{{ABI: "arm64-v8a", File: "旧名.apk"}},
+		[]model.Asset{{ABI: "arm64-v8a", File: "新名.apk"}},
 	)
 	if len(got) != 1 || got[0].File != "新名.apk" {
 		t.Fatalf("同 ABI 应当被新的覆盖：%+v", got)
@@ -236,7 +236,7 @@ func TestMergeAssets_NewWinsOnSameABI(t *testing.T) {
 // 两条规则不同是有意的（合并时"新的"更可信，排序时"先来的"是已知的），
 // 所以各自钉一遍，免得日后有人"顺手统一"掉。
 func TestSortAssets_KeepsFirstOnDuplicateABI(t *testing.T) {
-	got := sortAssets([]model.IndexAsset{
+	got := sortAssets([]model.Asset{
 		{ABI: "arm64-v8a", File: "先来.apk"},
 		{ABI: "arm64-v8a", File: "后到.apk"},
 		{ABI: "universal", File: "u.apk"},
@@ -252,9 +252,9 @@ func TestSortAssets_KeepsFirstOnDuplicateABI(t *testing.T) {
 	}
 }
 
-// 排序必须是确定的 —— 它是清单里 apkUrls 顺序与 index 位次的直接来源。
+// 排序必须是确定的 —— 它是清单里 apkUrls 顺序与账本位次的直接来源。
 func TestSortAssets_Deterministic(t *testing.T) {
-	in := []model.IndexAsset{
+	in := []model.Asset{
 		{ABI: "x86", File: "x.apk"},
 		{ABI: "arm64-v8a", File: "a.apk"},
 		{ABI: "universal", File: "u.apk"},

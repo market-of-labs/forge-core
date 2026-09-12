@@ -227,14 +227,26 @@ func (s *Source) Validate(fileName string) error {
 		return fmt.Errorf("source = %q，只能是 %q 或 %q", s.Source, SourceGitHub, SourceManual)
 	}
 
-	if s.Kind != "" && s.Kind != KindObtainium && s.Kind != KindCompanion {
-		return fmt.Errorf("kind = %q，只能是 %q 或 %q（02 规则 9）", s.Kind, KindObtainium, KindCompanion)
+	if err := ValidateKind(s.Kind); err != nil {
+		return err
 	}
 
 	for _, a := range s.ABIWhitelist {
 		if !naming.IsABI(a) {
 			return fmt.Errorf("abiWhitelist 里的 %q 不在固定集 %v 内", a, naming.ABISet)
 		}
+	}
+	return nil
+}
+
+// ValidateKind 检查 kind 是不是 02 规则 9 允许的取值。空串合法 = "普通应用"。
+//
+// 抽成独立函数而不是留在 Source.Validate 里，理由与 Upstream.Validate 一样：还没有 appId
+// 的那半条申请（issue 新增单）也要能复用同一条规则 —— 它同样写得出 kind，
+// 而 `Source.Validate` 此刻会先因为 `ID == ""` 判失败。规则写两遍就一定会漂移。
+func ValidateKind(kind string) error {
+	if kind != "" && kind != KindObtainium && kind != KindCompanion {
+		return fmt.Errorf("kind = %q，只能是 %q 或 %q（02 规则 9）", kind, KindObtainium, KindCompanion)
 	}
 	return nil
 }

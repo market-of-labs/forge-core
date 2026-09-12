@@ -14,7 +14,7 @@ import (
 // 会直接读那两个 yml 来钉住这件事。
 //
 // 括号里的空格是模板里真实存在的（`作者 / 组织`），不要"顺手对齐"掉。
-// 新增侧只有五个字段：repo 必填，其余四个可选。**appId / 显示名 / 作者都从模板里
+// 新增侧七个字段：repo 必填，其余六个可选。**appId / 显示名 / 作者都从模板里
 // 删掉了** —— 它们能从 APK 与仓库里读出来，让人手填只会多一个填错的地方（03 §2.6）。
 // 唯一保留的自由文本是 `一句话简介`：它是**唯一从任何地方都派生不出来**的东西，
 // 而它进的是用户唯一会扫的那一行（Obtainium 的列表标题，见 model.DisplayName）。
@@ -24,6 +24,17 @@ const (
 	LabelCategories = "分类标签（可选）"
 	LabelABIs       = "只镜像哪些 ABI（可选）"
 	LabelDesc       = "一句话简介（可选）"
+	// LabelKind 是个 dropdown，选项是 `普通应用` / `obtainium` / `companion`，
+	// 带 default 且 required —— 也就是**正文里一定有一个选项文本**（见 KindOptionNormal）。
+	LabelKind = "应用类型"
+	// LabelPrerelease 底下只有**一个**勾选项（PrereleaseOption）：布尔量在 issue 表单里
+	// 只有 checkboxes 表达得了 —— dropdown 没有"未选中"这个渲染结果，要它表达 false
+	// 就得凭空造一个 `否` 取值，再在 Go 里做一次"否 → false"的映射，多一处能漂移的地方。
+	//
+	// 代价是它会被 `TestCheckboxVocabularyMatchesGo` 看见（那个测试断言模板里每个
+	// `- label:` 选项都是 Go 认识的取值），所以 PrereleaseOption 必须是个 Go 常量并
+	// 加进那份期望集。这是对的：那个测试的实质是"模板里出现的每个选项名，Go 都认识"。
+	LabelPrerelease = "拉取预发布版本（可选）"
 
 	LabelTargetAppID = "目标 appId"
 	LabelAction      = "动作"
@@ -44,6 +55,23 @@ const (
 	ActionResume = "恢复更新"
 	ActionRemove = "移除"
 )
+
+// PrereleaseOption 是「拉取预发布版本」那组的唯一个勾选项，与 add-source.yml 的
+// options 逐字一致。**不含空格** —— checkboxItem 在空格处停下（见 issue.go）。
+//
+// 它只是"勾了没有"的载体：值本身不进任何数据文件（`upstream.includePrerelease`
+// 是个 bool），所以这里不需要像 ReviewCategories 那样是一份"合法取值表"。
+const PrereleaseOption = "拉取预发布版本"
+
+// KindOptionNormal 是「应用类型」下拉里代表"普通应用"的那一项 —— 它映射到**空串**
+// （`Source.Kind` 的零值），不是 `model.KindObtainium`/`KindCompanion` 之外的第三个取值。
+//
+// 为什么要造这么一个选项、而不是让它空着：dropdown **没有"未选中"这个渲染结果**。
+// 留空的代价是取值要靠 GitHub 把空白渲染成 `_No response_`（可选 input/textarea 是这么
+// 渲染的，但这是**外部行为**，本仓库里没有一行代码能证明它对 dropdown 也成立）。赌错的
+// 后果不是少一个选项，而是**每一张新增单都被 ValidateKind 拒掉** —— 唯一的入口整个哑掉。
+// 所以模板里给它一个 default，正文里就一定有一个合法选项文本，取值不再依赖任何假设。
+const KindOptionNormal = "普通应用"
 
 // Kind 是一份申请的类型。
 type Kind int
@@ -97,6 +125,11 @@ type AddRequest struct {
 	// Desc 是**原样**取出来的简介，没有裁长度 —— 上限与截断都在 job 层
 	// （model.TruncateDesc），因为那需要给申请人回一句"被裁了"，而本包只负责取值。
 	Desc string
+	// Kind 是模板下拉里**原样**读出来的值：`obtainium` / `companion` / 空串（= 普通应用）。
+	// 合法性不在本包判 —— 复用 model.ValidateKind，判定规则与上手写来源文件时是同一批。
+	Kind string
+	// IncludePrerelease 是"上游的 prerelease 也一起镜像"（模板里勾了那一项）。
+	IncludePrerelease bool
 }
 
 // ChangeRequest 是一次「变更 · 移除」申请。
@@ -131,6 +164,17 @@ func ParseAdd(f *Form) (*AddRequest, error) {
 	r.Categories = f.Checked(LabelCategories)
 	r.ABIWhitelist = f.Checked(LabelABIs)
 	r.Desc = f.Get(LabelDesc)
+	// 下拉的那一项"普通应用"落到空串上，正是 `Source.Kind` 的零值语义（见 KindOptionNormal）。
+	// 顺带兜住一种历史形态：模板换成带 default 的 dropdown **之前**提交的单子没有这一段，
+	// 取值同样是空串 = 普通应用 —— 老单子不会因为这次模板改动而失效。
+	r.Kind = f.Get(LabelKind)
+	if r.Kind == KindOptionNormal {
+		r.Kind = ""
+	}
+	// 只关心"有没有被勾中"，值本身丢掉 —— 但**不**要求它等于 PrereleaseOption：
+	// 用户能伪造 `- [X] 随便什么`，那时按"勾了"处理仍是安全的（bool 没有别的取值），
+	// 而拒绝它只会让人对着一份合法申请挠头。
+	r.IncludePrerelease = len(f.Checked(LabelPrerelease)) > 0
 	return r, nil
 }
 
@@ -160,8 +204,8 @@ func ParseChange(f *Form) (*ChangeRequest, error) {
 		if v := strings.TrimSpace(f.Get(LabelNewAssetPat)); v != "" {
 			r.NewAssetPat = &v
 		}
-		// 同前三个：**无法通过 issue 把简介清空**（空 = 不改），
-		// 与分类一样是模板表达力的限制，要清空就走入口甲直接改文件。
+		// 同前三个：**无法通过 issue 把简介清空**（空 = 不改）—— 模板表达力的限制，
+		// 模板里那句话如实写着这一点（要清空就在说明里写一句，由人处理）。
 		if v := strings.TrimSpace(f.Get(LabelNewDesc)); v != "" {
 			r.NewDesc = &v
 		}

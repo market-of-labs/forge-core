@@ -1,6 +1,7 @@
 package upstream_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/market-of-labs/forge-core/internal/gh"
@@ -213,7 +214,7 @@ func TestLatestReleasableSkipsDraftAndPrerelease(t *testing.T) {
 		rel(1, "v1.0.0", "2025-01-01T00:00:00Z", false, false),
 		rel(2, "v2.0.0-beta", "2025-06-01T00:00:00Z", false, true), // 更新的预发布，必须跳过
 		rel(3, "v1.5.0", "2025-08-01T00:00:00Z", true, false),      // 更新的 draft，必须跳过
-	})
+	}, false)
 	if !ok {
 		t.Fatal("应当挑得出一个")
 	}
@@ -222,12 +223,60 @@ func TestLatestReleasableSkipsDraftAndPrerelease(t *testing.T) {
 	}
 }
 
+// TestLatestReleasableIncludesPrerelease 钉住 `upstream.includePrerelease: true` 的语义：
+// prerelease 与正式版**一视同仁**（按时间排，不看标记），而 **draft 依然不收**。
+//
+// 后半句是这条测试真正的价值：draft 没有开关，一旦有人把这里的条件写成
+// `if r.Prerelease && !include` 之外的样子（比如顺手把 Draft 也挂上开关），
+// 表现是"收录的时候镜像了一个上游作者自己都还没发布的东西"，而那是静默的。
+func TestLatestReleasableIncludesPrerelease(t *testing.T) {
+	rels := []gh.Release{
+		rel(1, "v1.0.0", "2025-01-01T00:00:00Z", false, false),
+		rel(2, "v2.0.0-beta", "2025-06-01T00:00:00Z", false, true),  // 更新的预发布：这次要收
+		rel(3, "v3.0.0-draft", "2025-08-01T00:00:00Z", true, false), // 更新的 draft：永远不收
+	}
+	got, ok := upstream.LatestReleasable(rels, true)
+	if !ok {
+		t.Fatal("应当挑得出一个")
+	}
+	if got.TagName != "v2.0.0-beta" {
+		t.Errorf("挑中 %q，期望 v2.0.0-beta（开了开关后 prerelease 与正式版按时间排）", got.TagName)
+	}
+	// 候选集里应当正好是那两个非 draft 的，顺序按发布时间倒序。
+	cands := upstream.Releasable(rels, true)
+	if len(cands) != 2 || cands[0].TagName != "v2.0.0-beta" || cands[1].TagName != "v1.0.0" {
+		t.Errorf("候选集 = %v，期望 [v2.0.0-beta v1.0.0]", tags(cands))
+	}
+	if n := len(upstream.Releasable(rels, false)); n != 1 {
+		t.Errorf("不开开关时候选集有 %d 个，期望 1 个", n)
+	}
+}
+
+func tags(rels []gh.Release) []string {
+	out := make([]string, 0, len(rels))
+	for _, r := range rels {
+		out = append(out, r.TagName)
+	}
+	return out
+}
+
+// TestExcludedNote 钉住"没有可镜像的发布"那句告警的措辞随开关变 ——
+// 开过 includePrerelease 之后还说"全是 draft/prerelease"会让人去上游找一个不存在的东西。
+func TestExcludedNote(t *testing.T) {
+	if got := upstream.ExcludedNote(false); !strings.Contains(got, "prerelease") {
+		t.Errorf("未开开关时应当提到 prerelease，得到 %q", got)
+	}
+	if got := upstream.ExcludedNote(true); strings.Contains(got, "prerelease") {
+		t.Errorf("开了开关后不该再提 prerelease（它已经不在排除项里了），得到 %q", got)
+	}
+}
+
 func TestLatestReleasablePicksNewest(t *testing.T) {
 	got, _ := upstream.LatestReleasable([]gh.Release{
 		rel(1, "v1.0.0", "2025-01-01T00:00:00Z", false, false),
 		rel(2, "v2.0.0", "2025-06-01T00:00:00Z", false, false),
 		rel(3, "v1.5.0", "2025-03-01T00:00:00Z", false, false),
-	})
+	}, false)
 	if got.TagName != "v2.0.0" {
 		t.Errorf("挑中 %q，期望 v2.0.0（按发布时间而不是列表顺序）", got.TagName)
 	}
@@ -235,14 +284,14 @@ func TestLatestReleasablePicksNewest(t *testing.T) {
 
 // TestLatestReleasableTieBreaksOnID 钉住"同一秒发布"时的确定性。
 //
-// 不确定的挑选意味着同一次对账跑两遍可能镜像不同的版本 —— 那会让 index.json
+// 不确定的挑选意味着同一次对账跑两遍可能镜像不同的版本 —— 那会让账本
 // 的 diff 抖动，也会让"输在 tie-break 上"的那个版本永远进不来。
 func TestLatestReleasableTieBreaksOnID(t *testing.T) {
 	same := "2025-06-01T00:00:00Z"
 	got, _ := upstream.LatestReleasable([]gh.Release{
 		rel(10, "v1.0.0", same, false, false),
 		rel(20, "v2.0.0", same, false, false),
-	})
+	}, false)
 	if got.TagName != "v2.0.0" {
 		t.Errorf("挑中 %q，期望 ID 更大的 v2.0.0", got.TagName)
 	}
@@ -251,13 +300,19 @@ func TestLatestReleasableTieBreaksOnID(t *testing.T) {
 func TestLatestReleasableNoneAvailable(t *testing.T) {
 	// 全是 draft/prerelease，或一个都没有 —— 都必须如实报 false，
 	// 让调用方去告警，而不是退而求其次镜像一个预发布。
-	if _, ok := upstream.LatestReleasable(nil); ok {
+	if _, ok := upstream.LatestReleasable(nil, false); ok {
 		t.Error("空列表应当返回 false")
 	}
 	if _, ok := upstream.LatestReleasable([]gh.Release{
 		rel(1, "v1", "2025-01-01T00:00:00Z", true, false),
 		rel(2, "v2", "2025-01-01T00:00:00Z", false, true),
-	}); ok {
+	}, false); ok {
 		t.Error("只有 draft/prerelease 时应当返回 false")
+	}
+	// 开了开关：prerelease 变成候选，但**全是 draft** 时仍然要如实报 false。
+	if _, ok := upstream.LatestReleasable([]gh.Release{
+		rel(1, "v1", "2025-01-01T00:00:00Z", true, false),
+	}, true); ok {
+		t.Error("开了 includePrerelease 也不该把 draft 当候选")
 	}
 }

@@ -187,7 +187,8 @@ func CheckMismatch(file, contentABI string) (Mismatch, bool) {
 
 // ---- 挑"最新" --------------------------------------------------------------
 
-// Releasable 挑出可镜像的 Release（非 draft、非 prerelease），按发布时间**从新到旧**排列。
+// Releasable 挑出可镜像的 Release（非 draft；prerelease 由 includePrerelease 决定），
+// 按发布时间**从新到旧**排列。
 //
 // 为什么需要整份有序列表而不只是"最新的那个"：§4.4 承诺"某天 runner 挂了、cron 被跳过，
 // 第二天自然补齐"。要兑现这句，对账就必须知道"比上次镜像的那个更新的有哪些" ——
@@ -195,10 +196,18 @@ func CheckMismatch(file, contentABI string) (Mismatch, bool) {
 //
 // 排序键是 PublishedAt 倒序；同一秒发布时退到 ID 倒序。ID 单调递增，所以 tie-break
 // 也是确定的 —— 不确定的排序会让同一次对账跑两遍镜像不同的版本。
-func Releasable(rels []gh.Release) []gh.Release {
+//
+// includePrerelease（sources 里的 `upstream.includePrerelease`）是**唯一的**例外入口：
+// 它为真时 prerelease 与正式版一视同仁地进候选集，顺序也一视同仁地由时间决定。
+// 需要它的场景只有一个 —— 上游把新版只发成了 prerelease，于是"不收 prerelease"
+// 意味着这个应用永远停在旧版本上。默认为假：绝大多数上游的 prerelease 是测试包。
+//
+// **draft 永远不收**，没有开关：draft 在上游是"还没发布"的意思（GitHub 的 UI 里
+// 只有作者看得见），镜像一个作者自己都还没发布的东西没有正当场景。
+func Releasable(rels []gh.Release, includePrerelease bool) []gh.Release {
 	cands := make([]gh.Release, 0, len(rels))
 	for _, r := range rels {
-		if r.Draft || r.Prerelease {
+		if r.Draft || (r.Prerelease && !includePrerelease) {
 			continue
 		}
 		cands = append(cands, r)
@@ -212,19 +221,31 @@ func Releasable(rels []gh.Release) []gh.Release {
 	return cands
 }
 
-// LatestReleasable 从一组 Release 里挑出该镜像的那个：非 draft、非 prerelease，
-// 按发布时间取最新。
+// LatestReleasable 从一组 Release 里挑出该镜像的那个：非 draft（prerelease 见
+// includePrerelease），按发布时间取最新。
 //
 // 为什么不能用 `/releases/latest` 就完事：那个端点只看"最新非 draft 非 prerelease"，
 // 语义上是对的，但它**不告诉我们列表里还有没有别的**。而 §4.4 的对账需要知道
 // "上游是不是发布了新版" —— 那正是这一个判断。多拉一页列表换来的是：404（上游
 // 一个 Release 都没有）能被明确区分出来，而不是当作网络错误。
 //
-// 返回值 ok=false 表示没有可镜像的 Release（全是 draft/prerelease，或一个都没有）。
-func LatestReleasable(rels []gh.Release) (gh.Release, bool) {
-	c := Releasable(rels)
+// 返回值 ok=false 表示没有可镜像的 Release（见 ExcludedNote，或一个都没有）。
+func LatestReleasable(rels []gh.Release, includePrerelease bool) (gh.Release, bool) {
+	c := Releasable(rels, includePrerelease)
 	if len(c) == 0 {
 		return gh.Release{}, false
 	}
 	return c[0], true
+}
+
+// ExcludedNote 描述当前候选集把哪些发布排除在外，只给"没有可镜像的发布"那句告警当措辞用。
+//
+// 单独一个函数是因为它有两个消费者（对账与收录），而**说错原因**是这套设计里明确要
+// 消灭的东西：开过 includePrerelease 之后还说"全是 draft/prerelease"，
+// 会让人去上游找一个根本不存在的 draft。
+func ExcludedNote(includePrerelease bool) string {
+	if includePrerelease {
+		return "全是 draft"
+	}
+	return "全是 draft/prerelease"
 }

@@ -13,7 +13,7 @@ import (
 // **它刻意不做 02 §2.8 的条目级校验** —— 那是 check-manifest 的活，两者在 workflow 里
 // 是相邻的两步，失败原因因此可区分：
 //
-//	build-manifest  失败 = 输入有问题（index 对不上 sources / 模板非法 / 地址渲染不出来）
+//	build-manifest  失败 = 输入有问题（模板非法 / 地址渲染不出来）
 //	check-manifest  失败 = 产出有问题（生成的东西违反了清单契约）
 //
 // 把它们合成一步的话，一条"渲染地址失败"与一条"versionCode 缺失"会以同样的面目出现，
@@ -28,7 +28,6 @@ func BuildManifest(c *Ctx) (*model.Manifest, *model.Report, error) {
 
 	m, buildRep, err := manifest.Build(manifest.Input{
 		Sources:   c.Sources,
-		Index:     c.Index,
 		Endpoints: c.Endpoints,
 	})
 	if err != nil {

@@ -70,8 +70,8 @@ go test ./...
 | `intake-incoming` | 搬 `_incoming` 并清场（`-force` 跳过闸门，只给本地调试） |
 | `resolve-upstream` | `-only ID` 只算出该镜像哪些版本并打印计划，**不下载不上传** |
 | `mirror-upstream` | `-only ID` `-dry-run` 下载 → 按内容判 ABI → 改名 → 幂等上传 |
-| `build-index` | `-fetch-missing` 从 Release 现状重建 `store/index.json` |
-| `build-manifest` | 由 sources + index + endpoints 合成 `apps.json` |
+| `build-index` | `-fetch-missing` 从 Release 现状重建各 `sources/` 条目的 `versions` 账本 |
+| `build-manifest` | 由 sources（自带账本）+ endpoints 合成 `apps.json` |
 | `check-manifest` | 跑 02 §2.8 自检 + 阈值告警 |
 | `reconcile` | `-only ID` `-dry-run` 幂等全量对账（§4.4） |
 | `commit-back` | `-m MSG` 按固定路径提交并推送（自动加 `[skip-dispatch]`） |
@@ -137,7 +137,7 @@ cmd/forge/            子命令分发、环境读取、退出码
 internal/
   naming/             文件名的契约：{appId}-{version}-{abi}.apk
   apkmeta/            纯 Go 读 APK：package / versionName / versionCode / ABI
-  model/              清单、索引、来源、地址模板的类型与校验
+  model/              清单、来源（含版本账本）、地址模板的类型与校验
   issue/              issue 正文的表单解析（纯数据，绝不 eval）
   upstream/           从上游 Release 里挑该镜像哪些文件
   manifest/           sources + index + endpoints → apps.json

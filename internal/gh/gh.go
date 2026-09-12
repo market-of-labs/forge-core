@@ -9,7 +9,7 @@
 //     真正容易写错的地方都能被测试钉住，而不是等 CI 上跑一次才知道。
 //   - **依赖为零**。这个仓库要在 runner 上每次跑，多一个依赖就多一份供应链面。
 //
-// 本包只做 HTTP：不认识 apps.json，也不认识 index.json。
+// 本包只做 HTTP：不认识 apps.json，也不认识 sources/ 里那些 JSON。
 package gh
 
 import (

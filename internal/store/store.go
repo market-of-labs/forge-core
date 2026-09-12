@@ -2,9 +2,8 @@
 //
 // 布局（03 §2.1）：
 //
-//	{root}/sources/{appId}.json     输入，人维护
+//	{root}/sources/{appId}.json     输入（元数据人填）+ 产物（`versions` 账本，forge 写）
 //	{root}/apps.json                产物，唯一直接伺服给客户端的文件
-//	{root}/store/index.json         产物，版本账本
 //	{root}/store/endpoints.json     配置，地址模板
 //
 // 本包只做 IO：不判断业务规则、不碰网络。这样"文件在哪、怎么写"与"内容对不对"分开，
@@ -29,10 +28,8 @@ const (
 	SourcesDirName = "sources"
 	// ManifestName 是清单文件名（在根目录）。
 	ManifestName = "apps.json"
-	// SubDirName 是存放其余产物与契约常量的子目录名。
+	// SubDirName 是存放契约常量的子目录名。
 	SubDirName = "store"
-	// IndexName 是索引文件名。
-	IndexName = "index.json"
 	// EndpointsName 是地址模板文件名。
 	EndpointsName = "endpoints.json"
 )
@@ -48,9 +45,6 @@ func (r Repo) SourcesDir() string { return filepath.Join(r.Root, SourcesDirName)
 
 // ManifestPath 返回 apps.json 的路径。
 func (r Repo) ManifestPath() string { return filepath.Join(r.Root, ManifestName) }
-
-// IndexPath 返回 store/index.json 的路径。
-func (r Repo) IndexPath() string { return filepath.Join(r.Root, SubDirName, IndexName) }
 
 // EndpointsPath 返回 store/endpoints.json 的路径。
 func (r Repo) EndpointsPath() string { return filepath.Join(r.Root, SubDirName, EndpointsName) }
@@ -73,20 +67,6 @@ func (r Repo) LoadEndpoints() (model.Endpoints, error) {
 		return ep, fmt.Errorf("%s：%w", r.EndpointsPath(), err)
 	}
 	return ep, nil
-}
-
-// LoadIndex 读版本账本。文件不存在时返回一份空索引而不是错误 ——
-// 索引是**派生数据**（03 §2.4：可从 Release 完全重建），首次跑或刚清空时它本就不存在。
-func (r Repo) LoadIndex() (*model.Index, error) {
-	ix := &model.Index{}
-	err := readJSON(r.IndexPath(), ix)
-	if os.IsNotExist(err) {
-		return &model.Index{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return ix, nil
 }
 
 // LoadManifest 读清单。
@@ -137,11 +117,17 @@ func (r Repo) LoadSources() ([]model.Source, error) {
 // WriteManifest 写清单。
 func (r Repo) WriteManifest(m *model.Manifest) error { return WriteJSON(r.ManifestPath(), m) }
 
-// WriteIndex 写索引。
-func (r Repo) WriteIndex(ix *model.Index) error { return WriteJSON(r.IndexPath(), ix) }
-
-// WriteSource 写一个 sources 条目。只用于 issue 流程（03 §2.5 规则 2：只改申请涉及的字段）——
-// 日常路径下 sources/ 完全由人维护，forge 不碰。
+// WriteSource 写一个 sources 条目。
+//
+// 两条路都走它：issue 流程（03 §2.5 规则 2：只改申请涉及的字段）与对账写回 `versions`
+// 账本。**写的是整个结构体**，所以：
+//
+//   - 写回去的内容 = 加载时的内存快照。一次运行期间有人在网页上改同一个文件，
+//     会被这一份盖掉。这是已知且接受的 —— 数据源只有 issue 与 workflow 两条入口
+//     （forge 自己就是写入方），不存在"人手改文件与对账并发"这种场景。
+//   - JSON 里不认识的键会被丢掉（解析时就丢了）。同上，没有第三方往这些文件里加键。
+//   - 键序 = 结构体字段序，所以人手写的文件第一次被改写时会整篇重排一次，
+//     之后每次都是同一种形状（稳定的 diff 是刻意要的）。
 func (r Repo) WriteSource(s *model.Source) error {
 	if err := s.Validate(s.ID + ".json"); err != nil {
 		return err

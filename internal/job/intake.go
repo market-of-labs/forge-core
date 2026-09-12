@@ -20,7 +20,7 @@ import (
 type placedVersion struct {
 	versionName string
 	versionCode int32
-	assets      []model.IndexAsset
+	assets      []model.Asset
 }
 
 // ---- intake-issue：issue → sources/{appId}.json（03 §2.5 / §5.5） --------------
@@ -129,6 +129,14 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 	if err := validateAdd(r); err != nil {
 		return reject(fmt.Sprintf("申请内容不合法：%v", err))
 	}
+	if other := companionConflict(c, r); other != nil {
+		return reject(fmt.Sprintf(
+			"`kind: companion` 全局至多一条（02 规则 9），现在已经是 `%s`（`%s`）了。\n\n"+
+				"伴侣应用换成另一个仓库是维护者改 `sources/%s.json` 的事 —— "+
+				"**这一条刻意不给申请改**：让一张申请能把整个市场的伴侣应用顶掉，"+
+				"代价是全部设备的自更新源被换走。",
+			other.ID, other.Upstream.Repo, other.ID))
+	}
 
 	// 简介**裁而不拒**：上限 20 rune 是量出来的（见 model.MaxDescRunes），为一个纯装饰
 	// 字段让人重填不值得。但**裁了就必须说** —— 默默把人写的东西切掉、再回评一句
@@ -154,7 +162,12 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 				Type:         model.UpstreamGitHubRelease,
 				Repo:         r.Repo,
 				AssetPattern: r.AssetPattern,
+				// 这一项必须在**这里**就带上：probeIdentity 要用同一个候选集去探身份，
+				// 而"最新那个 release 是 prerelease"正是开这个开关的场景 ——
+				// 探身份时若把它跳掉，会从一个更老的 release 里读出身份（甚至报"没有可镜像的发布"）。
+				IncludePrerelease: r.IncludePrerelease,
 			},
+			Kind:         r.Kind,
 			Categories:   r.Categories,
 			ABIWhitelist: r.ABIWhitelist,
 			Desc:         desc,
@@ -189,6 +202,36 @@ func validateAdd(r *issue.AddRequest) error {
 			return fmt.Errorf("ABI %q 不在固定集 %v 内 —— 请用模板里的勾选项，不要手改正文",
 				a, naming.ABISet)
 		}
+	}
+	// kind 的规则与手改文件那条入口共用同一个函数，不另写一份判断。
+	if err := model.ValidateKind(r.Kind); err != nil {
+		return err
+	}
+	return nil
+}
+
+// companionConflict 检查这份申请会不会造出**第二条** kind=companion —— 是的话返回占位
+// 的那一条，否则 nil。
+//
+// 为什么这条规则要提前到这里判：`CheckSourceSet` 已经有一条同样的规则（02 规则 9），
+// 但它在**落盘之后**才跑 —— 那时第二份文件已经在 `sources/` 里了，而后续的
+// check-manifest 会因此判**硬失败**，整份清单推不出去，直到有人手动删掉那个文件。
+// 一张陌生人的申请能把整个 store 卡住，这是这套流程里唯一一处"外部输入能造成持续故障"
+// 的地方，堵在门口最省事。
+//
+// **同一条目重跑不算冲突**：编辑正文重新发车是这套设计的重试路径（见 landNewSource），
+// 而那时已有的 companion 就是这份申请自己写的。用上游仓库认它 —— 与 sameRequest 同一个判据，
+// 因为此刻 appId 还没探出来（要从 APK 里读）。
+func companionConflict(c *Ctx, r *issue.AddRequest) *model.Source {
+	if r.Kind != model.KindCompanion {
+		return nil
+	}
+	for i := range c.Sources {
+		s := &c.Sources[i]
+		if s.Kind != model.KindCompanion || s.Upstream == nil || s.Upstream.Repo == r.Repo {
+			continue
+		}
+		return s
 	}
 	return nil
 }
@@ -296,8 +339,8 @@ func decideChange(c *Ctx, f *issue.Form) *IntakeDecision {
 			next.Desc = d
 		}
 		// 模板里"新分类"是自由文本列表，**空列表 = 不改**，不是"清空"。
-		// 因此无法通过 issue 把分类清掉 —— 那是模板表达力的限制，
-		// 不是这条路径的疏漏；真要清空就用入口甲直接改文件（§2.5）。
+		// 因此无法通过 issue 把分类清掉 —— 那是模板表达力的限制，不是这条路径的
+		// 疏漏；真要清空只能由维护者直接改 `sources/{appId}.json` 里的那一段。
 		if len(r.NewCategories) > 0 {
 			next.Categories = r.NewCategories
 		}
@@ -616,19 +659,21 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 			pv = &placedVersion{versionName: meta.VersionName, versionCode: meta.VersionCode}
 			byVer[version] = pv
 		}
-		pv.assets = append(pv.assets, model.IndexAsset{ABI: contentABI, File: target2, Size: a.Size})
+		pv.assets = append(pv.assets, model.Asset{ABI: contentABI, File: target2, Size: a.Size})
 	}
 
-	// 先把索引写上盘（仍然在推送之前）：搬运这一步是唯一知道元数据的时刻。
+	// 先把账本写上盘（仍然在推送之前）：搬运这一步是唯一知道元数据的时刻。
 	if len(res.Moved) > 0 {
+		var touched []string
 		for _, id := range targetOrder {
 			byVer := placed[id]
 			if len(byVer) == 0 {
 				continue
 			}
 			c.recordPlaced(id, byVer)
+			touched = append(touched, id)
 		}
-		if err := WriteIndex(c, c.Index); err != nil {
+		if err := writeLedgers(c, touched); err != nil {
 			return res, err
 		}
 	}
@@ -719,19 +764,17 @@ func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int
 	return nil
 }
 
-// recordPlaced 把 _incoming 搬过来的版本写进索引。
+// recordPlaced 把 _incoming 搬过来的版本写进账本。
 //
 // upstreamTag 留空：手动来源**本来就没有上游 tag**，这不是"漏了"。
 // build-index 对 manual 源因此不该告警"没有 upstreamTag" —— 那条告警只对 github 源有意义。
 func (c *Ctx) recordPlaced(appID string, byVer map[string]*placedVersion) {
-	idxApp := c.Index.Find(appID)
-	if idxApp == nil {
-		c.Index.Apps = append(c.Index.Apps, model.IndexApp{ID: appID, Tag: appID})
-		idxApp = c.Index.Find(appID)
-	}
+	// 一定有：applyIntake 的调用方已经按 c.Source 校验过每个 id（搬运本来就要先知道
+	// 往哪个 Release 放）。所以这里不需要"凭空造一个"的分支。
+	src := c.Source(appID)
 
 	// **必须排序**：一次批量上传可以带同一个 App 的多个版本（§3.2「一次 Publish
-	// 可带多个 App 的 APK」），而位次就是 IndexApp.Latest() 的判据 ——
+	// 可带多个 App 的 APK」），而位次就是 Source.Latest() 的判据 ——
 	// 用 map 的遍历顺序会让"哪个是最新"每次跑都不一样。
 	//
 	// 排序键取 versionCode 升序：它是上游自己的单调计数器，是这里唯一能表达
@@ -753,7 +796,7 @@ func (c *Ctx) recordPlaced(appID string, byVer map[string]*placedVersion) {
 	for _, version := range tokens {
 		pv := byVer[version]
 		assets := sortAssets(pv.assets)
-		if v := idxApp.FindVersion(version); v != nil {
+		if v := src.FindVersion(version); v != nil {
 			v.Assets = mergeAssets(v.Assets, assets)
 			if v.VersionName == "" {
 				v.VersionName = pv.versionName
@@ -763,7 +806,7 @@ func (c *Ctx) recordPlaced(appID string, byVer map[string]*placedVersion) {
 			}
 			continue
 		}
-		idxApp.Versions = append(idxApp.Versions, model.IndexVersion{
+		src.Versions = append(src.Versions, model.Version{
 			Version:     version,
 			VersionName: pv.versionName,
 			VersionCode: pv.versionCode,

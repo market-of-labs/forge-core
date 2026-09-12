@@ -159,7 +159,8 @@ func landedReply(src *model.Source, tag, note string, r *ReconcileResult, rerr e
 		"已收录 `%s`。\n\n"+
 			"| 字段 | 值 |\n|---|---|\n"+
 			"| 包名（appId） | `%s` |\n| 显示名（列表里显示的） | %s |\n| 作者 / 组织 | %s |\n"+
-			"| 上游仓库 | `%s` |\n| 资产正则 | `%s` |\n| 分类标签 | %s |\n| 只镜像 ABI | %s |\n\n"+
+			"| 上游仓库 | `%s` |\n| 资产正则 | `%s` |\n| 应用类型 | %s |\n| 拉取预发布版本 | %s |\n"+
+			"| 分类标签 | %s |\n| 只镜像 ABI | %s |\n\n"+
 			"%s**包名与显示名是从 APK 里读出来的**（上游发布 `%s`），作者取仓库 owner —— "+
 			"都不是申请时填的，所以**请核对一下上面那个包名确实是你要的那个应用**："+
 			"仓库填错时会静默收错一个应用，而这条回评是唯一的发现机会。\n"+
@@ -168,9 +169,19 @@ func landedReply(src *model.Source, tag, note string, r *ReconcileResult, rerr e
 			"%s",
 		src.ID, src.ID, src.DisplayName(), src.Author, src.Upstream.Repo,
 		orDefault(src.Upstream.AssetPattern, DefaultAssetPatternNote),
+		orDefault(src.Kind, "普通应用"),
+		yesNo(src.Upstream.IncludePrerelease),
 		orDefault(strings.Join(src.Categories, " / "), "未勾选"),
 		orDefault(strings.Join(src.ABIWhitelist, " / "), "全部"),
 		note, tag, model.MaxDescRunes, syncedNote(r, rerr))
+}
+
+// yesNo 把 bool 变成回评表格里的「是 / 否」。
+func yesNo(b bool) string {
+	if b {
+		return "是"
+	}
+	return "否"
 }
 
 // announceLanded 给一张已落地的单回评并关单。
@@ -257,9 +268,10 @@ func (c *Ctx) probeIdentity(ctx context.Context, half *model.Source) (*model.Sou
 	if err != nil {
 		return nil, "", fmt.Errorf("列上游 `%s` 的 Release 失败（仓库名写错了？私有库？）：%w", repo, err)
 	}
-	cands := upstream.Releasable(rels)
+	cands := upstream.Releasable(rels, half.Upstream.IncludePrerelease)
 	if len(cands) == 0 {
-		return nil, "", fmt.Errorf("上游 `%s` 没有可镜像的发布（全是 draft/prerelease，或一个都没有）", repo)
+		return nil, "", fmt.Errorf("上游 `%s` 没有可镜像的发布（%s，或一个都没有）",
+			repo, upstream.ExcludedNote(half.Upstream.IncludePrerelease))
 	}
 
 	pattern := half.Upstream.AssetPattern

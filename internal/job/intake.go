@@ -112,11 +112,12 @@ func DecideIntake(c *Ctx, body string) *IntakeDecision {
 	return d
 }
 
-// decideAdd 裁决一份新增申请。
+// decideAdd 裁决一份新增申请（标准源或手动源）。
 //
-// **它不写文件。** 申请人填的只有 repo，appId 要从上游 APK 里读出来，而 DecideIntake
+// **它不写文件。** 标准源申请人填的只有 repo，appId 要从上游 APK 里读出来，而 DecideIntake
 // 是纯函数、不许联网。所以这里只做两件不需要网络的事：取值、本地校验 —— 真正的解析与
-// 落盘紧接着在同一条链上做（见 newsource.go）。
+// 落盘紧接着在同一条链上做（见 newsource.go）。手动源没有那一步（身份三件套是申请人
+// 自己填的），所以它的决定里已经是一份完整可落盘的 Source。
 //
 // 这里也**不再回一段"已收到"**。那一段只是把申请人刚填的东西复述回去，而它与落盘后的
 // 「已收录」回评几乎逐行重叠 —— 一张单要读两条一样的表，还得分辨哪条是现在的。留下的
@@ -131,26 +132,29 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 	}
 	if other := companionConflict(c, r); other != nil {
 		return reject(fmt.Sprintf(
-			"`kind: companion` 全局至多一条（02 规则 9），现在已经是 `%s`（`%s`）了。\n\n"+
-				"伴侣应用换成另一个仓库是维护者改 `sources/%s.json` 的事 —— "+
+			"`kind: companion` 全局至多一条（02 规则 9），现在已经是 `%s`（%s）了。\n\n"+
+				"伴侣应用换成另一个是维护者改 `sources/%s.json` 的事 —— "+
 				"**这一条刻意不给申请改**：让一张申请能把整个市场的伴侣应用顶掉，"+
 				"代价是全部设备的自更新源被换走。",
-			other.ID, other.Upstream.Repo, other.ID))
+			other.ID, originOf(other), other.ID))
 	}
 
 	// 简介**裁而不拒**：上限 20 rune 是量出来的（见 model.MaxDescRunes），为一个纯装饰
 	// 字段让人重填不值得。但**裁了就必须说** —— 默默把人写的东西切掉、再回评一句
 	// "已收录"，是最难发现的那种假回评。这句话跟着决定走到落盘后的那条回评里去。
 	desc := model.TruncateDesc(r.Desc)
-	descNote := ""
+	note := ""
 	if desc != strings.TrimSpace(r.Desc) {
-		descNote = fmt.Sprintf(
+		note = fmt.Sprintf(
 			"⚠️ 你填的简介超过了 %d 个字的长度上限，上面显示的是**截断**后的。"+
 				"它进的是 Obtainium 列表里的标题行（单行、超出即省略号），写长了显示不全；"+
 				"想换一个的话，**编辑正文**重填即可。\n\n",
 			model.MaxDescRunes)
 	}
 
+	if r.Manual() {
+		return decideAddManual(r, desc, note)
+	}
 	return &IntakeDecision{
 		Accept:  true,
 		Summary: fmt.Sprintf("新增 %s", r.Repo),
@@ -172,7 +176,41 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 			ABIWhitelist: r.ABIWhitelist,
 			Desc:         desc,
 		},
-		DescNote: descNote,
+		DescNote: note + strayIdentityNote(r),
+	}
+}
+
+// decideAddManual 裁决一份手动源申请。
+//
+// 比标准源短得多，因为标准源那半条链（探身份）在它这里不存在：没有上游可读，
+// 三件套由申请人填。所以裁决阶段就拿出**一份完整的 Source** —— 落盘那一步不再需要网络，
+// 也不需要"半成品"那套交接（见 IntakeDecision.Source 的说明）。
+func decideAddManual(r *issue.AddRequest, desc, note string) *IntakeDecision {
+	src := &model.Source{
+		ID:     r.AppID,
+		Name:   r.Name,
+		Author: r.Author,
+		Source: model.SourceManual,
+		Desc:   desc,
+		// 上游那组一个都不带。`source: manual` 时长出 upstream 是**硬失败**，
+		// 由下面那次 Validate 兜住（这条路径上不可能构造出来，但校验不因此省）。
+		Categories:   r.Categories,
+		ABIWhitelist: r.ABIWhitelist,
+		Kind:         r.Kind,
+	}
+	// 唯一一处"整份校验"：id 的 charset（包名里不能有斜杠）、保留名 `_incoming`、
+	// desc 长度、kind 与 ABI 词表 —— 全部复用来源文件那条入口的规则，不另写一份。
+	// 传进去的是**裁过**的简介，所以"简介超长"不会在这里把人拒掉（裁而不拒，见 TruncateDesc）。
+	if err := src.Validate(""); err != nil {
+		return reject(fmt.Sprintf("申请内容不合法：%v", err))
+	}
+	return &IntakeDecision{
+		Accept:  true,
+		Summary: fmt.Sprintf("新增 %s（手动上传）", src.ID),
+		Source:  src,
+		// 这里只有"简介被裁过"这一句。**"下一步去传 APK"不在这一层说** —— 它属于
+		// 落盘之后的回评（manualLandedReply），因为那时"已收录"才是真话。
+		DescNote: note,
 	}
 }
 
@@ -182,6 +220,9 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 // owner/name 形状与正则可编译，`naming.IsABI` 是固定 ABI 集），所以 issue 能写进来的
 // 东西不可能比手改文件能写进来的更多 —— 这里只是换个调用方式，不是第二套规则。
 func validateAdd(r *issue.AddRequest) error {
+	if r.Manual() {
+		return validateAddManual(r)
+	}
 	up := &model.Upstream{
 		Type:         model.UpstreamGitHubRelease,
 		Repo:         r.Repo,
@@ -190,6 +231,59 @@ func validateAdd(r *issue.AddRequest) error {
 	if err := up.Validate(); err != nil {
 		return err
 	}
+	return validateLists(r)
+}
+
+// validateAddManual 校验手动源申请。
+//
+// 与标准源的分工一样：这里只判"申请人写的东西自洽吗"，**不判包名是不是真的存在** ——
+// 那要等 APK 传进来才知道，判据是"`_incoming` 里那个 APK 的 package 能不能找到这条来源"
+// （找不到就留在暂存区并回评，见 intake-incoming）。所以这一层的全部工作是把话提前说清：
+// 填漏了、或者把上游那一组也填了。
+func validateAddManual(r *issue.AddRequest) error {
+	var missing []string
+	if r.AppID == "" {
+		missing = append(missing, "包名")
+	}
+	if r.Name == "" {
+		missing = append(missing, "显示名")
+	}
+	if r.Author == "" {
+		missing = append(missing, "作者 / 组织")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("来源类型选了「%s」，但这几项是空的：%s。\n\n"+
+			"手动源没有上游，这三样无从读起 —— 只能由申请人填（03 §2.2 B）。"+
+			"其中包名会被用来把上传的 APK 认回家，必须与 APK 里的 `package` 逐字一致",
+			issue.OriginManual, strings.Join(missing, "、"))
+	}
+
+	// 上游那一组对手动源没有意义。**拒绝并点名，而不是静默忽略** —— 与 change-source.yml
+	// 拒绝「手动源改资产正则」同一个理由：让人以为改成功了，比拒绝难发现得多。
+	var stray []string
+	if r.Repo != "" {
+		stray = append(stray, issue.LabelRepo)
+	}
+	if r.AssetPattern != "" {
+		stray = append(stray, issue.LabelAssetPat)
+	}
+	if r.IncludePrerelease {
+		stray = append(stray, issue.LabelPrerelease)
+	}
+	if len(stray) > 0 {
+		return fmt.Errorf("来源类型选了「%s」（没有上游），但还填了：%s。\n\n"+
+			"这几项一起去掉再提交即可；如果它其实有上游仓库，请把来源类型改回「%s」",
+			issue.OriginManual, strings.Join(stray, "、"), issue.OriginGitHub)
+	}
+
+	return validateLists(r)
+}
+
+// validateLists 校验两组列表与 kind —— 标准源与手动源都会填的那些字段。
+//
+// 抽出来的唯一理由是避免为手动源再抄一份：词表与 kind 规则都在 model / naming 里，
+// 这里只是换个调用方式。
+func validateLists(r *issue.AddRequest) error {
 	for _, c := range r.Categories {
 		if !slices.Contains(model.ReviewCategories, c) {
 			return fmt.Errorf("分类标签 %q 不在可选范围内（%s）—— "+
@@ -204,10 +298,43 @@ func validateAdd(r *issue.AddRequest) error {
 		}
 	}
 	// kind 的规则与手改文件那条入口共用同一个函数，不另写一份判断。
-	if err := model.ValidateKind(r.Kind); err != nil {
-		return err
+	return model.ValidateKind(r.Kind)
+}
+
+// strayIdentityNote 在**标准源**申请里填了身份三件套时回一句"那几项不作数"。
+//
+// 为什么要有这句：GitHub 的表单没法按另一个字段的取值隐藏字段，所以那三个输入框
+// 在标准源申请里也照样渲染在正文中；而标准源的包名/显示名/作者一律从上游 APK 与仓库
+// 读出来。默默盖掉申请人写的值，会让"我明明填了显示名"与回评里那个名字对不上。
+// 手动源不走这里 —— 那三样对它是**必填**，填了就是真话（见 validateAddManual）。
+func strayIdentityNote(r *issue.AddRequest) string {
+	var stray []string
+	if r.AppID != "" {
+		stray = append(stray, issue.LabelAppID)
 	}
-	return nil
+	if r.Name != "" {
+		stray = append(stray, issue.LabelName)
+	}
+	if r.Author != "" {
+		stray = append(stray, issue.LabelAuthor)
+	}
+	if len(stray) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("⚠️ 你填的 %s **不作数**：标准源的包名、显示名、作者都是从上游 APK 与"+
+		"仓库里读出来的，以上面表里的为准（要改的话，收录之后用 `change-source.yml`）。\n\n",
+		strings.Join(stray, "、"))
+}
+
+// originOf 用一句话说明这条来源的二进制从哪来：上游仓库，或手动上传队列。
+//
+// 两处拒绝回评要念它（撞包名、撞 companion），而"手动来源没有上游"是个会让消息直接
+// 崩掉的 nil —— 所以这句话只在这里说一次。
+func originOf(s *model.Source) string {
+	if s.Upstream == nil {
+		return "手动上传来源，没有上游"
+	}
+	return fmt.Sprintf("来自 `%s`", s.Upstream.Repo)
 }
 
 // companionConflict 检查这份申请会不会造出**第二条** kind=companion —— 是的话返回占位
@@ -220,20 +347,34 @@ func validateAdd(r *issue.AddRequest) error {
 // 的地方，堵在门口最省事。
 //
 // **同一条目重跑不算冲突**：编辑正文重新发车是这套设计的重试路径（见 landNewSource），
-// 而那时已有的 companion 就是这份申请自己写的。用上游仓库认它 —— 与 sameRequest 同一个判据，
-// 因为此刻 appId 还没探出来（要从 APK 里读）。
+// 而那时已有的 companion 就是这份申请自己写的 —— 判据见 sameCompanionRequest。
 func companionConflict(c *Ctx, r *issue.AddRequest) *model.Source {
 	if r.Kind != model.KindCompanion {
 		return nil
 	}
 	for i := range c.Sources {
 		s := &c.Sources[i]
-		if s.Kind != model.KindCompanion || s.Upstream == nil || s.Upstream.Repo == r.Repo {
+		// **不跳过没有上游的条目**：手动来源同样占着"全局唯一那条 companion"这个位置，
+		// 漏掉它就会让第二张 companion 申请落盘，而 02 规则 9 会让 check-manifest 硬失败 ——
+		// 整份清单推不出去，直到有人手动删掉那个文件（本函数存在的全部理由）。
+		if s.Kind != model.KindCompanion || sameCompanionRequest(s, r) {
 			continue
 		}
 		return s
 	}
 	return nil
+}
+
+// sameCompanionRequest 判断一条已落的 companion 来源是不是**这份申请自己**写出来的。
+//
+// 与 sameRequest 同一套思路（比"这份申请能决定的那一半"），但两者比的东西不同：
+// 此刻标准源的 appId 还没探出来，所以它比上游仓库；手动源的包名是申请人自己填的，
+// 就是它唯一的身份。
+func sameCompanionRequest(s *model.Source, r *issue.AddRequest) bool {
+	if r.Manual() {
+		return s.ID == r.AppID
+	}
+	return s.Upstream != nil && s.Upstream.Repo == r.Repo
 }
 
 func decideChange(c *Ctx, f *issue.Form) *IntakeDecision {

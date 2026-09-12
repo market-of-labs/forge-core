@@ -14,12 +14,20 @@ import (
 // 会直接读那两个 yml 来钉住这件事。
 //
 // 括号里的空格是模板里真实存在的（`作者 / 组织`），不要"顺手对齐"掉。
-// 新增侧七个字段：repo 必填，其余六个可选。**appId / 显示名 / 作者都从模板里
-// 删掉了** —— 它们能从 APK 与仓库里读出来，让人手填只会多一个填错的地方（03 §2.6）。
-// 唯一保留的自由文本是 `一句话简介`：它是**唯一从任何地方都派生不出来**的东西，
-// 而它进的是用户唯一会扫的那一行（Obtainium 的列表标题，见 model.DisplayName）。
+//
+// 新增侧字段分两组：**标准源**（repo 必填，其余可选）与**手动源**（`来源类型` 选了
+// `手动上传`，这时上游那组必须留空、而身份三件套必须自己填）。身份三件套之所以只对
+// 手动源出现，是因为它**没有 APK 与仓库可读**：标准源的 appId/显示名/作者都是从上游
+// 读出来的，让人手填只会多一个填错的地方（03 §2.6）；而手动源在申请时还没有任何
+// 二进制（第一份 APK 是收录之后才传进 `_incoming` 的），除了申请人没人知道这几样。
+// 唯一从头到尾都派生不出来的自由文本是 `一句话简介`：它进的是用户唯一会扫的那一行
+// （Obtainium 的列表标题，见 model.DisplayName）。
 const (
+	LabelOrigin     = "来源类型"
 	LabelRepo       = "上游 GitHub 仓库"
+	LabelAppID      = "包名（仅手动上传时填）"
+	LabelName       = "显示名（仅手动上传时填）"
+	LabelAuthor     = "作者 / 组织（仅手动上传时填）"
 	LabelAssetPat   = "资产匹配正则（可选）"
 	LabelCategories = "分类标签（可选）"
 	LabelABIs       = "只镜像哪些 ABI（可选）"
@@ -63,6 +71,17 @@ const (
 // 是个 bool），所以这里不需要像 ReviewCategories 那样是一份"合法取值表"。
 const PrereleaseOption = "拉取预发布版本"
 
+// 「来源类型」下拉的两个选项，与 add-source.yml 的 options 逐字一致。
+//
+// 它是正文里**唯一**能表达"这条来源有没有上游"的字段，所以两处依赖它：
+// 取值（ParseAdd 决定 repo 必不必填）与认模板（Detect，见那里的说明）。
+const (
+	// OriginGitHub 是默认项：上游仓库自己发 Release，forge 去镜像它。
+	OriginGitHub = "GitHub 上游发布"
+	// OriginManual 选中时，上游那组字段必须留空，身份三件套必须填 —— 见 LabelOrigin 上面的说明。
+	OriginManual = "手动上传"
+)
+
 // KindOptionNormal 是「应用类型」下拉里代表"普通应用"的那一项 —— 它映射到**空串**
 // （`Source.Kind` 的零值），不是 `model.KindObtainium`/`KindCompanion` 之外的第三个取值。
 //
@@ -94,12 +113,15 @@ func (k Kind) String() string {
 //
 // 判据是**结构**而不是 issue 标题：标题是用户可以随手改的（模板只给个默认值），
 // 而正文里出现哪套字段由表单渲染决定。两份模板各有一个对方没有的字段 ——
-// 新增侧是 `上游 GitHub 仓库`、变更侧是 `目标 appId`，认这一对就够。
+// 变更侧是 `目标 appId`、新增侧是 `上游 GitHub 仓库`，认这一对就够。
+//
+// **手动源要看 `来源类型`**：它的 `上游 GitHub 仓库` 是留空的（没有上游），
+// 只看 repo 会把手动新增单判成"既不新增也不变更"而整个拒掉。
 //
 // 两边都对不上时返回 ok=false（拒绝），且**不看标题**：本函数只拿得到正文，
 // 而手打的 issue 正文结构本来就不该信。
 func (f *Form) Detect() (Kind, bool) {
-	hasAdd := f.Get(LabelRepo) != ""
+	hasAdd := f.Get(LabelRepo) != "" || f.Get(LabelOrigin) == OriginManual
 	hasChange := f.Get(LabelTargetAppID) != ""
 	switch {
 	case hasChange && !hasAdd:
@@ -113,12 +135,22 @@ func (f *Form) Detect() (Kind, bool) {
 	}
 }
 
-// AddRequest 是一次「新增 · 标准源」申请。
+// AddRequest 是一次新增申请（标准源或手动源）。
 //
-// 只有 Repo 是必填。**这里没有 AppID / Name / Author** —— 申请人无从知道它们
-// （写错了还得靠人发现），所以改由对账阶段从 APK 的 package 与 label 读出来。
+// 必填的是哪几项取决于 Origin：标准源必填 Repo，手动源必填 AppID/Name/Author。
+// 这一对关系在 ParseAdd 里判（"缺字段"是取值问题），而字段**是否合法**由 job 层判，
+// 与手写来源文件那条入口共用同一批校验（见 job.validateAdd）。
 type AddRequest struct {
-	Repo         string
+	// Origin 是「来源类型」下拉的原样取值，`OriginGitHub` 或 `OriginManual`。
+	Origin string
+	Repo   string
+	// AppID / Name / Author 只对**手动源**有意义：标准源的这三样是从上游 APK 与仓库里
+	// 读出来的，申请人填了也不作数（job 层会在回评里点名说明）。手动源没有上游可读，
+	// 而它的第一份 APK 要到收录之后才上传，所以只能由申请人填 —— 包名还是**唯一的定位键**
+	// （`_incoming` 里那个 APK 靠它找回家）。
+	AppID        string
+	Name         string
+	Author       string
 	AssetPattern string
 	Categories   []string
 	ABIWhitelist []string
@@ -131,6 +163,12 @@ type AddRequest struct {
 	// IncludePrerelease 是"上游的 prerelease 也一起镜像"（模板里勾了那一项）。
 	IncludePrerelease bool
 }
+
+// Manual 报告这份申请是不是手动源（`source: "manual"`，二进制走 `_incoming` 上传队列）。
+//
+// 判据只有下拉那一个值，所以手动源与标准源在**同一张模板**里、走**同一条**收录链，
+// 分叉点少到只有读得出这个 bool 的那几处。
+func (r *AddRequest) Manual() bool { return r.Origin == OriginManual }
 
 // ChangeRequest 是一次「变更 · 移除」申请。
 type ChangeRequest struct {
@@ -153,12 +191,23 @@ type ChangeRequest struct {
 // 本函数只做**取值**，不判合法性（词表、正则能不能编译）—— 那是 job 层的事，
 // 与手改文件那条入口共用同一批校验，见 03 §2.6。
 func ParseAdd(f *Form) (*AddRequest, error) {
-	r := &AddRequest{}
+	r := &AddRequest{Origin: f.Get(LabelOrigin)}
 	var err error
-	if r.Repo, err = f.Required(LabelRepo); err != nil {
-		return nil, err
-	}
+	// 上游那一组**一律读出来**（即使手动源该留空）：job 层要靠"填了没有"决定是拒绝
+	// 还是照收，静默丢掉一个申请人特意填的值是最难发现的那种假回评。
+	r.Repo = f.Get(LabelRepo)
 	r.AssetPattern = f.Get(LabelAssetPat)
+	// 身份三件套同理：标准源填了也不作数（会从上游读），但那句话得有人去说。
+	r.AppID = f.Get(LabelAppID)
+	r.Name = f.Get(LabelName)
+	r.Author = f.Get(LabelAuthor)
+	// 必填只对**该填的那些**成立：手动源没有上游仓库，标准源没有身份三件套可填
+	// （模板里那三个的 label 写着"仅手动上传时填"）。所以这里只钉标准源的 Repo 一项。
+	if !r.Manual() {
+		if r.Repo, err = f.Required(LabelRepo); err != nil {
+			return nil, err
+		}
+	}
 	// 勾选项走 Checked（认 GitHub 渲染的 `- [X]`）—— 把整张任务列表当成一个
 	// 逗号分隔串去切会切得乱七八糟。
 	r.Categories = f.Checked(LabelCategories)

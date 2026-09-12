@@ -60,13 +60,28 @@ func withFields(base, extra [][2]string) [][2]string {
 	return out
 }
 
-// addBody 是一份**合法**的新增申请，extra 用来覆盖已有字段或追加新字段。
+// addBody 是一份**合法**的标准源新增申请，extra 用来覆盖已有字段或追加新字段。
 //
 // 只有 repo 是必填的（03 §2.6）：包名/显示名/作者都被从模板里删掉了，
 // 它们由对账阶段从 APK 里读出来 —— 所以这份"合法"的最小形态就是这么短。
 func addBody(extra ...[2]string) string {
 	base := [][2]string{
 		{issue.LabelRepo, "example/app"},
+	}
+	return form(withFields(base, extra)...)
+}
+
+// addManualBody 是一份**合法**的手动源新增申请（03 §2.2 B）：
+// 来源类型选「手动上传」、上游仓库留空、身份三件套由申请人填。
+//
+// 注意 base 里**没有** repo 那一项 —— 正是"上游那一组全空"才让它落进手动那一支
+// （见 issue.Detect：判据是"来源类型选了什么"，不是"repo 填没填"）。
+func addManualBody(extra ...[2]string) string {
+	base := [][2]string{
+		{issue.LabelOrigin, issue.OriginManual},
+		{issue.LabelAppID, "com.example.closed"},
+		{issue.LabelName, "自研应用"},
+		{issue.LabelAuthor, "Example Org"},
 	}
 	return form(withFields(base, extra)...)
 }
@@ -135,7 +150,7 @@ func mustAccept(t *testing.T, d *IntakeDecision) {
 	}
 }
 
-// mustAcceptAdd 是新增申请**在裁决阶段**唯一的通过形态（03 §2.6）：受理，且**不写文件**。
+// mustAcceptAdd 是**标准源**新增申请在裁决阶段唯一的通过形态（03 §2.6）：受理，且**不写文件**。
 //
 // 它顺带把所有"DecideIntake 会落盘"的回归都挡住：这里 ID 必然是空的，而写一个 ID 为空的
 // 来源文件会覆盖掉 `sources/.json`。落盘由 landNewSource 做 —— 那要联网探出身份才谈得上
@@ -145,14 +160,38 @@ func mustAccept(t *testing.T, d *IntakeDecision) {
 // landedReply 在探完身份之后生成。所以这里断言的是"摘要非空"，不是"回评非空"。
 func mustAcceptAdd(t *testing.T, d *IntakeDecision) {
 	t.Helper()
+	mustAcceptAddCommon(t, d)
+	if d.Source == nil || d.Source.ID != "" {
+		t.Fatalf("裁决阶段不该带 appId（它还没被读出来）：%+v", d.Source)
+	}
+}
+
+// mustAcceptAddManual 是**手动源**新增申请在裁决阶段唯一的通过形态。
+//
+// 与 mustAcceptAdd 唯一的差别就是 appId：手动源的包名是申请人自己填的，不在上游任何地方，
+// 所以裁决阶段拿到的已经是一份**完整**的 Source —— 没有"探身份"这第二步，也就没有
+// 那个"ID 必须是空的"的中间态。这条差别正是手动源能整条链短一截的原因。
+func mustAcceptAddManual(t *testing.T, d *IntakeDecision) {
+	t.Helper()
+	mustAcceptAddCommon(t, d)
+	if d.Source == nil || d.Source.ID == "" {
+		t.Fatalf("手动源的包名是申请人填的，裁决阶段就该定下来：%+v", d.Source)
+	}
+	if d.Source.Source != model.SourceManual {
+		t.Fatalf("source = %q，期望 %q", d.Source.Source, model.SourceManual)
+	}
+	if d.Source.Upstream != nil {
+		t.Fatalf("手动源长出 upstream 是硬失败（Source.Validate 会拦）：%+v", d.Source.Upstream)
+	}
+}
+
+func mustAcceptAddCommon(t *testing.T, d *IntakeDecision) {
+	t.Helper()
 	if !d.Accept {
 		t.Fatalf("期望通过，实际拒绝了：\n%s", d.Reply)
 	}
 	if strings.TrimSpace(d.Summary) == "" {
 		t.Fatal("摘要不该为空")
-	}
-	if d.Source == nil || d.Source.ID != "" {
-		t.Fatalf("裁决阶段不该带 appId（它还没被读出来）：%+v", d.Source)
 	}
 	if !d.Hold {
 		t.Fatal("新增单必须留在打开状态 —— 关掉它就等于把这张单丢了")
@@ -175,7 +214,8 @@ func TestDecideIntake_AddAccepted(t *testing.T) {
 	mustAcceptAdd(t, d)
 
 	s := d.Source
-	// 新增一律是 github 源（§2.2：manual 没有"申请"这个动作）。
+	// 没选「来源类型」（= 默认的 `GitHub 上游发布`）就是标准源，走探身份那一支；
+	// 手动源另外一组用例（见下面那一节）。
 	if s.Source != model.SourceGitHub {
 		t.Fatalf("新增来源的 source 必须是 %q，得到 %q", model.SourceGitHub, s.Source)
 	}
@@ -364,6 +404,111 @@ func TestDecideIntake_AddCompanionSlot(t *testing.T) {
 	// 有 companion 在场也照样放行。
 	d = DecideIntake(ctxWith(comp), addBody([2]string{issue.LabelKind, model.KindObtainium}))
 	mustAcceptAdd(t, d)
+}
+
+// ---- 新增 · 手动源 -----------------------------------------------------------
+//
+// 手动源（私有/自研闭源应用）没有上游，身份三件套由申请人填 —— 所以它的整条链比标准源
+// 短一截：裁决阶段就有完整的一份 Source，没有"探身份"这一步。这一节钉的就是那几处分岔：
+// 三件套缺一不可、上游那一组填了要拒、以及它与标准源**共用**的那道 companion 闸门。
+
+func TestDecideIntake_AddManualAccepted(t *testing.T) {
+	d := DecideIntake(ctxWith(), addManualBody(
+		[2]string{issue.LabelDesc, "内部用的"},
+		[2]string{issue.LabelCategories, "- [X] 工具 - [ ] 效率 - [ ] 媒体 - [ ] 通讯 - [ ] 开发 - [ ] 游戏 - [ ] 其他"},
+		[2]string{issue.LabelABIs, "- [X] arm64-v8a - [ ] armeabi-v7a - [ ] x86_64 - [ ] x86 - [ ] universal"},
+	))
+	mustAcceptAddManual(t, d)
+
+	s := d.Source
+	if s.ID != "com.example.closed" || s.Name != "自研应用" || s.Author != "Example Org" {
+		t.Fatalf("身份三件套没按申请人填的落下来：%+v", s)
+	}
+	if s.Desc != "内部用的" {
+		t.Fatalf("desc 没带上：%q", s.Desc)
+	}
+	if !reflect.DeepEqual(s.Categories, []string{"工具"}) ||
+		!reflect.DeepEqual(s.ABIWhitelist, []string{"arm64-v8a"}) {
+		t.Fatalf("列表没解析对：categories=%v abiWhitelist=%v", s.Categories, s.ABIWhitelist)
+	}
+	// 手动源的整份校验就是来源文件那条入口的规则（decideAddManual 里那次 Validate）。
+	// 这里再跑一遍是为了钉住"裁决阶段拿到的确实是一份可落盘的文件"，而不是半成品。
+	if err := s.Validate(""); err != nil {
+		t.Fatalf("手动源裁决结果必须是合法的一份来源：%v", err)
+	}
+}
+
+// 三件套缺任何一项都得被**点名**：手动源没有上游，这几样无从读起，缺了就是缺了。
+// 只说"申请内容不合法"会让人对着三行中文输入框猜是哪一行。
+func TestDecideIntake_AddManualMissingIdentity(t *testing.T) {
+	mustReject(t, DecideIntake(ctxWith(), addManualBody([2]string{issue.LabelAppID, ""})), "包名")
+	mustReject(t, DecideIntake(ctxWith(), addManualBody([2]string{issue.LabelName, ""})), "显示名")
+	mustReject(t, DecideIntake(ctxWith(), addManualBody([2]string{issue.LabelAuthor, ""})), "作者")
+}
+
+// 上游那一组对手动源没有意义 —— 填了要**拒绝并点名**，不是静默忽略。
+// 与 change-source.yml 拒绝「手动源改资产正则」同一个理由：让人以为填了有用，
+// 比直接拒绝难发现得多（他要等到某次上传搬不进来才会回头找原因）。
+func TestDecideIntake_AddManualRejectsStrayUpstreamFields(t *testing.T) {
+	mustReject(t, DecideIntake(ctxWith(), addManualBody(
+		[2]string{issue.LabelRepo, "owner/app"})), issue.LabelRepo)
+	mustReject(t, DecideIntake(ctxWith(), addManualBody(
+		[2]string{issue.LabelAssetPat, `\.apk$`})), issue.LabelAssetPat)
+	mustReject(t, DecideIntake(ctxWith(), addManualBody(
+		[2]string{issue.LabelPrerelease, "- [X] " + issue.PrereleaseOption})), issue.LabelPrerelease)
+}
+
+// 手动源的包名直接进来源文件，所以它受**来源文件那条入口的全部规则**约束，一样不少。
+// `_incoming` 是最要紧的那一条：它是暂存 Release 的 tag（03 §3.1），拿它当 appId 会让
+// 那个 Release 的 tag 与某个 App 的 tag 撞上。
+func TestDecideIntake_AddManualRejectsReservedAppID(t *testing.T) {
+	mustReject(t, DecideIntake(ctxWith(), addManualBody(
+		[2]string{issue.LabelAppID, model.IncomingTag})), "保留名")
+}
+
+// 标准源申请里填了身份三件套：照收（模板没法按来源类型隐藏字段），但**必须在回评里
+// 说清那几项不作数** —— 否则"我明明填了显示名"与回评表格里那个从 APK 读出来的名字对不上，
+// 而这条回评是申请人唯一能发现"仓库填错了"的地方。
+func TestDecideIntake_AddStandardSourceStrayIdentityIsNoteNotReject(t *testing.T) {
+	d := DecideIntake(ctxWith(), addBody(
+		[2]string{issue.LabelName, "我自己取的"},
+		[2]string{issue.LabelAuthor, "我自己"},
+	))
+	mustAcceptAdd(t, d)
+	if !strings.Contains(d.DescNote, issue.LabelName) || !strings.Contains(d.DescNote, "不作数") {
+		t.Errorf("填了不作数的字段却没在提醒里说：%q", d.DescNote)
+	}
+	// 反方向：没填就不该冒出这句噪音。
+	if bare := DecideIntake(ctxWith(), addBody()); strings.Contains(bare.DescNote, "不作数") {
+		t.Errorf("没填身份三件套却说它不作数：%q", bare.DescNote)
+	}
+}
+
+// 手动源同样占着「kind: companion 全局至多一条」那个位置 —— 它没有 upstream，
+// 但**不是**"可以跳过"的理由：漏掉它就会让第二张 companion 申请落盘，而 02 规则 9
+// 会让 check-manifest 硬失败（整份清单推不出去）。
+//
+// 放行的那一半同样重要：手动源的包名就是它自己填的，所以"重跑"的判据是包名相同。
+func TestDecideIntake_AddManualCompanionSlot(t *testing.T) {
+	comp := manualSource("com.example.closed")
+	comp.Kind = model.KindCompanion
+
+	// 同一个包名再提交一次 = 这条 companion 就是这份申请自己写的，放行。
+	d := DecideIntake(ctxWith(comp), addManualBody([2]string{issue.LabelKind, model.KindCompanion}))
+	mustAcceptAddManual(t, d)
+	if d.Source.Kind != model.KindCompanion {
+		t.Errorf("kind = %q，期望 %q", d.Source.Kind, model.KindCompanion)
+	}
+
+	// 另一个包名想当 companion：拒（这就是那个"没有 upstream 也得占位"的洞）。
+	mustReject(t, DecideIntake(ctxWith(comp), addManualBody(
+		[2]string{issue.LabelAppID, "com.example.other"},
+		[2]string{issue.LabelKind, model.KindCompanion},
+	)), "至多一条")
+
+	// 标准源申请也一样被这条手动 companion 挡住 —— 占位与来源种类无关。
+	mustReject(t, DecideIntake(ctxWith(comp), addBody(
+		[2]string{issue.LabelKind, model.KindCompanion})), "至多一条")
 }
 
 // 两套模板的字段混在一张单里：拒绝，不猜。猜错方向的后果是拿「目标 appId」

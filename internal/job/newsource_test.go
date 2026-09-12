@@ -341,6 +341,31 @@ func TestSameRequest_NilUpstream(t *testing.T) {
 	}
 }
 
+// 两边都是手动源时比的**只有包名**：它没有上游，包名就是这份申请的全部主张。
+//
+// 判成同一份申请是这里的关键半条 —— 上一次落了盘、收尾（回评/关单）没走完时，重跑
+// 会带着同一个包名重新走到撞包名那个分支；返回 false 会对一张完全合法的申请回一句
+// "已经有这个应用了，请用 change-source.yml"，而那张单从此卡在一条错误的回评底下。
+func TestSameRequest_BothManualComparesPackageName(t *testing.T) {
+	old := &model.Source{Source: model.SourceManual, ID: "com.example.closed"}
+	same := &model.Source{Source: model.SourceManual, ID: "com.example.closed", Name: "改了名字"}
+	other := &model.Source{Source: model.SourceManual, ID: "com.example.other"}
+
+	// 显示名/作者对判定**不参与** —— 手动源的它们可以由 change-source.yml 随时改，
+	// 改过一次就不该让自家补跑变成"别人撞了包名"。
+	if !sameRequest(old, same) {
+		t.Error("同一个包名的手动源重跑，应当判为同一份申请")
+	}
+	if sameRequest(old, other) {
+		t.Error("包名不同就是真的占了另一个安装身份，该拒")
+	}
+	// 一份 github、一份 manual：同一个 appId 也不相等（真的撞了，回评要让人去用变更单）。
+	gh := &model.Source{Source: model.SourceGitHub, ID: "com.example.closed", Upstream: &model.Upstream{Repo: "a/b"}}
+	if sameRequest(old, gh) || sameRequest(gh, old) || sameRequest(gh, same) {
+		t.Error("来源种类不同时不能判成同一份申请")
+	}
+}
+
 func TestRepoOwner(t *testing.T) {
 	cases := map[string]string{
 		"ImranR98/Obtainium": "ImranR98",
@@ -387,5 +412,39 @@ func TestLandedReply(t *testing.T) {
 	}
 	if !strings.Contains(bad, "已收录") {
 		t.Errorf("来源确实落盘了，回评不能改口说没收录：\n%s", bad)
+	}
+}
+
+// manualLandedReply 与 landedReply 分开写，因为要说的不是同一件事：手动源收完的那一刻
+// **一个字节的二进制都还没有**，所以这段话的全部作用是"下一步去哪传"。
+//
+// 逐条钉住是因为它们都会**静默**地坏：少了 tag 或仓库名，申请人就得自己猜去哪传；
+// 少了"只有 Publish 会触发搬运"，他会以为挂上去就行了（草稿不会触发）；
+// 少了"包名必须逐字一致"，他会卡在"传了却没反应"而无从排查。
+func TestManualLandedReply(t *testing.T) {
+	c := &Ctx{Env: &Env{StoreRepo: "market-of-labs/store"}}
+	src := manualSource("com.example.closed")
+
+	got := c.manualLandedReply(&src, "⚠️ 简介被截断了。\n\n")
+	for _, want := range []string{
+		"com.example.closed", // 包名：上传的 APK 靠它认回家
+		model.IncomingTag,    // 传去哪（暂存 Release 的 tag）
+		c.Env.StoreRepo,      // 哪个仓库
+		"Publish release",    // 只有 Publish 触发搬运 —— 光挂上去是草稿，不算
+		"逐字一致",             // 唯一会让 APK 搬不进来的原因
+		"apps.json",          // "它现在还不在清单里"：不说会被当成收录失败
+		"⚠️ 简介被截断了。",       // 截断提醒原样带出去（它只在这条链上有机会露面）
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("回评里少了 %q：\n%s", want, got)
+		}
+	}
+	// 没截断时不该凭空冒出一条提醒。
+	if bare := c.manualLandedReply(&src, ""); strings.Contains(bare, "截断") {
+		t.Errorf("没截断却说截断了：\n%s", bare)
+	}
+	// 手动源没有上游，所以那段话里不该出现"上游发布"这类只对标准源成立的说法。
+	if strings.Contains(got, "身份是从") {
+		t.Errorf("手动源没有上游可读身份，回评里不该说它是从哪次发布读出来的：\n%s", got)
 	}
 }

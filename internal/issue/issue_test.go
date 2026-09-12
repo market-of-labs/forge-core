@@ -414,7 +414,9 @@ func TestLabelsMatchStoreTemplates(t *testing.T) {
 		labels []string
 	}{
 		{"add-source.yml", []string{
-			issue.LabelRepo, issue.LabelAssetPat, issue.LabelDesc,
+			issue.LabelOrigin, issue.LabelRepo,
+			issue.LabelAppID, issue.LabelName, issue.LabelAuthor,
+			issue.LabelAssetPat, issue.LabelDesc,
 			issue.LabelCategories, issue.LabelABIs,
 			issue.LabelKind, issue.LabelPrerelease,
 		}},

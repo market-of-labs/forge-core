@@ -1,6 +1,7 @@
 package job
 
 import (
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
@@ -11,9 +12,10 @@ import (
 	"github.com/market-of-labs/forge-core/internal/upstream"
 )
 
-// 这一组钉的是待办扫描的**决策**部分：从哪个 Release 读身份、读出来算不算数。
-// 它们都不发请求、也不下载 —— readMetas 被换成了一个返回手工 Meta 的桩，
-// 这正是 pickIdentityRelease 把那一层抽出来的原因（真 APK 有 8 MB，不能进仓库）。
+// 这一组钉的是新增单的**决策**部分：从哪个 Release 读身份、读出来算不算数、
+// 撞了包名算不算自己。它们都不发请求、也不下载 —— readMetas 被换成了一个返回手工
+// Meta 的桩，这正是 pickIdentityRelease 把那一层抽出来的原因（真 APK 有 8 MB，
+// 不能进仓库）。
 
 // halfSource 造一份"身份还没定"的半成品 Source，形状与 decideAdd 产出的完全一致。
 func halfSource(repo string) *model.Source {
@@ -252,6 +254,93 @@ func TestBuildIdentity_DoesNotMutateInput(t *testing.T) {
 	}
 }
 
+// ---- sameRequest：撞了包名时，是不是"它自己" ----------------------------------
+//
+// 这一组钉的是一条**回评的正确性**，不是一个算法：落盘（WriteSource + CommitBack）与
+// "回评 + 关单"之间隔着几次网络调用，它们失败时文件已经在 `sources/` 里、而单还开着。
+// 申请人改完正文重发车（或维护者手工重跑）时会重新走到撞包名那个分支 —— 判错的代价是
+// 对一张**完全合法**的申请回一句"已经有这个应用了，请用 change-source.yml"，
+// 而那张单从此就卡在一条错误的回评底下。
+
+func TestSameRequest_MatchesOnRepoAndPattern(t *testing.T) {
+	half := halfSource("ExampleOrg/ExampleApp")
+	half.Upstream.AssetPattern = `(?i)app.*\.apk$`
+
+	// 自家补跑：文件是上一次跑用同一份正文写出来的。
+	old := *half
+	old.ID, old.Name, old.Author = "com.example.app", "示例应用", "ExampleOrg"
+	if !sameRequest(&old, half) {
+		t.Fatal("同仓库 + 同正则应当判为同一份申请")
+	}
+
+	// 两边都没填正则（默认正则）也是同一份 —— 空 == 空 不能因为"看起来没值"就算不等。
+	noPat := halfSource("ExampleOrg/ExampleApp")
+	if !sameRequest(noPat, halfSource("ExampleOrg/ExampleApp")) {
+		t.Fatal("两边都没写正则时应当判为同一份申请")
+	}
+}
+
+// 这条是这个函数存在的理由：**拿整份文件比对会在这里判错**。
+//
+// 显示名是从 APK 里读的，上游改过 label 就会让两份不再相等 —— 而那不是"别人撞了
+// 包名"，是自家补跑。作者同理（仓库改名/转移）。
+func TestSameRequest_IgnoresProbedFields(t *testing.T) {
+	half := halfSource("ExampleOrg/ExampleApp")
+	half.Upstream.AssetPattern = `(?i)app.*\.apk$`
+
+	old := *half
+	old.ID = "com.example.app"
+	old.Name = "改名之前的显示名"   // 上游换了 label
+	old.Author = "OldOwner" // 仓库转过手
+	if !sameRequest(&old, half) {
+		t.Fatal("显示名/作者是探出来的，不该参与判断 —— 否则自家补跑会被误判成撞包名")
+	}
+}
+
+func TestSameRequest_RejectsRealConflicts(t *testing.T) {
+	half := halfSource("ExampleOrg/ExampleApp")
+	half.Upstream.AssetPattern = `(?i)app.*\.apk$`
+
+	cases := map[string]*model.Source{
+		"不同仓库占了同一个包名": func() *model.Source {
+			s := halfSource("OtherOrg/OtherApp")
+			s.Upstream.AssetPattern = half.Upstream.AssetPattern
+			return s
+		}(),
+		"同仓库但正则不同（另一条申请）": func() *model.Source {
+			s := halfSource("ExampleOrg/ExampleApp")
+			s.Upstream.AssetPattern = `(?i)other.*\.apk$`
+			return s
+		}(),
+		"一边填了正则一边没有": func() *model.Source {
+			return halfSource("ExampleOrg/ExampleApp")
+		}(),
+	}
+	for name, old := range cases {
+		old.ID = "com.example.app"
+		if sameRequest(old, half) {
+			t.Errorf("%s：应当判为真冲突（回评里要让他去用 change-source.yml）", name)
+		}
+	}
+}
+
+// 手动来源（`source: "manual"`）没有 Upstream，而它的 appId 一样会被撞上。
+// 这里必须**返回 false 而不是 panic** —— 崩溃会让整轮扫描停在一张无关的单上。
+func TestSameRequest_NilUpstream(t *testing.T) {
+	half := halfSource("ExampleOrg/ExampleApp")
+	manual := &model.Source{Source: model.SourceManual, ID: "com.example.app"}
+
+	if sameRequest(manual, half) {
+		t.Error("没有 Upstream 的来源不可能是同一份申请")
+	}
+	if sameRequest(half, manual) {
+		t.Error("反向也不该相等")
+	}
+	if sameRequest(nil, half) || sameRequest(half, nil) || sameRequest(nil, nil) {
+		t.Error("nil 入参应当返回 false，不能 panic")
+	}
+}
+
 func TestRepoOwner(t *testing.T) {
 	cases := map[string]string{
 		"ImranR98/Obtainium": "ImranR98",
@@ -262,5 +351,41 @@ func TestRepoOwner(t *testing.T) {
 		if got := repoOwner(in); got != want {
 			t.Errorf("repoOwner(%q) = %q，期望 %q", in, got, want)
 		}
+	}
+}
+
+// ---- landedReply：申请人唯一会读到的那段话 -------------------------------------
+//
+// 三件事各自都会**静默**地坏掉，所以逐条钉住：核对身份的请求、简介截断的告知、
+// 以及这一轮镜像的实况。前两条是"仓库填错 / 写的东西被裁"仅有的发现机会，
+// 第三条决定了申请人会不会去追一个已经跑完的版本。
+func TestLandedReply(t *testing.T) {
+	src := githubSource("com.example.app")
+
+	// 一切顺利 + 一条截断提醒。
+	ok := landedReply(&src, "v1.2.3", "⚠️ 简介被截断了。\n\n", nil, nil)
+	for _, want := range []string{
+		"com.example.app", // 读出来的包名
+		"v1.2.3",          // 身份是从哪个 release 读的
+		"⚠️ 简介被截断了。",
+		"核对", // 仓库填错会静默收错应用，这句是唯一的发现机会
+	} {
+		if !strings.Contains(ok, want) {
+			t.Errorf("回评里少了 %q：\n%s", want, ok)
+		}
+	}
+
+	// 没有截断时不该凭空冒出一条提醒。
+	if bare := landedReply(&src, "v1.2.3", "", nil, nil); strings.Contains(bare, "截断") {
+		t.Errorf("没截断却说截断了：\n%s", bare)
+	}
+
+	// 同步没跑完：必须如实说出来，且**不能**说成"上游没有匹配到资产"。
+	bad := landedReply(&src, "v1.2.3", "", nil, errors.New("上游 502"))
+	if !strings.Contains(bad, "上游 502") {
+		t.Errorf("同步失败的原因没写进回评：\n%s", bad)
+	}
+	if !strings.Contains(bad, "已收录") {
+		t.Errorf("来源确实落盘了，回评不能改口说没收录：\n%s", bad)
 	}
 }

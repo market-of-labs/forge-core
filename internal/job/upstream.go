@@ -215,6 +215,9 @@ type MirrorOptions struct {
 type MirrorReport struct {
 	Uploaded int
 	Skipped  int
+	// Failed 是**整个应用**没镜像成的个数（区别于 Skipped：那个是"按规则不该镜像"，
+	// 这个是"想镜像但出错了"）。它只用于摘要行 —— 真正的痕迹在 Problems 里。
+	Failed int
 	// Recorded 表示往索引里写过东西（哪怕一个字节都没上传）。
 	// 它决定 index 要不要落盘：见 MirrorUpstream 末尾。
 	Recorded bool
@@ -222,6 +225,23 @@ type MirrorReport struct {
 }
 
 // MirrorUpstream 执行镜像：下载 → 按内容判定 → 改名 → 幂等上传（03 §4.4 第 3 步）。
+//
+// # 单个应用失败不中断整轮
+//
+// 一个应用的下载/上传出错（网络抖动、上游 asset 404、建 Release 失败）只让**它自己**
+// 这一轮不镜像，其余应用照常走完，这一轮的 index 与 apps.json 照样重建并回写。
+// 这跟 resolveOne 容忍"列上游失败"（upstream.go 里那句"不该让整次对账停摆"）是同一条
+// 口径 —— 上一处一开始就写对了，这里当初漏了。
+//
+// 为什么必须容忍：apps.json 的重建在整轮**之后**（Reconcile 的 RebuildAndCheck），
+// index 的落盘在本函数**末尾**。任一处失败就整体返回，等于"50 个应用里第 37 个碰上一次
+// 下载 500，全市场当天都拿不到清单更新"；而水位线也没推进，下一轮会把前 36 个**已经成功**
+// 的上游 APK 重新下载一遍（上传会被幂等挡下，但读元数据那趟下载省不掉）。
+//
+// 代价（明确接受）：**这一轮是绿的** —— 因为东西确实推上去了，符合 reconcile.yml 里
+// "红 = 没推"那条既有约定。所以失败只以 ERROR 行的形式留在报告与日志里，不会让 workflow
+// 变红；它也不阻断任何东西（res.Report 只被打印，唯一的阻断点是 check-manifest）。
+// 漏掉的那个应用由下一轮幂等补齐。
 //
 // # ABI 的唯一权威是 APK 内容
 //
@@ -239,7 +259,12 @@ func MirrorUpstream(ctx context.Context, c *Ctx, plans []Plan, opts MirrorOption
 
 	for i := range plans {
 		if err := c.mirrorPlan(ctx, &plans[i], opts, out); err != nil {
-			return out, err
+			// 记成**硬错误**而不是告警：整轮现在是绿的，报告与日志是它唯一的痕迹，
+			// 不能让它看起来像一句无关紧要的提示。它不阻断任何东西 —— 见上面的说明。
+			out.Problems.Errorf(plans[i].Source.ID,
+				"镜像上游 %s 失败，本轮跳过这个应用（下一轮对账会补）：%v",
+				plans[i].Release.TagName, err)
+			out.Failed++
 		}
 	}
 

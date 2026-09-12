@@ -144,28 +144,6 @@ type Issue struct {
 	PullRequest *struct {
 		URL string `json:"url"`
 	} `json:"pull_request,omitempty"`
-	// Labels 是这张单当前的标签。扫描器靠它判断"标签跳变了没有" ——
-	// 决定要不要回评（幂等：没变就不说话）。
-	Labels []Label `json:"labels"`
-}
-
-// Label 是 issue 上的一个标签。只取 name：颜色与描述本项目用不上，
-// 而少一个字段就少一处随 API 改版漂移的地方。
-type Label struct {
-	Name string `json:"name"`
-}
-
-// HasLabel 报告这张单上有没有某个标签。
-//
-// 列表端点返回的 labels 是**完整的**当前标签集，所以这一个方法就够扫描器判断
-// "标签要不要变" —— 那正是"要不要回评"的判据（见 job.holdForInfo）。
-func (is Issue) HasLabel(name string) bool {
-	for _, l := range is.Labels {
-		if l.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 // ReleasePatch 是 PATCH release 的可选字段（用指针区分"不改"与"改成零值"）。
@@ -504,62 +482,6 @@ func (c *Client) CloseIssue(ctx context.Context, repo string, number int) error 
 	u := c.repoURL(repo, "issues", strconv.Itoa(number))
 	_, err := c.do(ctx, http.MethodPatch, u, map[string]string{"state": "closed"}, nil)
 	return err
-}
-
-// ListOpenIssues 列出开着、且带指定标签的 issue。
-//
-// 让服务端按 labels 筛，而不是拉全部再本地过滤：待办扫描每轮都跑，而关掉的单
-// 只增不减，本地过滤会让每轮拉取量随时间线性膨胀。
-//
-// **过滤掉 PullRequest** —— PR 也出现在 issues 端点里（GetIssue 那边同理），
-// 而 PR 的"正文"是代码 diff，不是申请。
-func (c *Client) ListOpenIssues(ctx context.Context, repo, label string) ([]Issue, error) {
-	q := url.Values{"state": {"open"}, "per_page": {"100"}}
-	if label != "" {
-		// 标签名含中文，必须编码后进 query。
-		q.Set("labels", label)
-	}
-	var all []Issue
-	next := c.repoURL(repo, "issues") + "?" + q.Encode()
-	for next != "" {
-		var page []Issue
-		resp, err := c.do(ctx, http.MethodGet, next, nil, &page)
-		if err != nil {
-			return nil, err
-		}
-		for _, is := range page {
-			if is.PullRequest == nil {
-				all = append(all, is)
-			}
-		}
-		next = nextLink(resp)
-	}
-	return all, nil
-}
-
-// AddLabels 给 issue 加标签。端点自带幂等：已经在 issue 上的标签不会重复添加。
-//
-// 走 POST .../issues/{n}/labels 而**不是** PATCH issue —— 后者的 labels 字段是
-// 整份替换，会把这张单上其余标签（包括人手工打的）一次抹掉。
-func (c *Client) AddLabels(ctx context.Context, repo string, number int, labels ...string) error {
-	if len(labels) == 0 {
-		return nil
-	}
-	u := c.repoURL(repo, "issues", strconv.Itoa(number), "labels")
-	_, err := c.do(ctx, http.MethodPost, u, map[string][]string{"labels": labels}, nil)
-	return err
-}
-
-// RemoveLabel 从 issue 上摘掉一个标签。
-//
-// **标签本来就不在时 API 返回 404**，而那正是我们想要的终态（"这张单上没有它了"）。
-// 把它当失败会让"删两次"这种幂等场景炸掉，所以这里正常化 ErrNotFound。
-func (c *Client) RemoveLabel(ctx context.Context, repo string, number int, label string) error {
-	u := c.repoURL(repo, "issues", strconv.Itoa(number), "labels", label)
-	if _, err := c.do(ctx, http.MethodDelete, u, nil, nil); err != nil && !errors.Is(err, ErrNotFound) {
-		return err
-	}
-	return nil
 }
 
 // ---- 提交 --------------------------------------------------------------------

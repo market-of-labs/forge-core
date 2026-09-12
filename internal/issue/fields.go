@@ -32,7 +32,9 @@ const (
 	LabelNewAssetPat = "新的资产匹配正则（仅「修改元数据」时填）"
 	LabelNewCats     = "新的分类标签（仅「修改元数据」时填）"
 	LabelNewDesc     = "新的简介（仅「修改元数据」时填）"
-	LabelReason      = "说明（可选）"
+	// LabelReason **刻意不解析**：维护者读的本来就是 issue 本身，把它取出来也没有
+	// 第二个消费者。留着常量只是让"模板里有哪几个字段"这件事在一处看得全。
+	LabelReason = "说明（可选）"
 )
 
 // 动作取值，与 change-source.yml 的 dropdown options 逐字一致。
@@ -111,8 +113,6 @@ type ChangeRequest struct {
 	NewAssetPat   *string
 	NewDesc       *string
 	NewCategories []string
-
-	Reason string
 }
 
 // ParseAdd 解析一份新增申请。
@@ -122,12 +122,12 @@ type ChangeRequest struct {
 func ParseAdd(f *Form) (*AddRequest, error) {
 	r := &AddRequest{}
 	var err error
-	if r.Repo, err = f.Required(LabelRepo, LabelRepo); err != nil {
+	if r.Repo, err = f.Required(LabelRepo); err != nil {
 		return nil, err
 	}
 	r.AssetPattern = f.Get(LabelAssetPat)
-	// 勾选项走 Checked（认 GitHub 渲染的 `- [X]`），不能走 List ——
-	// 后者会把整张任务列表当成一个逗号分隔串切得乱七八糟。
+	// 勾选项走 Checked（认 GitHub 渲染的 `- [X]`）—— 把整张任务列表当成一个
+	// 逗号分隔串去切会切得乱七八糟。
 	r.Categories = f.Checked(LabelCategories)
 	r.ABIWhitelist = f.Checked(LabelABIs)
 	r.Desc = f.Get(LabelDesc)
@@ -138,13 +138,12 @@ func ParseAdd(f *Form) (*AddRequest, error) {
 func ParseChange(f *Form) (*ChangeRequest, error) {
 	r := &ChangeRequest{}
 	var err error
-	if r.AppID, err = f.Required(LabelTargetAppID, LabelTargetAppID); err != nil {
+	if r.AppID, err = f.Required(LabelTargetAppID); err != nil {
 		return nil, err
 	}
-	if r.Action, err = f.Required("动作", LabelAction); err != nil {
+	if r.Action, err = f.Required(LabelAction); err != nil {
 		return nil, err
 	}
-	r.Reason = f.Get(LabelReason)
 
 	if r.Action == ActionEdit {
 		// 三个"新值"字段都用**是否出现在正文里**判定，而不是"值非空"：

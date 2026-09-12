@@ -136,21 +136,27 @@ func mustAccept(t *testing.T, d *IntakeDecision) {
 	}
 }
 
-// mustPending 是新增申请唯一的通过形态（03 §2.6）：受理、登记、**不写文件**。
+// mustAcceptAdd 是新增申请**在裁决阶段**唯一的通过形态（03 §2.6）：受理，且**不写文件**。
 //
-// 它顺带把所有"新增单会落盘"的回归都挡住：Pending 为真时 ID 必然是空的，
-// 而写一个 ID 为空的来源文件会覆盖掉 `sources/.json`。
-func mustPending(t *testing.T, d *IntakeDecision) {
+// 它顺带把所有"DecideIntake 会落盘"的回归都挡住：这里 ID 必然是空的，而写一个 ID 为空的
+// 来源文件会覆盖掉 `sources/.json`。落盘由 landNewSource 做 —— 那要联网探出身份才谈得上
+// （见 newsource.go），所以裁决结果里不可能有。
+//
+// Reply 为空**不是漏写**：要回评的字段（包名、显示名、作者）此刻还不存在，那段话由
+// landedReply 在探完身份之后生成。所以这里断言的是"摘要非空"，不是"回评非空"。
+func mustAcceptAdd(t *testing.T, d *IntakeDecision) {
 	t.Helper()
-	mustAccept(t, d)
-	if !d.Pending {
-		t.Fatalf("新增申请应当是 Pending（等对账去上游读身份）：\n%s", d.Reply)
+	if !d.Accept {
+		t.Fatalf("期望通过，实际拒绝了：\n%s", d.Reply)
+	}
+	if strings.TrimSpace(d.Summary) == "" {
+		t.Fatal("摘要不该为空")
 	}
 	if d.Source == nil || d.Source.ID != "" {
-		t.Fatalf("Pending 的申请不该带 appId（它还没被读出来）：%+v", d.Source)
+		t.Fatalf("裁决阶段不该带 appId（它还没被读出来）：%+v", d.Source)
 	}
 	if !d.Hold {
-		t.Fatal("Pending 的单必须留在打开状态 —— 关掉它，队列就丢了这张单")
+		t.Fatal("新增单必须留在打开状态 —— 关掉它就等于把这张单丢了")
 	}
 	if d.Kind != issue.KindAdd {
 		t.Fatalf("Kind = %v，期望 KindAdd", d.Kind)
@@ -167,7 +173,7 @@ func TestDecideIntake_AddAccepted(t *testing.T) {
 		[2]string{issue.LabelCategories, "- [X] 工具 - [ ] 效率 - [X] 媒体 - [ ] 通讯 - [ ] 开发 - [ ] 游戏 - [ ] 其他"},
 		[2]string{issue.LabelABIs, "- [X] arm64-v8a - [X] armeabi-v7a - [ ] x86_64 - [ ] x86 - [ ] universal"},
 	))
-	mustPending(t, d)
+	mustAcceptAdd(t, d)
 
 	s := d.Source
 	// 新增一律是 github 源（§2.2：manual 没有"申请"这个动作）。
@@ -190,48 +196,43 @@ func TestDecideIntake_AddAccepted(t *testing.T) {
 	if s.Paused {
 		t.Fatal("新增的条目不该是 paused")
 	}
-	// 回评必须请申请人**核对**读出来的身份：仓库填错会静默收错应用，
-	// 而那条回评是唯一的发现机会（03 §2.6）。
-	if !strings.Contains(d.Reply, "核对") {
-		t.Fatalf("回评里没有请申请人核对身份：\n%s", d.Reply)
-	}
 }
 
 // `_No response_` 是 GitHub 对"可选字段留空"的渲染结果，必须等价于空。
 // TestDecideIntake_AddDescIsTruncatedNotRejected 钉住简介的**裁而不拒**（D42）。
 //
 // 上限是量出来的（model.MaxDescRunes）：它进的是 Obtainium 列表的标题行，
-// 那行是单行 + 省略号。之所以裁而不拒 —— 这个字段纯装饰，而新增单一次往返是
-// 一天（03 §2.5.1 两拍），为一个简介让人重填一整天不成比例。
+// 那行是单行 + 省略号。之所以裁而不拒 —— 这个字段纯装饰，为一个简介让人重填不值当。
 //
-// 但回评必须**说出被裁了**：默默切掉申请人写的东西、还回一句"已收到"，
-// 是这套流程里最难被发现的那种假回评（只有对账落盘时才看得见差别）。
+// 但**必须说出被裁了**：默默切掉申请人写的东西、再回一句"已收录"，是这套流程里
+// 最难被发现的那种假回评（要等到落地后对着 APK 里的显示名才看得见差别）。这句话现在
+// 走 DescNote 到 landedReply —— 裁决阶段没有回评可写，所以这里断言的就是 DescNote。
 func TestDecideIntake_AddDescIsTruncatedNotRejected(t *testing.T) {
 	c := ctxWith()
 	long := strings.Repeat("很", model.MaxDescRunes+8)
 
 	d := DecideIntake(c, addBody([2]string{issue.LabelDesc, long}))
-	mustPending(t, d)
+	mustAcceptAdd(t, d)
 	if n := len([]rune(d.Source.Desc)); n != model.MaxDescRunes {
 		t.Fatalf("简介该被裁到 %d 个字，得到 %d 个字：%q", model.MaxDescRunes, n, d.Source.Desc)
 	}
-	if !strings.Contains(d.Reply, "截断") {
-		t.Errorf("裁过却没在回评里说：\n%s", d.Reply)
+	if !strings.Contains(d.DescNote, "截断") {
+		t.Errorf("裁过却没在提醒里说（那条提醒要跟着回评出去）：%q", d.DescNote)
 	}
 
 	// 不超限：原样保留（只去首尾空白），且不该冒出"被裁了"的噪音。
 	d2 := DecideIntake(c, addBody([2]string{issue.LabelDesc, "  去广告的第三方客户端  "}))
-	mustPending(t, d2)
+	mustAcceptAdd(t, d2)
 	if d2.Source.Desc != "去广告的第三方客户端" {
 		t.Fatalf("首尾空白该去掉：%q", d2.Source.Desc)
 	}
-	if strings.Contains(d2.Reply, "截断") {
-		t.Errorf("没超限却说被截断了：\n%s", d2.Reply)
+	if strings.Contains(d2.DescNote, "截断") {
+		t.Errorf("没超限却说被截断了：%q", d2.DescNote)
 	}
 
 	// 留空 = 没有简介，清单里就只有应用名，不该出现一个空的分隔符。
 	d3 := DecideIntake(c, addBody())
-	mustPending(t, d3)
+	mustAcceptAdd(t, d3)
 	if d3.Source.Desc != "" || d3.Source.DisplayName() != d3.Source.Name {
 		t.Fatalf("没填简介时不该改变显示名：desc=%q name=%q", d3.Source.Desc, d3.Source.DisplayName())
 	}
@@ -244,7 +245,7 @@ func TestDecideIntake_AddOptionalFieldsLeftBlank(t *testing.T) {
 		[2]string{issue.LabelCategories, "_No response_"},
 		[2]string{issue.LabelABIs, "_No response_"},
 	))
-	mustPending(t, d)
+	mustAcceptAdd(t, d)
 
 	s := d.Source
 	if s.Upstream.AssetPattern != "" {
@@ -257,23 +258,6 @@ func TestDecideIntake_AddOptionalFieldsLeftBlank(t *testing.T) {
 	// 被抽出来的原因（Source.Validate 会因 ID=="" 直接失败）。
 	if err := s.Upstream.Validate(); err != nil {
 		t.Fatalf("留空可选字段的申请必须仍然合法：%v", err)
-	}
-}
-
-// 同仓库已有记录时**只告警**（03 §2.6）：一个仓库合法地可以发布多个不同包名的应用，
-// 所以"同仓库已存在"不等于"重复申请"。真正的把关在解析那一步 —— 多包名会被拒。
-func TestDecideIntake_AddWarnsOnSameRepo(t *testing.T) {
-	c := ctxWith(githubSource("com.example.app"))
-	d := DecideIntake(c, addBody())
-	mustPending(t, d)
-	if !strings.Contains(d.Reply, "已经有 1 条记录指向") {
-		t.Fatalf("同仓库已有记录时应当告警：\n%s", d.Reply)
-	}
-
-	// 不同仓库时不该有这条噪音 —— 否则每张单都带它，告警就没人看了。
-	d2 := DecideIntake(c, addBody([2]string{issue.LabelRepo, "other/app"}))
-	if strings.Contains(d2.Reply, "已经有") {
-		t.Fatalf("不同仓库不该触发查重告警：\n%s", d2.Reply)
 	}
 }
 
@@ -340,7 +324,7 @@ func TestDecideIntake_DuplicateFieldFirstWins(t *testing.T) {
 		[2]string{issue.LabelRepo, "attacker/evil"},
 	)
 	d := DecideIntake(c, body)
-	mustPending(t, d)
+	mustAcceptAdd(t, d)
 	if d.Source.Upstream.Repo != "example/real" {
 		t.Fatalf("重复字段应当取第一个（用户真正填的那个）：%q", d.Source.Upstream.Repo)
 	}

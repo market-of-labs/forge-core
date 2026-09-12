@@ -15,19 +15,6 @@ import (
 	"github.com/market-of-labs/forge-core/internal/naming"
 )
 
-// 待办队列的两个标签（03 §2.6）。**issue 本身就是队列** —— 不另建数据库，
-// 标签就是状态，而"标签跳变"就是"该回评了"的信号。于是回评天然幂等：
-// 同一轮重复扫到同一张单，标签已经是目标值，就不再说话。
-const (
-	// LabelPending 已受理，等对账去上游读出 appId。
-	LabelPending = "待收录"
-	// LabelNeedInfo 解析失败或申请不合法，等申请人补完。
-	LabelNeedInfo = "待补充"
-)
-
-// queueLabels 是扫描器要认领的全部标签。
-var queueLabels = []string{LabelPending, LabelNeedInfo}
-
 // placedVersion 是搬运过程中为一个 version token 攒起来的分片。
 // 与 versionAcc 同构，但**不带 UpstreamTag** —— 手动上传没有上游 tag 可记。
 type placedVersion struct {
@@ -49,29 +36,45 @@ type placedVersion struct {
 
 // IntakeDecision 是一次申请的裁决结果。
 type IntakeDecision struct {
-	// Kind 是判定出来的申请类型，供调用方分流（只有新增单会被挂进待办队列）。
+	// Kind 是判定出来的申请类型，供调用方分流：新增单的身份要联网才定得出来，
+	// 所以它走的是一条比变更单长得多的链（见 newsource.go）。
 	Kind issue.Kind
 	// Accept 为真时 Source/Delete 有意义；为假时 Reply 是拒绝理由。
 	Accept bool
-	// Pending 为真表示"已受理，但身份还没定"：**不写文件、不关单**，
-	// 只打上待收录标签，等对账阶段去上游读出 appId（03 §2.6）。
-	Pending bool
-	// Hold 为真表示"本单留在打开状态等下一轮重评"，不关单。
+	// Hold 为真表示"本单要留在打开状态"，不关单。
 	//
-	// 新增单**一律**为真：它成败都在下一轮对账才见分晓，而 issue 本身就是队列
-	// （不另建数据库）。变更为假 —— 它是即时的，留一张没人再看第二眼的单只是噪音。
+	// 新增单**一律**为真：裁决只是那条链的第一段，成不成要等身份定出来才知道。
+	// 链走完且落了盘才关单（announceLanded），没走完就留开 —— 而"单开着"正是重试的
+	// 全部实现：申请人改完正文（store 侧监听 `issues[edited]`）整条链重新发车。
+	// 变更为假 —— 它是即时的，留一张没人再看第二眼的单只是噪音。
 	Hold bool
 	// Reply 是回评正文，成功与拒绝都要写清原因（§2.5 规则 6）。
+	//
+	// **被接受的新增单这里为空**：要回评的那些字段（包名、显示名、作者）此刻还不存在，
+	// 得等身份探出来 —— 那段话由 landedReply 生成。所以裁决阶段确实无话可说。
 	Reply string
+	// DescNote 是一句要带给申请人的提醒，由 landedReply 拼在回评末尾。
+	//
+	// 现在唯一的产出者是 decideAdd 的**截断告知**：简介被裁过就必须说（见那里的注释）。
+	// 它不能塞进 Reply（被接受的新增单 Reply 为空），也不能等落盘后再算 ——
+	// 原始正文只在这一个函数里出现过，落到 model.Source 上的已经是裁完的值。
+	DescNote string
 	// Source 是要写入的**完整**内容。注意它是"改完之后的整份"，不是补丁 ——
 	// 补丁的写法要求每个调用点都知道"哪份文件"，而 §2.5 规则 2 要的语义
 	// （只改申请涉及的字段）在 DecideIntake 里就已经兑现了：它是**从当前文件
 	// 复制一份再改**，不是凭申请内容凭空造一个。
 	//
-	// Pending 为真时它是**半成品**：ID/Name/Author 都还空着，要等对账填。
+	// 新增单里它是**半成品**：ID/Name/Author 都还空着（申请人无从知道它们），
+	// 由 landNewSource 探身份之后填上。
 	Source *model.Source
 	// Delete 为真表示"移除"（§2.5 规则 4：移除 = 删掉该文件）。
 	Delete bool
+	// Committed 是跑完之后才填的：这一次到底有没有真的提交。
+	//
+	// 裁决阶段必然为假 —— 那时候还什么都没写。它由 IntakeIssue 填，因为"提交了没有"
+	// 只有真正落盘的那几步知道（内容没变时 CommitBack 会安静地不提交），
+	// 而调用方（`handle-dispatch` 的摘要行）只能从裁决结果上读。
+	Committed bool
 	// Summary 一行摘要，给日志与提交信息用。
 	Summary string
 }
@@ -79,8 +82,9 @@ type IntakeDecision struct {
 // DecideIntake 解析 issue 正文并给出裁决。**纯函数**：同样的 (sources, body) 必然
 // 得到同样的结论，不发一个请求、不写一个字节。
 //
-// 对账阶段的待办扫描也复用它（见 pending.go）—— 申请人改完正文、或在评论里补了正则
-// 之后，"这份申请现在合法了吗"必须有**同一个**答案，两条路径各有各的判断就会漂移。
+// 它是这条链上**唯一**判断"这份申请现在合法吗"的地方：申请人改完正文、整条链重新发车
+// 之后重跑的还是它（见 newsource.go）。另写一套判断就会漂移，而漂移的后果是同一份正文
+// 在两个时刻得到两个互相矛盾的结论。
 func DecideIntake(c *Ctx, body string) *IntakeDecision {
 	f := issue.Parse(body)
 
@@ -100,14 +104,23 @@ func DecideIntake(c *Ctx, body string) *IntakeDecision {
 	}
 	d := decideChange(c, f)
 	d.Kind = kind
+	// 被拒的变更单也留开，与新增单同一个理由：回评里写着"改完编辑正文即可"，
+	// 而一张已经关掉的单不会再有人去动它。成功的变更单即时生效，关掉了事。
+	if !d.Accept {
+		d.Hold = true
+	}
 	return d
 }
 
 // decideAdd 裁决一份新增申请。
 //
 // **它不写文件。** 申请人填的只有 repo，appId 要从上游 APK 里读出来，而 DecideIntake
-// 是纯函数、不许联网。所以这里只做三件不需要网络的事：取值、本地校验、把申请挂进
-// 待办队列 —— 真正的解析与落盘在对账阶段（03 §2.6）。
+// 是纯函数、不许联网。所以这里只做两件不需要网络的事：取值、本地校验 —— 真正的解析与
+// 落盘紧接着在同一条链上做（见 newsource.go）。
+//
+// 这里也**不再回一段"已收到"**。那一段只是把申请人刚填的东西复述回去，而它与落盘后的
+// 「已收录」回评几乎逐行重叠 —— 一张单要读两条一样的表，还得分辨哪条是现在的。留下的
+// 那条（landedReply）是**探过身份之后**写的事实，比复述有价值。
 func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 	r, err := issue.ParseAdd(f)
 	if err != nil {
@@ -117,37 +130,24 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 		return reject(fmt.Sprintf("申请内容不合法：%v", err))
 	}
 
-	// 简介**裁而不拒**：上限 20 rune 是量出来的（见 model.MaxDescRunes），
-	// 而新增单一次往返是一天，为一个纯装饰字段让人重填不划算。
-	// 裁过就明说 —— 默默把人写的东西切掉、还回评说"已收录"，是最难发现的那种假回评。
+	// 简介**裁而不拒**：上限 20 rune 是量出来的（见 model.MaxDescRunes），为一个纯装饰
+	// 字段让人重填不值得。但**裁了就必须说** —— 默默把人写的东西切掉、再回评一句
+	// "已收录"，是最难发现的那种假回评。这句话跟着决定走到落盘后的那条回评里去。
 	desc := model.TruncateDesc(r.Desc)
 	descNote := ""
 	if desc != strings.TrimSpace(r.Desc) {
 		descNote = fmt.Sprintf(
-			"\n> ⚠️ 你填的简介超过了 %d 个字的长度上限，已**截断**为上面这个。\n"+
-				"> 它进的是 Obtainium 列表里的标题行（单行、超出即省略号），写长了显示不全。\n"+
-				"> 想换一个的话，**编辑正文**重填即可。\n",
+			"⚠️ 你填的简介超过了 %d 个字的长度上限，上面显示的是**截断**后的。"+
+				"它进的是 Obtainium 列表里的标题行（单行、超出即省略号），写长了显示不全；"+
+				"想换一个的话，**编辑正文**重填即可。\n\n",
 			model.MaxDescRunes)
-	}
-
-	// 按 repo 反查查重。**只告警、不拒绝**：一个仓库合法地可以发布多个不同包名的
-	// 应用（那时每一条都得各自带 assetPattern 消歧），所以"同仓库已存在"不等于
-	// "重复申请"。真正的把关在解析那一步 —— 多包名会被拒。
-	dup := ""
-	if same := c.SourcesByRepo(r.Repo); len(same) > 0 {
-		dup = fmt.Sprintf(
-			"\n> ⚠️ `sources/` 里已经有 %d 条记录指向 `%s`（`%s`）。如果这个仓库确实发布"+
-				"多个**不同包名**的应用，请忽略这条；否则这可能是重复申请，解析出来的"+
-				"appId 已存在时会被拒。\n",
-			len(same), r.Repo, same[0].ID)
 	}
 
 	return &IntakeDecision{
 		Accept:  true,
-		Pending: true,
-		Summary: fmt.Sprintf("登记 %s", r.Repo),
+		Summary: fmt.Sprintf("新增 %s", r.Repo),
 		// 此刻还没有 appId，所以 Source 只填得出上游那半边。ID/Name/Author
-		// 由对账阶段的 probe 填（它们是从 APK 与仓库里读出来的，不是猜的）。
+		// 由 landNewSource 探身份时填（它们是从 APK 与仓库里读出来的，不是猜的）。
 		Source: &model.Source{
 			Source: model.SourceGitHub,
 			Upstream: &model.Upstream{
@@ -159,24 +159,7 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 			ABIWhitelist: r.ABIWhitelist,
 			Desc:         desc,
 		},
-		Reply: fmt.Sprintf(
-			"已收到，登记为**待收录**。\n\n"+
-				"| 字段 | 值 |\n|---|---|\n"+
-				"| 上游仓库 | `%s` |\n| 资产正则 | `%s` |\n"+
-				"| 一句话简介 | %s |\n"+
-				"| 分类标签 | %s |\n| 只镜像 ABI | %s |\n"+
-				"%s%s\n"+
-				"下一轮对账会去上游取**当前最新**的 APK，从包里读出包名与显示名，"+
-				"然后写入 `sources/` 并回评给你核对。\n\n"+
-				"⚠️ 仓库填错的话会**静默收错应用**，所以那条回评请务必看一眼。\n\n"+
-				"本单保持打开，解析成功后自动关闭；被拒了会写明原因，"+
-				"按回评说的改完**编辑正文**即可，不用重开单。",
-			r.Repo,
-			orDefault(r.AssetPattern, DefaultAssetPatternNote),
-			orDefault(desc, "未填"),
-			orDefault(strings.Join(r.Categories, " / "), "未勾选"),
-			orDefault(strings.Join(r.ABIWhitelist, " / "), "全部"),
-			dup, descNote),
+		DescNote: descNote,
 	}
 }
 
@@ -358,7 +341,7 @@ func reject(reason string) *IntakeDecision {
 // 新增单被留开（`Hold`），所以这里说的是"编辑正文"，**不是**"重开一张" ——
 // 让申请人重开一张会把同一件事变成两条挂着的单，而旧的这条还得有人去关。
 const retryHint = "**这张单会保持打开。** 改好后直接**编辑正文**（右上角 `...` → Edit），" +
-	"下一轮对账会重新评估，不用重开一张。\n" +
+	"整条链会重新发车，不用重开一张。\n" +
 	"如果你认为这个判断不对，直接在这里回一句，或者找维护者。"
 
 // DefaultAssetPatternNote 是回评里展示默认正则用的占位文本（与 upstream 的默认值一致）。
@@ -376,6 +359,8 @@ func orDefault(s, def string) string {
 
 // IntakeIssue 是 `intake-issue` 动词：拉 issue → 裁决 → 落盘 → 回评 → 关单。
 //
+// 返回的第二个值是新增单那一次单项目同步的结果（变更单恒为 nil）。
+//
 // # 顺序是刻意的：先落盘并推送，再回评
 //
 // 如果反过来（先回评"已收录"再推送），推送失败时 issue 上留着一句假话，
@@ -385,53 +370,55 @@ func orDefault(s, def string) string {
 //
 // **已经关闭的 issue 直接跳过**：dispatch 可能因为 edit 之类的原因重复送达，
 // 重复回评+重复写入是没必要的噪音。
-func IntakeIssue(ctx context.Context, c *Ctx, number int) (*IntakeDecision, error) {
+func IntakeIssue(ctx context.Context, c *Ctx, number int) (*IntakeDecision, *ReconcileResult, error) {
 	if err := c.Env.RequireToken("处理 issue"); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	is, err := c.GH.GetIssue(ctx, c.Env.StoreRepo, number)
 	if err != nil {
-		return nil, fmt.Errorf("读 issue #%d：%w", number, err)
+		return nil, nil, fmt.Errorf("读 issue #%d：%w", number, err)
 	}
 	if is.PullRequest != nil {
 		// PR 也会出现在 issues 端点里，而它的"正文"是代码 diff，不是申请。
 		c.Log("issue #%d 其实是个 PR，跳过", number)
-		return nil, nil
+		return nil, nil, nil
 	}
 	if is.State == "closed" {
 		c.Log("issue #%d 已关闭，跳过（幂等）", number)
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// issue 正文是**不可信输入**，DecideIntake 是纯函数，这里之前没有任何 IO 副作用。
 	d := DecideIntake(c, is.Body)
 
 	switch {
-	case d.Pending:
-		// 登记：打「待收录」标签 + 回评，**不写文件、不关单**。
-		// issue 自己就是待办队列，对账阶段会来认领（见 pending.go）。
-		if err := c.GH.AddLabels(ctx, c.Env.StoreRepo, number, LabelPending); err != nil {
-			return d, fmt.Errorf("给 issue #%d 打标签：%w", number, err)
-		}
-		c.Log("#%d 登记为待收录（未写文件，等对账解析）", number)
+	case d.Kind == issue.KindAdd && d.Accept:
+		// 新增单：整条链在这里跑完 —— 探身份 → 落盘 → 同步这一个应用 → 回评 → 关单。
+		// 它自己负责收尾，所以这一支直接返回，下面那套"回评 + 按 Hold 关单"的通用
+		// 收尾只服务变更单与被拒的申请（见 newsource.go）。
+		r, err := c.intakeNewSource(ctx, *is, d)
+		return d, r, err
 
 	case d.Accept:
+		// 变更单（改元数据 / 暂停 / 移除）：即时生效，当场落盘提交。
 		if d.Delete {
 			if err := c.Repo.DeleteSource(d.Source.ID); err != nil {
-				return d, fmt.Errorf("删除 sources/%s.json：%w", d.Source.ID, err)
+				return d, nil, fmt.Errorf("删除 sources/%s.json：%w", d.Source.ID, err)
 			}
 			c.Log("#%d 移除 sources/%s.json", number, d.Source.ID)
 		} else {
 			if err := c.Repo.WriteSource(d.Source); err != nil {
-				return d, fmt.Errorf("写 sources/%s.json：%w", d.Source.ID, err)
+				return d, nil, fmt.Errorf("写 sources/%s.json：%w", d.Source.ID, err)
 			}
 			c.Log("#%d 写入 sources/%s.json：%s", number, d.Source.ID, d.Summary)
 		}
 		// 只提交本次改动涉及的路径（CommitBack 内部固定暂存范围），
 		// 并且**提交信息里带上 issue 号**：回看 store 历史时能直接对上。
-		if _, err := c.CommitBack(ctx, fmt.Sprintf("%s（#%d）", d.Summary, number)); err != nil {
-			return d, err
+		committed, err := c.CommitBack(ctx, fmt.Sprintf("%s（#%d）", d.Summary, number))
+		d.Committed = committed
+		if err != nil {
+			return d, nil, err
 		}
 
 	default:
@@ -439,19 +426,19 @@ func IntakeIssue(ctx context.Context, c *Ctx, number int) (*IntakeDecision, erro
 	}
 
 	// 回评是**无条件**的（§2.5 规则 6：拒绝也要写清原因）。
-	// 而关单跳变才发生 —— 见上面 Hold 的说明。
+	// 而关单跳变才发生 —— 见 Hold 的说明。
 	if err := c.GH.CommentIssue(ctx, c.Env.StoreRepo, number, d.Reply); err != nil {
-		return d, fmt.Errorf("回评 issue #%d：%w", number, err)
+		return d, nil, fmt.Errorf("回评 issue #%d：%w", number, err)
 	}
 	if d.Hold {
-		c.Log("#%d 回评并留开（等下一轮重评）", number)
-		return d, nil
+		c.Log("#%d 回评并留开（改完正文会重新发车）", number)
+		return d, nil, nil
 	}
 	if err := c.GH.CloseIssue(ctx, c.Env.StoreRepo, number); err != nil {
-		return d, fmt.Errorf("关闭 issue #%d：%w", number, err)
+		return d, nil, fmt.Errorf("关闭 issue #%d：%w", number, err)
 	}
 	c.Log("#%d 回评并关闭", number)
-	return d, nil
+	return d, nil, nil
 }
 
 // ---- intake-incoming：_incoming → 正式 Release（03 §3.2 / §4.6） -------------

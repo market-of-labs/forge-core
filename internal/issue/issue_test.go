@@ -180,16 +180,6 @@ func TestNoResponseIsEmpty(t *testing.T) {
 	}
 }
 
-func TestListSplitsBothCommaStyles(t *testing.T) {
-	// List 仍然被变更单之外的地方用着（下一行那个手工正文的场景）。
-	// 全角逗号、顿号、分号都要能分隔：中文输入法下这几个人人都会打出来。
-	f2 := issue.Parse("### 分类标签（可选）\n\n工具，效率、网络;测试\n")
-	got2 := f2.List(issue.LabelCategories)
-	if len(got2) != 4 {
-		t.Errorf("混用分隔符时 categories = %v，期望 4 项", got2)
-	}
-}
-
 func TestParseChangePauseLeavesFieldsNil(t *testing.T) {
 	f := issue.Parse(changeBody)
 	r, err := issue.ParseChange(f)
@@ -290,9 +280,9 @@ ImranR98/Obtainium
 	}
 }
 
-func TestDuplicateLabelIsReported(t *testing.T) {
-	// 有人在正文里手工插了一段重复字段。取第一个（模板渲染的那个），
-	// 但要把这件事报到 Duplicates 上，由上层决定是否拒绝。
+func TestDuplicateLabelTakesFirst(t *testing.T) {
+	// 有人在正文里手工插了一段重复字段。取值必须是**确定**的：取模板渲染的那个
+	// （也就是维护者在渲染出来的正文里最先看到的那个），而不是后面那个。
 	body := `### 上游 GitHub 仓库
 
 real/app
@@ -301,12 +291,8 @@ real/app
 
 evil/app
 `
-	f := issue.Parse(body)
-	if got := f.Get(issue.LabelRepo); got != "real/app" {
+	if got := issue.Parse(body).Get(issue.LabelRepo); got != "real/app" {
 		t.Errorf("重复字段应当取第一个，得到 %q", got)
-	}
-	if len(f.Duplicates) != 1 || f.Duplicates[0] != issue.LabelRepo {
-		t.Errorf("Duplicates = %v", f.Duplicates)
 	}
 }
 

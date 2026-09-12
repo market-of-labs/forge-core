@@ -23,16 +23,26 @@ type ReconcileResult struct {
 	Plans    int
 	Uploaded int
 	Skipped  int
+	// Failed 是"想镜像但出错了"的应用个数。它存在的唯一理由是：**容忍之后这一轮是绿的**
+	// （见 MirrorUpstream），摘要行就成了"这一轮是不是全都镜像成了"唯一的一眼可见处。
+	Failed   int
 	Commited bool
 	Report   *model.Report
-	// PendingLanded 是本轮从待办 issue 里收录进来的 appId（03 §2.6 拍 2）。
-	PendingLanded []string
 }
 
 // Reconcile 是 03 §4.4 的幂等全量对账，也是**唯一的"日常收敛"入口**。
 //
 // 它把 §4.4 的四步串起来：解析上游 → 镜像缺失版本 → 重建清单与索引 → 回写。
-// `handle-dispatch` 的 push / workflow_dispatch 分支最终都调它，区别只在 OnlyID。
+// `handle-dispatch` 的 push / workflow_dispatch 分支最终都调它，区别只在 OnlyID；
+// `issues` 分支在收录完一张新增单之后也调它一次 —— 那次只带刚收录的那一个 appId，
+// 好让新应用在设备端"一分钟内可装"，而不是等到明天。
+//
+// # 它只做这一件事
+//
+// 它**不扫 issue、不认领待办**。以前有过这样的第 0 步（扫「待收录 / 待补充」标签的单），
+// 已经删掉了：新增单现在在它自己的 issue 事件里一路跑完（见 newsource.go），而**落盘之后**
+// 的重试本来就由下面的幂等性兜着，跟队列无关。于是每日 cron 的全部语义就是标题那句话 ——
+// 扫 `sources/` 里需要自动更新的源。
 //
 // # 幂等 = 漏跑自愈
 //
@@ -59,36 +69,6 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 	// （BuildIndex 只对 VersionName 为空的版本下载），所以宁可开。
 	hadIndex := len(c.Index.Apps) > 0
 
-	// 0 步：先把待办 issue 里已经能定出身份的申请落成 sources（03 §2.6 拍 2）。
-	//
-	// **必须在镜像之前**：这一轮的镜像要顺手把刚收录的应用的最新版本拉进来。
-	// 放到后面的话，一个申请人今天通过的应用要等到明天的 cron 才有版本 ——
-	// 而在设备端"点不动"的那一天里，没人知道该怪谁。
-	//
-	// 两个门槛：
-	//   DryRun    —— 扫描器写文件、提交、回评、关单，dry-run 一件都不能做。
-	//   OnlyID    —— 带 OnlyID 的对账语义是"只收敛这一个 appId"（一次 push 触发的），
-	//                把整条待办队列拉进来会把一次局部的收敛变成一次全局动作。
-	//                全量路径（cron / workflow_dispatch / push 退化）才是收单的地方。
-	if !opts.DryRun && opts.OnlyID == "" {
-		pr, err := ScanPendingIssues(ctx, c)
-		if err != nil {
-			// 扫描失败**不阻断镜像**：待办队列是"迟早要收的单"，而镜像的是
-			// sources 里已有的应用 —— 后者是设备端已经在用的东西，不能因为
-			// 一张新单扫不动就停摆。
-			c.Log("扫待办 issue 失败，本轮跳过（不影响镜像）：%v", err)
-		} else {
-			res.PendingLanded = pr.Landed
-			if len(pr.Landed) > 0 {
-				// 刚落了文件，内存里那份 c.Sources 已经过期。不重载的话
-				// 下面这一步会看不见新来源 —— 正是上面说的"点不动的那一天"。
-				if err := c.Load(); err != nil {
-					return res, fmt.Errorf("收录后重载工作副本：%w", err)
-				}
-			}
-		}
-	}
-
 	// 1–3 步：解析 + 镜像。
 	plans, rep, err := ResolveUpstream(ctx, c, ResolveOptions{OnlyID: opts.OnlyID})
 	if err != nil {
@@ -107,7 +87,7 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 				return res, err
 			}
 			res.Report.Addf("", mr.Problems)
-			res.Uploaded, res.Skipped = mr.Uploaded, mr.Skipped
+			res.Uploaded, res.Skipped, res.Failed = mr.Uploaded, mr.Skipped, mr.Failed
 		}
 	}
 
@@ -222,7 +202,7 @@ type DispatchResult struct {
 //
 // 四个分支：
 //
-//	issues            → 处理 issue（§2.5 入口乙）
+//	issues            → 处理 issue（§2.5 入口乙）：新增单**当场**收录并只同步它自己
 //	release           → 过 §4.6 闸门后搬 _incoming（§3.2）
 //	push              → 只对该 appId 收敛（§4.3）
 //	workflow_dispatch → 全量对账（同 §4.4）
@@ -237,12 +217,12 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 			// 猜一个号比报错危险得多（可能去改一张无关的单）。
 			return res, fmt.Errorf("event=issues 但 client_payload.issue 是 %d，无法定位 issue", c.Env.Issue)
 		}
-		d, err := IntakeIssue(ctx, c, res.IssueNo)
-		res.Intake = d
+		// 整条链（新增单含落盘与单项目同步）在 IntakeIssue 里一次跑完，
+		// 提交与否也随之确定：变更单看 CommitBack 的返回，新增单看落盘与后续同步的或。
+		d, r, err := IntakeIssue(ctx, c, res.IssueNo)
+		res.Intake, res.Reconcile = d, r
 		if d != nil {
-			// IntakeIssue 内部已经提交过了。Pending 的单没写文件、也就没提交 ——
-			// 那不是失败，是 §2.6 的正常路径（只登记而已）。
-			res.Commited = d.Accept && !d.Pending
+			res.Commited = d.Committed
 		}
 		return res, err
 

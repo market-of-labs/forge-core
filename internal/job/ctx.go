@@ -148,23 +148,6 @@ func (c *Ctx) Source(id string) *model.Source {
 	return nil
 }
 
-// SourcesByRepo 反查所有指向同一个上游仓库的来源。
-//
-// 用 EqualFold：GitHub 的 owner/repo **不区分大小写**，而申请人打的是
-// "imranr98/obtainium" 还是 "ImranR98/Obtainium" 是随手的。不折叠的话查重会漏。
-//
-// 只用于**告警**（03 §2.6）：一个仓库合法地可以发布多个不同包名的应用。
-func (c *Ctx) SourcesByRepo(repo string) []*model.Source {
-	var out []*model.Source
-	for i := range c.Sources {
-		u := c.Sources[i].Upstream
-		if u != nil && strings.EqualFold(u.Repo, repo) {
-			out = append(out, &c.Sources[i])
-		}
-	}
-	return out
-}
-
 // ---- 回写 -------------------------------------------------------------------
 
 // TrackedPaths 是 forge 允许回写的**全部**路径（03 §5.5：commit-back 是唯一出口）。

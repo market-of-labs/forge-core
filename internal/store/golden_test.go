@@ -18,8 +18,13 @@ import (
 func storeRoot(t *testing.T) string {
 	t.Helper()
 	root := filepath.Join("..", "..", "..", "store")
-	if _, err := os.Stat(filepath.Join(root, "apps.json")); err != nil {
+	if _, err := os.Stat(root); err != nil {
 		t.Skipf("同级没有 store 仓库（%s）——跳过黄金测试", root)
+	}
+	// 仓库在、但还没有清单：那是**空仓库**（种子数据清空之后、第一条落进来之前），
+	// 与"没有 store 仓库"是两回事 —— 分开报，否则这句跳过信息会让人去查路径。
+	if _, err := os.Stat(filepath.Join(root, "apps.json")); err != nil {
+		t.Skipf("store 仓库里还没有 apps.json（空仓库）——跳过黄金测试")
 	}
 	return root
 }

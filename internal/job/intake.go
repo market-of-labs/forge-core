@@ -677,6 +677,15 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 	if isNotFound(err) {
 		// 暂存 Release 不存在：通常是把 tag 打错了，或者还没建。
 		// 不自动建 —— 一个空的 draft 建出来只会掩盖"你其实传到了别处"这个事实。
+		//
+		// ⚠️ 上面这行 by-tag 取有个**反直觉的前提**：`/releases/tags/{tag}` 的官方描述是
+		// 「Get a **published** release with the specified tag」—— draft 一律 404（draft
+		// 还没有真 tag，GitHub 把它挂在 untagged-* 引用下）。这里能这么写，是因为本函数
+		// 只从 `published` 事件那条路来（HandleDispatch 的 release 分支）：事件那一刻队列
+		// 恰好是 published，取得到；之后才被 cleanIncoming 改回 draft。
+		// 于是「队列静止时（= draft，那是它的常态）手工跑一次 intake-incoming」会落到
+		// 这句话上 —— 那时该做的是**重新 Publish 一次队列**（或重跑一次上传 CI，它会
+		// 先复位回 draft 再发一次真实跃迁），不是把这里改成"顺手兼容 draft"。
 		c.Log("`%s` Release 不存在。若刚上传过 APK，请确认传进的是 tag 为 `%s` 的 **draft** Release（03 §3.2）",
 			model.IncomingTag, model.IncomingTag)
 		return res, nil

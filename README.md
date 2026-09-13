@@ -21,9 +21,9 @@
 
 ```
 issues            → 解析 issue 正文 → 校验 → 写 sources/{appId}.json → 回评并关闭
-release           → 过 §4.6 闸门 → 搬 _incoming 的 APK 到正式 Release → 清场
+intake-incoming   → 搬 _incoming 的 APK 到正式 Release → 清场（人点手动按钮，或 CI 发信标）
 push              → 只对该 appId 收敛一次（解析上游 → 镜像 → 重建清单）
-workflow_dispatch → 全量对账（同下）
+workflow_dispatch → 全量对账（同下；手动按钮的另一个选项 reconcile 走同一条路）
 schedule（每日）   → 全量对账：解析上游 → 补齐缺失版本 → 重建 index 与清单 → 自检 → 回写
 ```
 
@@ -56,7 +56,7 @@ go test ./...
 | `FORGE_REPO` | 公有的**运行器**仓库 `owner/name`，默认 `market-of-labs/forge` |
 | `STORE_DIR` | 一个**已经 checkout 好**的 store 工作副本。留空则自己浅克隆到临时目录（用完删掉） |
 | `FORGE_API_BASE` | API 根地址。Actions 里自动用 `$GITHUB_API_URL` |
-| `EVENT` `ISSUE` `RELEASE_TAG` `PRERELEASE` `SHA` `REF` | `client_payload` 带过来的事件字段 |
+| `EVENT` `ISSUE` `SHA` `REF` | 事件字段（03 §2.6）。手动按钮走 `EVENT`（值就是 `verb`），没有 `client_payload` |
 
 `STORE_DIR` 那一条是给本地调试用的：指一个你的真实工作副本，动词就会直接改它，
 不克隆也不删（`Close` 对"调用方给的副本"什么都不做 —— 那可能是你的工作区）。
@@ -67,7 +67,7 @@ go test ./...
 |---|---|
 | `handle-dispatch` | 按 `$EVENT` 分派（CI 的入口） |
 | `intake-issue` | `-issue N` 处理一张申请单 |
-| `intake-incoming` | 搬 `_incoming` 并清场（`-force` 跳过闸门，只给本地调试） |
+| `intake-incoming` | 搬 `_incoming` 并清场。**没有闸门** —— 这条路只有人主动叫才会走到（D53） |
 | `resolve-upstream` | `-only ID` 只算出该镜像哪些版本并打印计划，**不下载不上传** |
 | `mirror-upstream` | `-only ID` `-dry-run` 下载 → 按内容判 ABI → 改名 → 幂等上传 |
 | `build-index` | `-fetch-missing` 从 Release 现状重建各 `sources/` 条目的 `versions` 账本 |
@@ -174,7 +174,7 @@ go test ./...
 
 纯逻辑那几个包（`naming` / `apkmeta` / `model` / `issue` / `upstream` / `manifest`）
 都是无 IO 的，测试直接调用。`job` 里被重点覆盖的是**判断**那部分
-（`DecideIntake` / `pickTargets` / `CheckIncomingGate`）—— 它们同样是纯函数，
+（`DecideIntake` / `pickTargets`）—— 它们同样是纯函数，
 把最难的那部分（该不该做）从网络那部分（怎么做）里切了出来。
 
 ---

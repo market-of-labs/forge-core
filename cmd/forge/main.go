@@ -119,21 +119,9 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 		return exitFailed, err
 
 	case "intake-incoming":
-		fs := newFlagSet(verb)
-		force := fs.Bool("force", false, "跳过 §4.6 闸门（本地调试用；CI 里绝不要加）")
-		if err := fs.Parse(args); err != nil {
-			return exitUsage, err
-		}
-		if !*force {
-			if err := job.CheckIncomingGate(c.Env); err != nil {
-				// 闸门拦住**不是错误**：store 的 forward.yml 转发所有 published
-				// 事件，所以"收到一个不该处理的 release"是正常流量，安静退出。
-				log("%v", err)
-				return exitOK, nil
-			}
-		} else {
-			log("⚠️ -force：跳过了 §4.6 闸门")
-		}
+		// 手动搬一次 §3.2 的队列。**没有闸门要过**：这条路只有人主动叫才会走到 ——
+		// 点 Actions 页的按钮，或 store 侧上传 CI 发信标（见 HandleDispatch 同名分支）。
+		// 从前那个 `release: published` 事件流需要筛，现在不存在了，闸门也就跟着没了。
 		inc, err := job.IntakeIncoming(ctx, c)
 		if err != nil {
 			return exitFailed, err
@@ -302,7 +290,7 @@ func usage() {
 	fmt.Fprintf(w, "  FORGE_REPO          forge 仓库 owner/name（默认 %s）\n", job.DefaultForgeRepo)
 	fmt.Fprintf(w, "  STORE_DIR           已 checkout 的 store 工作副本；为空则自己浅克隆到临时目录\n")
 	fmt.Fprintf(w, "  FORGE_API_BASE      API 根地址（默认 %s；Actions 里自动取 $GITHUB_API_URL）\n", job.DefaultAPIBase)
-	fmt.Fprintf(w, "  EVENT / ISSUE / RELEASE_TAG / PRERELEASE / SHA / REF\n")
-	fmt.Fprintf(w, "                      repository_dispatch 带过来的事件字段（03 §2.6）\n")
+	fmt.Fprintf(w, "  EVENT / ISSUE / SHA / REF\n")
+	fmt.Fprintf(w, "                      事件字段（03 §2.6）；手动按钮走 EVENT\n")
 	fmt.Fprintf(w, "\n退出码：0 成功 · 1 执行失败 · 2 用法或配置错误 · 3 自检发现硬错误\n")
 }

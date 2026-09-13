@@ -507,23 +507,28 @@ func IntakeIssue(ctx context.Context, c *Ctx, number int) (*IntakeDecision, *Rec
 
 // ---- intake-incoming：_incoming → 正式 Release（03 §3.2 / §4.6） -------------
 
-// CheckIncomingGate 是 §4.6 的闸门（规则 2）：只有 `_incoming` 的**正式**发布才发车。
+// incomingRelease 找到 `_incoming` 队列，没有则返回 (nil, nil)。
 //
-// 放在下载之前：一次误发布（比如你 Publish 了某个 App 的正式 Release）不该
-// 在花掉几十 MB 流量之后才被拒绝。
-func CheckIncomingGate(env *Env) error {
-	if env.ReleaseTag != model.IncomingTag {
-		// 上游 store 的 forward.yml 转发的是**所有** published 事件（它故意不筛，
-		// 因为筛选逻辑属于 forge 的职责），所以这里必须自己判断。
-		return fmt.Errorf("release tag 是 %q，不是 %q —— 不是暂存队列的发布，忽略",
-			env.ReleaseTag, model.IncomingTag)
+// ⚠️ **不能**用 `/releases/tags/_incoming` 取。那个端点的官方描述是「Get a
+// **published** release with the specified tag」—— draft 一律 404（draft 还没有真
+// tag，GitHub 把它挂在 untagged-* 引用下）。而队列的常态**就是** draft（§3.2：
+// 上传与搬运都不经过"发布"这个动作），所以 by-tag 取到的永远是 404。
+//
+// 改用列表筛 tag_name：有 push 权限的身份调这个列表会**同时拿到 draft 与已发布**的
+// Release，于是队列在哪个状态都找得到 —— 这正是要的：状态不该决定能不能搬运。
+// 分页不能省（ListReleases 里已按 per_page=100 翻页）：Release 数随收录数增长，
+// 越过一页之后队列会被挤出去，症状是静默的「store 里没有 _incoming」。
+func (c *Ctx) incomingRelease(ctx context.Context) (*gh.Release, error) {
+	rels, err := c.GH.ListReleases(ctx, c.Env.StoreRepo)
+	if err != nil {
+		return nil, fmt.Errorf("列 %s 的 Release：%w", c.Env.StoreRepo, err)
 	}
-	if env.Prerelease {
-		// `published` 对预发布**同样触发**。预发布是"还没准备好"的意思，
-		// 不该被搬运（规则 2）。
-		return fmt.Errorf("%s 这次是 prerelease —— 预发布不搬运（规则 2）", model.IncomingTag)
+	for i := range rels {
+		if rels[i].TagName == model.IncomingTag {
+			return &rels[i], nil
+		}
 	}
-	return nil
+	return nil, nil
 }
 
 // IncomingResult 是一次 _incoming 搬运的结果。
@@ -535,6 +540,14 @@ type IncomingResult struct {
 }
 
 // IntakeIncoming 搬 `_incoming` 的 asset 到各自的正式 Release，然后清场。
+//
+// # 谁来叫它
+//
+// **显式触发，没有"自动"这回事**（§3.2）：人传完文件点一次手动按钮（或让 CI 发一个
+// repository_dispatch）。队列**不经过"发布"这个动作** —— 它是常驻 draft，而 draft
+// 不会产生任何 `release` 事件，往它上传/改名/删 asset 也不产生（§3.3）。所以
+// "上传之后什么都没发生"是**设计**，不是故障；这一节存在的意义就是把这句话钉在
+// 读代码的人眼前，免得下一个人又去接一个永远不会响的钩子。
 //
 // # ABI 与版本号一律来自 APK 内容
 //
@@ -560,48 +573,34 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 	}
 	res := &IncomingResult{}
 
-	rel, err := c.GH.GetRelease(ctx, c.Env.StoreRepo, model.IncomingTag)
-	if isNotFound(err) {
-		// 暂存 Release 不存在：通常是把 tag 打错了，或者还没建。
+	rel, err := c.incomingRelease(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if rel == nil {
+		// 队列不存在：通常是把 tag 打错了，或者还没建。
 		// 不自动建 —— 一个空的 draft 建出来只会掩盖"你其实传到了别处"这个事实。
-		//
-		// ⚠️ 上面这行 by-tag 取有个**反直觉的前提**：`/releases/tags/{tag}` 的官方描述是
-		// 「Get a **published** release with the specified tag」—— draft 一律 404（draft
-		// 还没有真 tag，GitHub 把它挂在 untagged-* 引用下）。这里能这么写，是因为本函数
-		// 只从 `published` 事件那条路来（HandleDispatch 的 release 分支）：事件那一刻队列
-		// 恰好是 published，取得到；之后才被 cleanIncoming 改回 draft。
-		// 于是「队列静止时（= draft，那是它的常态）手工跑一次 intake-incoming」会落到
-		// 这句话上 —— 那时该做的是**重新 Publish 一次队列**（或重跑一次上传 CI，它会
-		// 先复位回 draft 再发一次真实跃迁），不是把这里改成"顺手兼容 draft"。
-		c.Log("`%s` Release 不存在。若刚上传过 APK，请确认传进的是 tag 为 `%s` 的 **draft** Release（03 §3.2）",
-			model.IncomingTag, model.IncomingTag)
+		c.Log("store 里没有 tag 为 `%s` 的 Release（03 §3.2：它是常驻队列，不自动建）",
+			model.IncomingTag)
 		return res, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("读 %s Release：%w", model.IncomingTag, err)
-	}
 
-	// 复位是**退出时的无条件动作**，不是"搬成功之后再做的一件事"（§3.2 / 规则 6）。
-	// 从读到这个 published 队列的那一刻起，无论从哪条路出去 —— 空队列、白名单拒绝、
-	// 全被保留、中途某个 API 报错 —— 队列都必须回到 draft。
+	// 清场是**退出时的无条件动作**，不是"搬成功之后再做的一件事"（§3.2 / 规则 6）。
+	// 无论从哪条路出去 —— 空队列、白名单拒绝、全被保留、中途某个 API 报错 ——
+	// 队列都要被留在"干净且仍是 draft"的样子。逐个 return 去补一定会漏一个出口，
+	// 所以由 defer 统一兜住。
 	//
-	// ⚠️ 少复位一次就**死锁**，而且死得静悄悄：published 的 Release 在网页上只有
-	// Update / Delete、**没有 Publish 按钮**，往它上传 APK 又不触发任何事件（§3.3）。
-	// 用户修好包名、重新上传、然后对着一个再也按不动的 Publish 发呆 —— 这一整类
-	// 卡死都是一个漏掉的出口造出来的，所以它由 defer 统一兜住，而不是逐个 return 补。
-	//
-	// 顺序上"先改 draft 再删 asset"：删到一半失败时，剩下的 asset 不会因为一次
-	// 误 Publish 而被重新解析。
+	// 顺序上"先确保 draft 再删 asset"：删到一半失败时，队列已经是干净状态了。
 	var movedIDs []int64
 	defer func() {
-		// 收尾要给足机会：ctx 可能已经超时/被取消，而队列复位恰恰是那时最要紧的
-		// 一件事 —— 用一个不受取消影响的 ctx 去发这一步。
+		// 收尾要给足机会：ctx 可能已经超时/被取消，而这一步恰恰是那时最要紧的
+		// 一件事 —— 用一个不受取消影响的 ctx 去发它。
 		cctx := context.WithoutCancel(ctx)
 		if err := c.cleanIncoming(cctx, rel, movedIDs, len(res.Kept)); err != nil {
 			// 不复写返回值：真正的原因（上面那个 err）比收尾失败更重要，别把它盖掉。
-			// 但必须吼出来，并把手工出路写在脸上 —— 这一步失败就是上面那个死锁。
-			c.Log("⚠️ `%s` 复位回 draft 失败：%v —— 请手动 Edit → Convert to draft，"+
-				"否则之后上传的 APK 不会触发任何流程（03 §3.2）", model.IncomingTag, err)
+			// 但必须吼出来，并把手工出路写在脸上。
+			c.Log("⚠️ `%s` 清场失败：%v —— 请手动把队列改回 draft 并删掉已搬走的 asset（03 §3.2）",
+				model.IncomingTag, err)
 			return
 		}
 		res.Cleaned = true
@@ -612,11 +611,8 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 		return nil, fmt.Errorf("列 %s 的 asset：%w", model.IncomingTag, err)
 	}
 	if len(assets) == 0 {
-		// 规则 3：空队列没有可搬的东西。这是重复 Publish 最常见的样子 ——
-		// 但"没有可搬的"不等于"可以什么都不做"：**此刻队列是 published 的**
-		// （能从 tag 读回来就说明如此），而 published 的 Release 在网页上
-		// **没有 Publish 按钮**，往它上面传 APK 又不触发任何事件（§3.3）。
-		// 所以照样要复位 —— 下面那个 defer 兜着，这里不用再写一遍。
+		// 规则 3：空队列没有可搬的东西。点错了按钮、或上一轮刚搬完又点一次，
+		// 都会落到这里。清场仍然由下面那个 defer 做（它不区分出口）。
 		c.Log("`%s` 里没有 asset，无事可做（规则 3）", model.IncomingTag)
 		return res, nil
 	}
@@ -836,7 +832,12 @@ func (c *Ctx) moveAsset(ctx context.Context, rel *gh.Release, releaseID int64, t
 	return nil
 }
 
-// cleanIncoming 把 _incoming 改回 draft，并删掉本次已搬运的 asset。
+// cleanIncoming 把 _incoming 保持在 draft，并删掉本次已搬运的 asset。
+//
+// 那句 PATCH 现在**本不该有任何效果** —— 队列常驻 draft（§3.2）。留着它是为了把
+// 不变量自己拧住：draft Release 的编辑页上那个「Publish release」按钮一直都在，
+// 万一有人按习惯点了，下一次搬运就把它掰回来，而不是让队列悄没声地变成已发布。
+// 幂等，多余的一次 PATCH 不值一提。
 //
 // **绝不用 delete release**（规则 6）：删 Release 会让 tag 消失，
 // 而若曾开启 Immutable Releases，那个 tag 会被**永久烧毁**，再建同名会 422。
@@ -844,14 +845,14 @@ func (c *Ctx) moveAsset(ctx context.Context, rel *gh.Release, releaseID int64, t
 func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int64, keptCount int) error {
 	draft := true
 	if _, err := c.GH.UpdateRelease(ctx, c.Env.StoreRepo, rel.ID, gh.ReleasePatch{Draft: &draft}); err != nil {
-		return fmt.Errorf("把 %s 改回 draft：%w", model.IncomingTag, err)
+		return fmt.Errorf("把 %s 保持在 draft：%w", model.IncomingTag, err)
 	}
-	c.Log("`%s` 已改回 draft", model.IncomingTag)
+	c.Log("`%s` 保持在 draft", model.IncomingTag)
 
 	for _, id := range movedIDs {
 		if err := c.GH.DeleteAsset(ctx, c.Env.StoreRepo, id); err != nil {
 			// 删不掉不该让整次搬运失败：内容已经在正式 Release 里了，
-			// 剩下的是"暂存区多留了一份"，下次 Publish 时会被幂等闸门挡住（规则 3）。
+			// 剩下的是"暂存区多留了一份"，下次搬运时会被幂等闸门挡住（规则 3）。
 			c.Log("删除 _incoming 里已搬运的 asset %d 失败（不影响正式版本，下次会被幂等闸门挡住）：%v", id, err)
 		}
 	}

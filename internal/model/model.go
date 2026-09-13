@@ -238,8 +238,8 @@ type Upstream struct {
 	// 打开之后 prerelease 与正式版**一视同仁**（同一个候选集、同一条 upstreamTag 水位线，
 	// 见 upstream.Releasable）—— 也就是说设备端会拿到比当前正式版更新的预发布版。
 	// 那是开启这个开关的**本意**，不是意外；而唯一需要它的场景是"上游把新版只发成 prerelease"。
-	// 开关只影响"进不进候选集"，**不影响** 03 §4.6 那条 `_incoming` 闸门
-	// （那个 Env.Prerelease 说的是 store 自己的暂存 Release，是另一件事）。
+	// 它只说上游那一侧，与 store 自己的 `_incoming` 队列无关（后者常驻 draft，
+	// 没有 prerelease 这个状态可言）。
 	IncludePrerelease bool `json:"includePrerelease,omitempty"`
 }
 

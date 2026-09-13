@@ -97,10 +97,15 @@ func TestCreateManualSource_RejectsReservedAppID(t *testing.T) {
 	}
 }
 
-// 队列**从哪条路出去都必须复位回 draft** —— 一次漏掉就是一个静默死锁：
-// published 的 Release 在网页上只有 Update / Delete、没有 Publish 按钮，
-// 而往它上传 APK 不触发任何事件（03 §3.3），于是"传了文件却没反应"，
-// 且用户没有任何按钮能把队列重新武装起来（2026-09-12 实际撞上过一次）。
+// 队列**从哪条路出去都必须留在 draft** —— 一次漏掉就是一个静默死锁：
+// 发布过的 Release 在网页上只有 Update / Delete、没有 Publish 按钮，而往它上传
+// APK 不触发任何事件（03 §3.3），于是"传了文件却没反应"，用户也没有按钮能把它
+// 重新武装起来（2026-09-12 实际撞上过一次）。
+//
+// 这里顺带钉住**队列是怎么被找到的**：它常态就是 draft，而 draft **取不到 tag**
+// （`/releases/tags/{tag}` 的官方描述是 "Get a published release"，draft 一律
+// 404，GitHub 把它挂在 untagged-* 引用下）。所以 fixture 是 draft:true 且接口是
+// 列表 —— by-tag 那条路在这里会直接找不到队列，测试就红了。
 //
 // 这条链上"没搬成"比"搬成了"更常见（上传的是 APK，随手传错是常态），所以下面两个
 // 用例都是**什么都没搬成**的那种出口 —— 它们曾经一个复位都没有。
@@ -123,10 +128,13 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
-				case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases/tags/_incoming":
-					// draft:false 是前提：能从 tag 读回来就说明它已 published。
-					json.NewEncoder(w).Encode(map[string]any{
-						"id": 700, "tag_name": model.IncomingTag, "draft": false})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases":
+					// 队列在列表里以 **draft** 出现 —— 这是常态（§3.2：队列不经过发布）。
+					// 旁边放一个别的 Release，钉住筛选是"按 tag 挑"而不是"拿第一个"。
+					json.NewEncoder(w).Encode([]map[string]any{
+						{"id": 1, "tag_name": "com.example.other", "draft": false},
+						{"id": 700, "tag_name": model.IncomingTag, "draft": true},
+					})
 				case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases/700/assets":
 					json.NewEncoder(w).Encode(tc.assets)
 				case r.Method == http.MethodPatch:

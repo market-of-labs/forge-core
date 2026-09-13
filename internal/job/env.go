@@ -37,12 +37,14 @@ const (
 	EnvUploadBase = "FORGE_UPLOAD_BASE"
 
 	// 以下是 repository_dispatch 的 client_payload 带过来的事件字段（03 §2.6）。
-	EnvEvent      = "EVENT"
-	EnvIssue      = "ISSUE"
-	EnvReleaseTag = "RELEASE_TAG"
-	EnvPrerelease = "PRERELEASE"
-	EnvSHA        = "SHA"
-	EnvRef        = "REF"
+	//
+	// 这里**没有** releaseTag / prerelease：它们只服务过 `release: published`
+	// 那条自动发车的路（闸门靠 tag 判断"这次发布是不是 _incoming"）。队列改成
+	// 常驻 draft + 显式触发之后，那类事件根本不会打到 forge，两个字段就没有输入了。
+	EnvEvent = "EVENT"
+	EnvIssue = "ISSUE"
+	EnvSHA   = "SHA"
+	EnvRef   = "REF"
 
 	// 默认的仓库地址。
 	DefaultStoreRepo = "market-of-labs/store"
@@ -67,12 +69,10 @@ type Env struct {
 	APIBase    string
 	UploadBase string
 
-	Event      string
-	Issue      int
-	ReleaseTag string
-	Prerelease bool
-	SHA        string
-	Ref        string
+	Event string
+	Issue int
+	SHA   string
+	Ref   string
 
 	// InCI 表示跑在 GitHub Actions 里。只影响 ::add-mask:: 要不要发。
 	InCI bool
@@ -89,11 +89,10 @@ func FromEnv() (*Env, error) {
 		APIBase:    firstNonEmpty(os.Getenv(EnvAPIBase), os.Getenv("GITHUB_API_URL"), DefaultAPIBase),
 		UploadBase: os.Getenv(EnvUploadBase),
 
-		Event:      strings.TrimSpace(os.Getenv(EnvEvent)),
-		ReleaseTag: os.Getenv(EnvReleaseTag),
-		SHA:        os.Getenv(EnvSHA),
-		Ref:        os.Getenv(EnvRef),
-		InCI:       os.Getenv("GITHUB_ACTIONS") == "true",
+		Event: strings.TrimSpace(os.Getenv(EnvEvent)),
+		SHA:   os.Getenv(EnvSHA),
+		Ref:   os.Getenv(EnvRef),
+		InCI:  os.Getenv("GITHUB_ACTIONS") == "true",
 	}
 
 	if v := strings.TrimSpace(os.Getenv(EnvIssue)); v != "" {
@@ -102,20 +101,6 @@ func FromEnv() (*Env, error) {
 			return nil, fmt.Errorf("%s=%q 不是整数：%w", EnvIssue, v, err)
 		}
 		e.Issue = n
-	}
-	// PRERELEASE 从 store 的 forward.yml 里是经 %s 渲染过来的，所以是字符串 "true"/"false"。
-	// 但它也可能是 workflow 里直接传的布尔，两种都认。
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvPrerelease))) {
-	case "true":
-		e.Prerelease = true
-	case "false", "":
-		e.Prerelease = false
-	default:
-		b, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(EnvPrerelease)))
-		if err != nil {
-			return nil, fmt.Errorf("%s=%q 不是布尔值", EnvPrerelease, os.Getenv(EnvPrerelease))
-		}
-		e.Prerelease = b
 	}
 
 	if e.UploadBase == "" {
@@ -183,8 +168,8 @@ func (e *Env) Sanitized() string {
 		tok = fmt.Sprintf("已设置(%d 字符)", len(e.Token))
 	}
 	return fmt.Sprintf(
-		"event=%q issue=%d releaseTag=%q prerelease=%v sha=%q store=%s forge=%s api=%s token=%s",
-		e.Event, e.Issue, e.ReleaseTag, e.Prerelease, shortSHA(e.SHA),
+		"event=%q issue=%d sha=%q store=%s forge=%s api=%s token=%s",
+		e.Event, e.Issue, shortSHA(e.SHA),
 		e.StoreRepo, e.ForgeRepo, e.APIBase, tok)
 }
 

@@ -200,14 +200,14 @@ type DispatchResult struct {
 
 // HandleDispatch 按 `client_payload.event` 分派（03 §4.3）。
 //
-// payload 只被当作**信标**：它带来的 event 名、issue 号、release tag、sha 都是
-// 标识而非内容，内容一律由 forge 自己用 API 去 store 读（§2.6 的切面）。
-// 于是"外部字符串进入执行环境"这条路径在这里依然是不通的。
+// payload 只被当作**信标**：它带来的 event 名、issue 号、sha 都是标识而非内容，
+// 内容一律由 forge 自己用 API 去 store 读（§2.6 的切面）。于是"外部字符串进入
+// 执行环境"这条路径在这里依然是不通的。
 //
 // 四个分支：
 //
 //	issues            → 处理 issue（§2.5 入口乙）：新增单**当场**收录并只同步它自己
-//	release           → 过 §4.6 闸门后搬 _incoming（§3.2）
+//	intake-incoming   → 搬 _incoming（§3.2）：人点手动按钮，或上传 CI 发一个信标
 //	push              → 只对该 appId 收敛（§4.3）
 //	workflow_dispatch → 全量对账（同 §4.4）
 func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
@@ -230,12 +230,11 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 		}
 		return res, err
 
-	case "release":
-		// §4.6 的闸门（规则 2）先过，再动手。
-		if err := CheckIncomingGate(c.Env); err != nil {
-			c.Log("%v", err)
-			return res, nil
-		}
+	case "intake-incoming":
+		// §3.2 的搬运。**没有闸门要过**：这条路只有两种来源 —— 人在 forge 的
+		// Actions 页点了按钮（要仓库写权限），或 store 侧上传 CI 发的信标。
+		// 两者都明确指名了"搬 _incoming"，不像从前那个 `release: published` 事件，
+		// 什么 Release 发布都会打进来、必须自己筛（旧闸门就是为了筛它）。
 		inc, err := IntakeIncoming(ctx, c)
 		res.Incoming = inc
 		if err != nil {
@@ -277,7 +276,9 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 		}
 		return res, err
 
-	case "workflow_dispatch":
+	case "workflow_dispatch", "reconcile":
+		// 手动按钮的另一个选项（verb=reconcile）。和 workflow_dispatch 同义：
+		// 两者的意思都是"人主动要一次全量对账"，没必要分成两条路。
 		r, err := Reconcile(ctx, c, ReconcileOptions{})
 		res.Reconcile = r
 		if r != nil {
@@ -288,7 +289,7 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 	default:
 		// 不认识的 event 一律拒绝而不是"当作全量对账"：store 侧将来新增事件类型时，
 		// 静默地按全量处理会掩盖"forge 还没支持这个事件"这件事。
-		return res, fmt.Errorf("不认识的事件 %q（03 §4.3 只定义了 issues / release / push / workflow_dispatch）",
+		return res, fmt.Errorf("不认识的事件 %q（03 §4.3 只定义了 issues / intake-incoming / push / workflow_dispatch / reconcile）",
 			c.Env.Event)
 	}
 }

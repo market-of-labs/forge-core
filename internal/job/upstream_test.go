@@ -16,8 +16,8 @@ import (
 	"github.com/market-of-labs/forge-core/internal/model"
 )
 
-// 这一组钉的是对账里唯一有真正判断的两段：**水位线**（pickTargets）与 **§4.6 闸门**
-// （CheckIncomingGate）。两者都是纯函数 —— 不发请求、不碰文件系统。
+// 这一组钉的是对账里唯一有真正判断的那一段：**水位线**（pickTargets）。
+// 它是纯函数 —— 不发请求、不碰文件系统。
 
 // candidates 造一份"上游 Release 列表"，**按发布时间从新到旧**（与
 // upstream.Releasable 的输出一致）。
@@ -144,57 +144,6 @@ func TestPickTargets_WarnsWhenCatchingUp(t *testing.T) {
 	rep2 := pickAndCheck(t, c2, "com.example.app", candidates("v3", "v2"), "v3")
 	if len(rep2.Warnings()) != 0 {
 		t.Fatalf("只补一个版本不该告警：%v", rep2.Warnings())
-	}
-}
-
-// ---- §4.6 闸门（规则 2） ----------------------------------------------------
-
-func TestCheckIncomingGate(t *testing.T) {
-	cases := []struct {
-		name    string
-		env     Env
-		wantErr string
-	}{
-		{
-			name: "暂存队列的正式发布 → 放行",
-			env:  Env{ReleaseTag: model.IncomingTag},
-		},
-		{
-			name: "预发布不搬运",
-			// `published` 对预发布**同样触发**，所以这条必须自己判。
-			env:     Env{ReleaseTag: model.IncomingTag, Prerelease: true},
-			wantErr: "prerelease",
-		},
-		{
-			name: "别的 tag 不是队列发布",
-			// store 侧故意不筛事件，筛选是 forge 的职责。
-			env:     Env{ReleaseTag: "com.example.app"},
-			wantErr: "不是",
-		},
-		{
-			name: "tag 为空（payload 没带过来）→ 同样拒绝",
-			env:  Env{},
-			// 空 tag 绝不能"因为没给所以放行"—— 那正是最危险的方向。
-			wantErr: "不是",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := CheckIncomingGate(&tc.env)
-			if tc.wantErr == "" {
-				if err != nil {
-					t.Fatalf("应当放行，却报错：%v", err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatal("应当拒绝，却放行了")
-			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("错误信息里应当提到 %q：%v", tc.wantErr, err)
-			}
-		})
 	}
 }
 

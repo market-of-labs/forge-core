@@ -511,11 +511,16 @@ func (c *Ctx) readAssetMeta(ctx context.Context, repo string, a gh.Asset) (*apkm
 //
 // 正文相同就不 PATCH：README 是项目级的，绝大多数轮次里它一个字节都没变，
 // 没必要每次镜像都写一次 Release（而 PATCH 改正文不产生状态跃迁，不会误发车）。
+//
+// 正文存的是**改写过的** README：仓库内的相对路径会被拼成指向源项目的绝对地址
+// （理由见 relink.go —— 正文渲染在 release 页面那个 base 下，`./img/x.png` 在那儿
+// 是 404）。那个改写是幂等的，所以上面"相同就不 PATCH"照旧成立。
 func (c *Ctx) syncReleaseBody(ctx context.Context, rel *gh.Release, repo string) error {
 	md, err := c.GH.Readme(ctx, repo)
 	if err != nil {
 		return fmt.Errorf("取上游 %s 的 README 失败，%s 的正文保持原样：%w", repo, rel.TagName, err)
 	}
+	md = relinkReadme(md, repo)
 	if md == "" || md == rel.Body {
 		return nil
 	}

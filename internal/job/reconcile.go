@@ -231,10 +231,11 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 		return res, err
 
 	case "intake-incoming":
-		// §3.2 的搬运。**没有闸门要过**：这条路只有两种来源 —— 人在 forge 的
-		// Actions 页点了按钮（要仓库写权限），或 store 侧上传 CI 发的信标。
-		// 两者都明确指名了"搬 _incoming"，不像从前那个 `release: published` 事件，
-		// 什么 Release 发布都会打进来、必须自己筛（旧闸门就是为了筛它）。
+		// §3.2 的搬运。**没有闸门要过**：这条路只有两种来源 —— 人在 Actions 页点了
+		// 手动按钮（store 的 forward-to-forge 或 forge 的 on-dispatch，都要仓库写
+		// 权限），或上传 CI 发的信标。两者都明确指名了"搬 _incoming"，不像从前那个
+		// `release: published` 事件，什么 Release 发布都会打进来、必须自己筛
+		// （旧闸门就是为了筛它）。
 		inc, err := IntakeIncoming(ctx, c)
 		res.Incoming = inc
 		if err != nil {

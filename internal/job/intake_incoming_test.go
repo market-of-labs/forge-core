@@ -100,10 +100,15 @@ func TestCreateManualSource_RejectsReservedAppID(t *testing.T) {
 }
 
 // fakeStore 是一台只实现搬运链所需端点的假 store：列 Release、列 asset、PATCH
-// （复位）、DELETE（删 asset），其余一律当作 asset 下载返回一段非 APK 内容。
+// （复位）、DELETE（删 asset 或删 tag 引用），其余一律当作 asset 下载返回一段非 APK 内容。
 //
-// 它同时留着两个计数器（PATCH 了什么、删了几个 asset），因为这一组要钉的恰好是
-// **这两件事各自发生了没有、以及一个失败了另一个还做不做**。
+// 它留的计数器全是"某个写动作发生了没有"：PATCH 了什么、删了几个 **asset**、删了哪些
+// **tag 引用**，因为这一组要钉的恰好是**这几件事各自发生了没有、以及一个失败了另一个
+// 还做不做**。
+//
+// ⚠️ 两种 DELETE 必须分开记。它们从前是同一种（那时只有删 asset），于是"清场顺手删掉
+// `refs/tags/_incoming`"会以"多删了一个 asset"的样子出现在 `deletes` 里，把三条断言
+// 一起带偏 —— 2026-09-16 就是这么红的。端点前缀不同，照实分开。
 type fakeStore struct {
 	*httptest.Server
 	assets    []map[string]any
@@ -112,9 +117,10 @@ type fakeStore struct {
 	noQueue   bool   // 列表里没有 `_incoming`：模拟队列被降级成 untagged-* / 压根没建
 	patchTag  string // 强制 PATCH 回应里的 tag_name：模拟"GitHub 没按我们发的 tag 名办"
 
-	patched []map[string]any
-	deletes int
-	logs    []string
+	patched    []map[string]any
+	deletes    int      // 删掉的 asset 个数（/releases/assets/{id}）
+	refDeletes []string // 删掉的 tag 引用，记的是请求路径（/git/refs/tags/{tag}）
+	logs       []string
 }
 
 // newFakeStore 起一台假 store。assets 是队列里的内容；patchErr 见上。
@@ -168,7 +174,12 @@ func newFakeStore(t *testing.T, assets []map[string]any, patchErr bool) *fakeSto
 			}
 			json.NewEncoder(w).Encode(map[string]any{"id": 700, "tag_name": tag})
 		case r.Method == http.MethodDelete:
-			f.deletes++
+			// 删 asset 还是删 tag 引用，按端点分（见 fakeStore 的说明）。
+			if strings.Contains(r.URL.Path, "/releases/assets/") {
+				f.deletes++
+			} else {
+				f.refDeletes = append(f.refDeletes, r.URL.Path)
+			}
 			w.WriteHeader(http.StatusNoContent)
 		default: // asset 下载：给一段不是 APK 的内容，读元数据必失败
 			w.Write(emptyZip)
@@ -176,6 +187,21 @@ func newFakeStore(t *testing.T, assets []map[string]any, patchErr bool) *fakeSto
 	}))
 	t.Cleanup(f.Close)
 	return f
+}
+
+// deletedIncomingRef 报出"队列的 tag 引用被删了几次"。
+//
+// 连端点一起钉，不只数个数：`repoURL` 会对每一段做 PathEscape，把 "tags/_incoming" 整段
+// 塞进去会把那个斜杠转义成 `%2F`，那时这个 DELETE 打在一个 GitHub 不认识的端点上 ——
+// 而这里的计数会照记，测试照绿。所以按 "/git/refs/tags/_incoming" 认。
+func (f *fakeStore) deletedIncomingRef() int {
+	n := 0
+	for _, p := range f.refDeletes {
+		if strings.HasSuffix(p, "/git/refs/tags/"+model.IncomingTag) {
+			n++
+		}
+	}
+	return n
 }
 
 // ctx 造一个打在这台假 store 上的 Ctx。
@@ -244,6 +270,14 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 			if f.deletes != 0 {
 				t.Errorf("没搬成的 asset 被删了 %d 个", f.deletes)
 			}
+			// 复位成功 ⇒ 顺手删掉队列的 tag 引用（D57）。与搬没搬成无关：这个引用是
+			// `release` 事件的解析依据，而它一旦建立就不再移动 —— 留着它，"Publish 即
+			// 发车"那条路会一直解析到一份旧的 forward.yml（症状：Publish 了却没反应，
+			// 而 Actions 页面干干净净）。删掉它，下一次 Publish 在当时的默认分支 HEAD 上重建。
+			if n := f.deletedIncomingRef(); n != 1 {
+				t.Errorf("复位成功后该删掉队列的 tag 引用（恰好一次），实际 %d 次，请求：%v",
+					n, f.refDeletes)
+			}
 			// 复位必须**把队列的 tag 名一起发回去**：不带就等于把队列报废（见 cleanIncoming
 			// 与 gh.Unpublish 的说明）。这条是本次修复的要害 —— 少了它，fake 会照实测行为
 			// 回一个 `untagged-*`，下面的告警断言随之变红。
@@ -277,6 +311,12 @@ func TestCleanIncoming_StillDeletesWhenRearmFails(t *testing.T) {
 	}
 	if f.deletes != 2 {
 		t.Errorf("已搬运的 asset 该照删不误（2 个），实际删了 %d 个", f.deletes)
+	}
+	// ⚠️ 删引用**只在复位成功时**做。复位失败说明队列还是 published 的，那个引用正是
+	// 它的标签 —— 这时删掉就成了一个悬空的 published Release（网页上按不动 Publish，
+	// 也再也认不出它）。所以这条不是"顺带一提"，是这个位置的约束之一。
+	if n := f.deletedIncomingRef(); n != 0 {
+		t.Errorf("复位失败时不该动那个引用（队列还是 published，引用就是它的标签），实际删了 %d 次", n)
 	}
 }
 
@@ -358,8 +398,9 @@ func TestIntakeIncoming_RedWhenQueueMissing(t *testing.T) {
 		t.Fatal("res 不该是 nil")
 	}
 	// 队列都没认出来，就不该有任何写动作：既不 PATCH，也不删东西。
-	if len(f.patched) != 0 || f.deletes != 0 {
-		t.Errorf("认不出队列时一个写动作都不该发：PATCH %d 次、删除 %d 个", len(f.patched), f.deletes)
+	if len(f.patched) != 0 || f.deletes != 0 || len(f.refDeletes) != 0 {
+		t.Errorf("认不出队列时一个写动作都不该发：PATCH %d 次、删 asset %d 个、删引用 %d 次（%v）",
+			len(f.patched), f.deletes, len(f.refDeletes), f.refDeletes)
 	}
 }
 
@@ -382,6 +423,11 @@ func TestCleanIncoming_WarnsWhenTagNameDropped(t *testing.T) {
 	}
 	if f.deletes != 2 {
 		t.Errorf("已搬运的 asset 该照删不误（2 个），实际删了 %d 个", f.deletes)
+	}
+	// tag 名没留住也照样删引用 —— 别看混：**引用对不对**和**该不该删**是两件事。
+	// 队列已经掰回 draft 了，此刻那个引用只会把下一次 Publish 拖回一份旧文件。
+	if n := f.deletedIncomingRef(); n != 1 {
+		t.Errorf("tag 名没留住不影响删引用（该删一次），实际 %d 次，请求：%v", n, f.refDeletes)
 	}
 	logs := strings.Join(f.logs, "\n")
 	// 两样都要在：成了什么（好让人认出现场）、以及该改回什么（好让人直接动手）。

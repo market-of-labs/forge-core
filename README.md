@@ -121,7 +121,7 @@ git tag v0.1.0 && git push origin v0.1.0
 > 发布那一步用的是第三方 action（`softprops/action-gh-release`）。这里可以接受，是因为
 > **这个 job 不握 PAT** —— 它只有本仓库的 `GITHUB_TOKEN`（`contents: write`），风险被
 > 限制在 `forge-core` 自己身上。规律：**第三方 action 只许出现在不握 PAT 的 job 里**，
-> 因为握 PAT 的 job 里跑一段别人的代码，代价是三个仓库（§6.2）。
+> 因为握 PAT 的 job 里跑一段别人的代码，代价是四个仓库（§6.2）。
 >
 > 公有的 `forge` 那边**有一处例外**：它取执行体用的是第三方 action
 > （`robinraju/release-downloader`），而那个 job 正是握着 PAT 的 —— 这是**已知并明确

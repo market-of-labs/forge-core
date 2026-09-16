@@ -65,17 +65,19 @@ func BuildIndex(ctx context.Context, c *Ctx) (*model.Report, error) {
 			// 的 draft 有两种，**都在说同一件事：这个 Release 此刻没有主人**。
 			//
 			//   - 清场路径上的正常停留（规则 6：只 unpublish 不删除），下一轮会被重新武装；
-			//   - **队列被发布过一次** —— published → draft 会把它的 tag_name 降级成
-			//     `untagged-<sha>`，于是上面那句 `== model.IncomingTag` 认不出它，它就从
-			//     队列滑进了这个分支。这一种**不会自愈**：下一次搬运照样认不出，人传上去的
-			//     APK 就停在队列里不动（2026-09-16 实际撞上，症状是"传了却没反应"）。
+			//   - **队列的 tag 名被降级过** —— 一次**不带 `tag_name` 的 PATCH** 就会把名字
+			//     换成 `untagged-<sha>`，于是上面那句 `== model.IncomingTag` 认不出它，它
+			//     就从队列滑进了这个分支。⚠️ 与"发布"无关：2026-09-16 实测，对**本来就是
+			//     draft** 的队列发 `{draft:true, make_latest:false}`（没有 tag_name）一样把
+			//     名字打掉了。这一种**不会自愈**：下一次搬运照样认不出，人传上去的 APK 就
+			//     停在队列里不动（症状是"传了却没反应"）。
 			//
 			// 两者在 API 层面分不出来（都只是"一个 draft"，也没有 ref 可查），所以不猜，
 			// 只把两条成因和那一条手工出路一起写出来：`untagged-` 开头的 tag 名本身就是
 			// 后一种的指纹，照着它就能在 Releases 页上找到那个 Release。
 			rep.Warnf(rel.TagName, "Release 处于 draft，其 asset 不计入账本。"+
-				"若它本该是手动上传的队列（tag 名显示为 `untagged-*` 即是此兆）：队列被发布过一次，"+
-				"published → draft 把 tag 名降级了，要把它改回 `%s` 才能再次搬运（03 §3.2）",
+				"若它本该是手动上传的队列（tag 名显示为 `untagged-*` 即是此兆）：一次不带 tag_name "+
+				"的 PATCH 把它的 tag 名降级了（与发布与否无关），要把它改回 `%s` 才能再次搬运（03 §3.2）",
 				model.IncomingTag)
 			continue
 		}

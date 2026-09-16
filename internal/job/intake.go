@@ -901,6 +901,24 @@ func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int
 				"要先把 tag 名改回 `%s`（03 §3.2 的手工出路）",
 				after.TagName, model.IncomingTag, model.IncomingTag)
 		}
+
+		// 连同 tag 引用一起清掉。**必须删，而且要在这里删**：
+		//
+		// `release` 事件跑的是 tag 所指提交上的 workflow，而引用一旦建立就不再移动
+		// （详见 gh.DeleteTagRef 的说明）。留着它，下一次 Publish 就会拿一份旧的
+		// forward.yml 去解析触发器 —— 默认分支上怎么改都看不见。删掉它，Publish 会在
+		// 当时的默认分支 HEAD 上重建，队列这条路才跟得上默认分支。
+		//
+		// 位置的两条约束：在 Unpublish **之后**（之前 Release 还挂在这个引用上，删引用
+		// 等于把现场拆了），且只在 Unpublish 成功时删（失败就说明队列还是 published 的，
+		// 那时引用是它的标签，删了就成了悬空的 published Release）。
+		//
+		// 删不掉不让整次搬运失败 —— 与下面删 asset 同一条理由：内容已经安顿好了，
+		// 剩下的是"下次 Publish 可能仍旧跑不动"，而那是下一次的事。
+		if err := c.GH.DeleteTagRef(ctx, c.Env.StoreRepo, model.IncomingTag); err != nil {
+			c.Log("删除 `%s` 的 tag 引用失败：下一次 Publish 可能仍旧解析到旧的 forward.yml"+
+				"（症状是「Publish 了却没反应」）：%v", model.IncomingTag, err)
+		}
 	}
 
 	for _, id := range movedIDs {

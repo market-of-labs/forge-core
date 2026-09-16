@@ -324,6 +324,40 @@ func TestUnpublishUsesDraftNotDelete(t *testing.T) {
 	}
 }
 
+// `_incoming` 的 tag 引用必须由清场删掉：`release` 事件跑的是**这个引用所指提交**上的
+// workflow，而引用一旦建立就不再移动，于是默认分支上改的触发器对它永远不可见（实测：
+// 09-12 建的引用，09-16 的发布还在用；症状是「Publish 了却没反应」且 Actions 干干净净）。
+// 删掉之后 Publish 会在当时的默认分支 HEAD 上重建它。
+func TestDeleteTagRefTargetsRefsEndpoint(t *testing.T) {
+	var method, gotPath string
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		method, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	if err := c.DeleteTagRef(context.Background(), "market-of-labs/store", "_incoming"); err != nil {
+		t.Fatalf("DeleteTagRef：%v", err)
+	}
+	if method != http.MethodDelete {
+		t.Errorf("方法 = %s，必须是 DELETE", method)
+	}
+	// 斜杠必须留在路径里（转义成 %2F 就不是 GitHub 认的那个端点了）。
+	if gotPath != "/repos/market-of-labs/store/git/refs/tags/_incoming" {
+		t.Errorf("路径不对：%q", gotPath)
+	}
+}
+
+// 队列常驻 draft 时压根没有这个引用，404 是常态而不是失败 —— 清场不该因此报错。
+func TestDeleteTagRefToleratesNotFound(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"message":"Not Found"}`)
+	})
+	if err := c.DeleteTagRef(context.Background(), "market-of-labs/store", "_incoming"); err != nil {
+		t.Errorf("404 应当被吞掉，却报了：%v", err)
+	}
+}
+
 func TestRepoSlugStaysInPath(t *testing.T) {
 	var gotPath string
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {

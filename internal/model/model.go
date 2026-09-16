@@ -196,13 +196,6 @@ const DescSeparator = " · "
 //
 // 这是 desc 唯一被消费的地方（D42）—— `sources/` 里两者始终分开存，
 // 于是改分隔符、改拼法都不用重写数据。
-// IsManual 报告这条来源有没有上游：`true` = 二进制走 `_incoming` 上传队列（03 §3.2），
-// 对账碰不到它、身份三件套也没有地方可读。
-//
-// 判据只有 Source 一个字段，所以它就是 `Source == SourceManual` 的一个名字 —— 名字的
-// 存在只是为了在调用点读起来是"这条来源的性质"，而不是散落的字符串比较。
-func (s *Source) IsManual() bool { return s.Source == SourceManual }
-
 func (s *Source) DisplayName() string {
 	if s.Desc == "" {
 		return s.Name

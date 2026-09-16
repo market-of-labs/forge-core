@@ -189,6 +189,12 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 		return exitFailed, err
 
 	case "build-manifest":
+		// 一个开关都没有（从前也没真有过一个 `--check` 预演模式）。留下 flagset 只为了
+		// 让多余参数报错，而不是被静静忽略 —— 与 build-index 同一个理由。
+		fs := newFlagSet(verb)
+		if err := fs.Parse(args); err != nil {
+			return exitUsage, err
+		}
 		_, rep, err := job.BuildManifest(c)
 		if rep != nil {
 			c.Reportf(rep)

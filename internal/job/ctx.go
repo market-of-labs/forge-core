@@ -16,9 +16,12 @@ import (
 
 // SkipDispatch 是每个回写提交都必须带上的标记（03 §4.5 规则 7）。
 //
-// 为什么必须有：store 仓库的 forward.yml 监听 `release: published`，而 forge 回写 store
-// 常常就是"发了一个 Release"（镜像完新版本 = 发布了一个内部 Release）。缺这个标记
-// 就是一次完美的自激振荡：dispatch → 镜像 → 发布 → dispatch → …
+// 为什么必须有：store 仓库的 forward.yml 监听 `push: paths:['sources/**']`，而 forge 每次
+// 回写改的恰好就是 `sources/`（收录、变更、账本重建都写那里）。缺这个标记就是一次
+// 完美的自激振荡：回写 → push → 转发 → 对账 → 回写 → …（PAT 触发的 push 不会被 GitHub 抑制）。
+//
+// ⚠️ 那句 `release: published` 已经在 forward.yml 里被删掉了（那儿留着"别再把它加回来"
+// 的注释）—— 本标记现在的理由只剩上面这一条，别再把它当成"Release 防回声"。
 //
 // 匹配方式是 forward.yml 里的 **contains**（子串），所以只要出现在提交信息里即可。
 // 放在这里而不是让每个调用点自己拼，是因为漏一次的代价是无限循环。

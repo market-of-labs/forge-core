@@ -66,12 +66,3 @@ func CheckManifest(c *Ctx) (*model.Manifest, *model.Report, error) {
 		c.Repo.ManifestPath(), len(m.Apps), len(rep.Errors()), len(rep.Warnings()))
 	return m, rep, nil
 }
-
-// CheckEntries 对一个**尚未落盘**的清单跑条目级校验。
-// 给 build-manifest 的 --check 预演模式与测试用。
-func CheckEntries(m *model.Manifest, ep model.Endpoints) *model.Report {
-	if m == nil {
-		return &model.Report{}
-	}
-	return m.Validate(ep)
-}

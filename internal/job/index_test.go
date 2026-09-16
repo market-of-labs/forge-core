@@ -1,7 +1,6 @@
 package job
 
 import (
-	"context"
 	"testing"
 
 	"github.com/market-of-labs/forge-core/internal/gh"
@@ -33,7 +32,7 @@ func TestBuildLedgerKeepsReleaseNote(t *testing.T) {
 		asset:   gh.Asset{Name: "com.x-1.0-arm64-v8a.apk", Size: 10, CreatedAt: "2026-01-01T00:00:00Z"},
 	}}
 
-	got, _, err := buildLedger(context.Background(), &Ctx{Log: func(string, ...any) {}}, src, groups, BuildIndexOptions{})
+	got, _, err := buildLedger(src, groups)
 	if err != nil {
 		t.Fatalf("buildLedger：%v", err)
 	}

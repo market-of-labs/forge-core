@@ -70,7 +70,7 @@ go test ./...
 | `intake-incoming` | 搬 `_incoming` 并清场。**没有闸门** —— 这条路只有人主动叫才会走到（D53） |
 | `resolve-upstream` | `-only ID` 只算出该镜像哪些版本并打印计划，**不下载不上传** |
 | `mirror-upstream` | `-only ID` `-dry-run` 下载 → 按内容判 ABI → 改名 → 幂等上传 |
-| `build-index` | `-fetch-missing` 从 Release 现状重建各 `sources/` 条目的 `versions` 账本 |
+| `build-index` | 从 Release 现状重建各 `sources/` 条目的 `versions` 账本（无开关，零下载；缺的元数据由下一轮镜像补，见 D56） |
 | `build-manifest` | 由 sources（自带账本）+ endpoints 合成 `apps.json` |
 | `check-manifest` | 跑 02 §2.8 自检 + 阈值告警 |
 | `reconcile` | `-only ID` `-dry-run` 幂等全量对账（§4.4） |

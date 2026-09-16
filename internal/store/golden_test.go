@@ -122,8 +122,7 @@ func TestGoldenRealRepo(t *testing.T) {
 //
 // **不比 ReleaseDate**：现存 apps.json 里的 releaseDate 是手写种子值，而账本里
 // 没有 publishedAt（那份种子账本也是手写的），所以重建不出来。这不是 bug 而是
-// "账本缺一个可选字段"，跑一次 `build-index`（必要时带 `-fetch-missing`）
-// 从 Release 的 published_at 回填后就能对上。这条差别单独在 TestGoldenReleaseDateGap 里说明。
+// "账本缺一个可选字段"。这条差别单独在 TestGoldenReleaseDateGap 里说明。
 func compareEntries(t *testing.T, got, want model.Entry) {
 	t.Helper()
 	type field struct {

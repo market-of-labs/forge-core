@@ -3,27 +3,12 @@ package job
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
 	"sort"
 
-	"github.com/market-of-labs/forge-core/internal/apkmeta"
 	"github.com/market-of-labs/forge-core/internal/gh"
 	"github.com/market-of-labs/forge-core/internal/model"
 	"github.com/market-of-labs/forge-core/internal/naming"
 )
-
-// BuildIndexOptions 调 build-index 的选项。
-type BuildIndexOptions struct {
-	// FetchMissing 决定"Release 里有、但现有账本里没有元数据的版本"要不要下载一个
-	// APK 把它补全。
-	//
-	// 关掉（默认）时这种版本只拿到文件名（version/abi/size），versionName 用 token 兜底、
-	// versionCode 缺失 —— 而 versionCode 缺失会让 check-manifest 判**失败**（规则 6），
-	// 于是整份清单推不出去。所以真要重建时得开这个开关：它是**唯一**能拿回 versionCode
-	// 的途径（那两个字段只在 APK 内部，Release 的元数据里没有）。代价是下载。
-	FetchMissing bool
-}
 
 // assetGroup 是 Release 里的一个分片，连同从它名字里解析出的坐标。
 type assetGroup struct {
@@ -45,13 +30,19 @@ type assetGroup struct {
 // 那份硬依赖的全部载体。
 //
 // 但**元数据**（versionName / versionCode / publishedAt / upstreamTag / releaseNote）
-// 在 Release 里没有，只存在于账本自己、或 APK 内部。所以本函数对它们的策略是：
+// 在 Release 里没有，只存在于账本自己、或上游的 Release 里。所以本函数对它们的策略是：
 //
 //	现有账本里有   → 原样保留（它记的是镜像**当时**读到的事实）
-//	现有账本里没有 → 用 APK 内容补齐（需 FetchMissing），或如实留空并告警
+//	现有账本里没有 → 如实留空并告警（见 buildLedger 末尾那两条）
 //
-// 于是日常路径（镜像时已写好元数据）**零下载**，而灾难恢复路径能自愈。
-func BuildIndex(ctx context.Context, c *Ctx, opts BuildIndexOptions) (*model.Report, error) {
+// 留空不等于"永远回不来"，只是**不在这里**回来：账本里没有 upstreamTag 的**最新**那个
+// 版本，下一轮对账会被镜像那一步重新计划（水位线以 upstreamTag 为准，pickTargets），
+// 那时它重读上游 APK 就把元数据填回账本了（recordIndex 的合并分支）。所以本函数
+// **零下载**，也不提供"下载我们自己的 Release 里的 APK 来补齐"那条路 —— 那条路只在
+// 上游也读不到时才有意义，而那时这个来源也不会有新版本了；何况账本本身在 git 里
+// （每次回写一个 commit），回滚比下载更准、给得还更多（releaseNote 与 upstreamTag
+// 只有 git 里有）。
+func BuildIndex(ctx context.Context, c *Ctx) (*model.Report, error) {
 	if err := c.Env.RequireToken("列 Release"); err != nil {
 		return nil, err
 	}
@@ -112,7 +103,7 @@ func BuildIndex(ctx context.Context, c *Ctx, opts BuildIndexOptions) (*model.Rep
 				"清单也不会收录它。若这是刚被「移除」的来源，属正常（D13 全保留，资产不删）")
 			continue
 		}
-		versions, appRep, err := buildLedger(ctx, c, src, byApp[id], opts)
+		versions, appRep, err := buildLedger(src, byApp[id])
 		if err != nil {
 			return nil, err
 		}
@@ -155,21 +146,8 @@ func writeLedgers(c *Ctx, ids []string) error {
 	return nil
 }
 
-// hasAnyLedger 报告当前内存里是否已经有任何版本账本。
-//
-// 用途只有一个：Reconcile 判断"这次要不要走自愈重建"。它必须在**镜像之前**调用 ——
-// 镜像本身就往账本里追加版本，那之后就分不清"加载时本来就没有"与"我们刚写进去的"了。
-func hasAnyLedger(srcs []model.Source) bool {
-	for i := range srcs {
-		if len(srcs[i].Versions) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
 // buildLedger 重建一个来源的账本。返回新值，由调用方写回 src.Versions。
-func buildLedger(ctx context.Context, c *Ctx, src *model.Source, groups []assetGroup, opts BuildIndexOptions) ([]model.Version, *model.Report, error) {
+func buildLedger(src *model.Source, groups []assetGroup) ([]model.Version, *model.Report, error) {
 	rep := &model.Report{}
 	id := src.ID
 	old := src.Versions
@@ -247,31 +225,21 @@ func buildLedger(ctx context.Context, c *Ctx, src *model.Source, groups []assetG
 			v.ReleaseNote = oldVer.ReleaseNote
 		}
 
-		if v.VersionName == "" && opts.FetchMissing {
-			meta, err := c.fetchVersionMeta(ctx, id, b.assets)
-			switch {
-			case err != nil:
-				// 下载失败不该让整次重建失败：已经拿到的部分仍然有价值，
-				// 而这个版本会被下面的告警点名。
-				rep.Warnf(id, "版本 %s 补元数据失败：%v", it.version, err)
-			case meta == nil:
-				rep.Warnf(id, "版本 %s 补元数据：读取结果为空", it.version)
-			default:
-				v.VersionName = meta.VersionName
-				v.VersionCode = meta.VersionCode
-			}
-		}
-
 		// **只对 github 源告警**没有 upstreamTag：manual 来源本来就没有上游 tag
 		// （它的二进制走 _incoming 上传队列，§3.2），对它告警是纯粹的噪音 ——
 		// 而噪音会让真正需要人看的告警失效。
+		//
+		// 这两条告警就是"账本缺元数据"的**全部**出口：没有自愈开关可开了（删了，
+		// 见 BuildIndex 的说明）。所以措辞要说到点子上：缺的是"哪一条"、能不能自己好。
 		if v.UpstreamTag == "" && src.Source == model.SourceGitHub {
-			rep.Warnf(id, "版本 %s 没有 upstreamTag —— 下一轮对账会当成未镜像，多下一次后被 asset 名幂等挡住",
-				it.version)
+			rep.Warnf(id, "版本 %s 没有 upstreamTag —— 水位线认不出它已经镜像过；若它是最新的那个版本，"+
+				"下一轮对账会重新镜像一遍并把元数据填回来（重读上游 APK），更老的版本不会", it.version)
 		}
 		if v.VersionCode == 0 {
-			rep.Warnf(id, "版本 %s 没解析出 versionCode：清单会缺该字段，check-manifest 将判**失败**（规则 6）。"+
-				"用 build-index --fetch-missing 可从 APK 内容补回来", it.version)
+			rep.Warnf(id, "版本 %s 没解析出 versionCode：清单会缺该字段，check-manifest 将判**失败**（规则 6），"+
+				"而这一轮的回写会连同**别的应用**一起放弃。它要么来自「上传成功但账本没落盘」"+
+				"（最新的那个版本下一轮镜像会补回），要么来自上游那个 APK 里真的没有 versionCode"+
+				"（不会自己好：得改 sources/%s.json 那条记录，或回滚它）", it.version, id)
 		}
 
 		assets := make([]model.Asset, 0, len(b.assets))
@@ -292,58 +260,6 @@ func findOldVersion(old []model.Version, version string) (*model.Version, int) {
 		}
 	}
 	return nil, -1
-}
-
-// fetchVersionMeta 下载该版本的一个分片并读它的 APK 元数据。
-//
-// 挑**最小**的那个分片：同一版本的所有分片共享 versionName/versionCode，
-// 下最小的那份能少传几 MB —— 而这是重建路径，可能有几十个版本要补。
-func (c *Ctx) fetchVersionMeta(ctx context.Context, appID string, assets []gh.Asset) (*apkmeta.Meta, error) {
-	if len(assets) == 0 {
-		return nil, fmt.Errorf("该版本没有任何分片")
-	}
-	best := assets[0]
-	for _, a := range assets[1:] {
-		if a.Size > 0 && (best.Size == 0 || a.Size < best.Size) {
-			best = a
-		}
-	}
-
-	rc, _, err := c.GH.DownloadAsset(ctx, c.Env.StoreRepo, best.ID)
-	if err != nil {
-		return nil, err
-	}
-	defer rc.Close()
-
-	// 落临时文件而不是读进内存：APK 动辄上百 MB，而 apkmeta.ReadZip 要的是
-	// io.ReaderAt —— 读进内存还得再留一整份。
-	f, err := os.CreateTemp("", "forge-apkmeta-*.apk")
-	if err != nil {
-		return nil, err
-	}
-	name := f.Name()
-	defer os.Remove(name)
-
-	if _, err := io.Copy(f, rc); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("把 %s 落盘：%w", best.Name, err)
-	}
-	// 先关再读：apkmeta.Read 会按路径重新打开这个文件，
-	// 在 Windows 上让同一份文件同时处于"我们写一半"与"它来读"的状态没有好处。
-	if err := f.Close(); err != nil {
-		return nil, err
-	}
-
-	c.Log("  下载 %s 以补 %s/%s 的元数据", best.Name, appID, mustVersion(best.Name, appID))
-	return apkmeta.Read(name)
-}
-
-// mustVersion 只为日志服务，尽力从文件名里取版本段；取不到就返回文件名。
-func mustVersion(fileName, appID string) string {
-	if v, _, err := naming.Split(appID, fileName); err == nil {
-		return v
-	}
-	return fileName
 }
 
 // sortAssets 按契约顺序排列分片，并去掉同一 ABI 的重复项（保留先出现的那份）。

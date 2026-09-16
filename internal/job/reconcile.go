@@ -67,17 +67,6 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 	// 失败被容忍（D44）本来就该靠报告被人看见，报告再没人打就等于没有。
 	defer func() { c.Reportf(res.Report) }()
 
-	// **在镜像之前**就把"有没有账本"记下来。镜像会往账本里追加版本，在这里之后
-	// 再看就已经不是"加载时的状态"了 —— 而自愈要判断的恰恰是后者。
-	//
-	// 一个账本都没有（被清空、丢失、或第一次跑）就开自愈：versionCode / versionName
-	// **只存在于 APK 内部**，Release 的元数据里没有，所以拿回它们的唯一途径就是
-	// 下载。代价是流量，收益是"不用人介入就能从一份空账本恢复"。
-	//
-	// 正常路径下它是关着的，但开着的代价也只是"对确实缺元数据的版本下一份"
-	// （buildLedger 只对 VersionName 为空的版本下载），所以宁可开。
-	hadLedger := hasAnyLedger(c.Sources)
-
 	// 1–3 步：解析 + 镜像。
 	plans, rep, err := ResolveUpstream(ctx, c, ResolveOptions{OnlyID: opts.OnlyID})
 	if err != nil {
@@ -105,11 +94,7 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 		return res, nil
 	}
 
-	fetch := !hadLedger
-	if fetch {
-		c.Log("账本为空 —— 走自愈重建，会按需下载 APK 补齐 versionCode（03 §5.2）")
-	}
-	if err := RebuildAndCheck(ctx, c, RebuildOptions{FetchMissing: fetch}); err != nil {
+	if err := RebuildAndCheck(ctx, c); err != nil {
 		return res, err
 	}
 
@@ -136,13 +121,6 @@ func commitMessage(opts ReconcileOptions, res *ReconcileResult) string {
 	return fmt.Sprintf("%s：镜像 %d 个新 asset", scope, res.Uploaded)
 }
 
-// RebuildOptions 调 RebuildAndCheck 的选项。
-type RebuildOptions struct {
-	// FetchMissing 见 BuildIndexOptions.FetchMissing。日常对账关着（镜像时已写好
-	// 元数据，零下载）；`rebuild-index` 的自愈路径要打开。
-	FetchMissing bool
-}
-
 // RebuildAndCheck 依次跑 build-index → build-manifest → check-manifest。
 //
 // 三步必须按这个顺序，且**必须一起跑**：
@@ -158,11 +136,11 @@ type RebuildOptions struct {
 // 代价是这一轮"什么都没有落地"——包括已经镜像好的 asset（它们在 Release 里，
 // 不依赖提交）。这个取舍是对的：把一份违反契约的 apps.json 推上去，会让**所有**
 // 客户端立刻拿到坏数据；而不推，最坏情况是"多跑一轮"。
-func RebuildAndCheck(ctx context.Context, c *Ctx, opts RebuildOptions) error {
+func RebuildAndCheck(ctx context.Context, c *Ctx) error {
 	// 账本：事实来自 Release 现状（D23：账本是派生数据，可以随时从 Release 重建）。
 	// 它**就地改写 c.Sources 并落盘**，所以下一步 build-manifest 拿到的已经是新账本 ——
 	// 这里不需要"把新值替换回内存"这一步，那正是合并（D48）消掉的东西。
-	ixRep, err := BuildIndex(ctx, c, BuildIndexOptions{FetchMissing: opts.FetchMissing})
+	ixRep, err := BuildIndex(ctx, c)
 	if err != nil {
 		return err
 	}
@@ -246,7 +224,7 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 		if inc == nil || (len(inc.Moved) == 0 && len(inc.Kept) == 0) {
 			return res, nil
 		}
-		if err := RebuildAndCheck(ctx, c, RebuildOptions{}); err != nil {
+		if err := RebuildAndCheck(ctx, c); err != nil {
 			return res, err
 		}
 		msg := fmt.Sprintf("搬运 _incoming：%d 个 asset", len(inc.Moved))

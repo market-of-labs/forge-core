@@ -127,7 +127,7 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 			return exitFailed, err
 		}
 		log("搬运 %d 个，保留 %d 个", len(inc.Moved), len(inc.Kept))
-		if err := job.RebuildAndCheck(ctx, c, job.RebuildOptions{}); err != nil {
+		if err := job.RebuildAndCheck(ctx, c); err != nil {
 			return exitFailed, err
 		}
 		_, err = c.CommitBack(ctx, fmt.Sprintf("搬运 _incoming：%d 个 asset", len(inc.Moved)))
@@ -175,12 +175,14 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 		return exitFailed, nil
 
 	case "build-index":
+		// 一个开关都没有了：从前那个 `-fetch-missing`（下载**我们自己** Release 里的
+		// APK 来补 versionCode）已经删掉。留下的 flagset 只为了让多余参数报错，
+		// 而不是被静静忽略（见 BuildIndex 的说明）。
 		fs := newFlagSet(verb)
-		fetch := fs.Bool("fetch-missing", false, "对缺元数据的版本下载一个分片补齐 versionCode（自愈路径）")
 		if err := fs.Parse(args); err != nil {
 			return exitUsage, err
 		}
-		rep, err := job.BuildIndex(ctx, c, job.BuildIndexOptions{FetchMissing: *fetch})
+		rep, err := job.BuildIndex(ctx, c)
 		if rep != nil {
 			c.Reportf(rep)
 		}

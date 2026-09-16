@@ -347,7 +347,15 @@ func (c *Client) UpdateRelease(ctx context.Context, repo string, id int64, patch
 // **这是清场的唯一手段，绝不用 DELETE**（03 §4.5 规则 6）：删 Release 会让 tag 消失，
 // 而若该仓库曾开启 Immutable Releases，删除会**永久烧毁该 tag**
 // （再建同名会 422 `tag_name was used by an immutable release`）—— 而 tag = {appId}
-// 是不可重建的安装身份。draft 只是个状态位，永远可逆。
+// 是不可重建的安装身份。
+//
+// ⚠️ 这么写的前提是"published → draft 走得通"，而这一步**从没在真环境里验证过**：
+// 拿得出手的证据只有 GitHub 自己的文档说 Update a release 能改 draft 字段，以及
+// 社区里有人用 `gh release edit --draft=true` 这么干过；反例（改回去报 422）一次都
+// 没见到 —— 但"没见到"不等于"不会"。整条队列的可恢复性都押在这上面：真要是哪天
+// 改不回去了，队列就卡在已发布上，而规则 6 又禁止删 Release，那时只剩人工介入
+// （03 §3.2 的手工出路）。所以调用方**必须把这里的错误当成要紧事报出去**，
+// 不能只记一行日志 —— 见 job.cleanIncoming。
 //
 // make_latest 一律 "false"（规则 4）。
 func (c *Client) Unpublish(ctx context.Context, repo string, id int64) (*Release, error) {

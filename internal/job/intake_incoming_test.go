@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/market-of-labs/forge-core/internal/apkmeta"
@@ -97,6 +98,72 @@ func TestCreateManualSource_RejectsReservedAppID(t *testing.T) {
 	}
 }
 
+// fakeStore 是一台只实现搬运链所需端点的假 store：列 Release、列 asset、PATCH
+// （复位）、DELETE（删 asset），其余一律当作 asset 下载返回一段非 APK 内容。
+//
+// 它同时留着两个计数器（PATCH 了什么、删了几个 asset），因为这一组要钉的恰好是
+// **这两件事各自发生了没有、以及一个失败了另一个还做不做**。
+type fakeStore struct {
+	*httptest.Server
+	assets    []map[string]any
+	patchErr  bool // PATCH 一律 500：模拟"队列掰不回 draft"
+	assetsErr bool // 列 asset 一律 500：用来制造一个"主路径自己就带错"的出口
+
+	patched []map[string]any
+	deletes int
+}
+
+// newFakeStore 起一台假 store。assets 是队列里的内容；patchErr 见上。
+func newFakeStore(t *testing.T, assets []map[string]any, patchErr bool) *fakeStore {
+	t.Helper()
+	f := &fakeStore{assets: assets, patchErr: patchErr}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases":
+			// 队列在列表里以 **draft** 出现 —— 这是常态（§3.2：队列不经过发布）。
+			// 旁边放一个别的 Release，钉住筛选是"按 tag 挑"而不是"拿第一个"。
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1, "tag_name": "com.example.other", "draft": false},
+				{"id": 700, "tag_name": model.IncomingTag, "draft": true},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases/700/assets":
+			if f.assetsErr {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]any{"message": "boom"})
+				return
+			}
+			json.NewEncoder(w).Encode(f.assets)
+		case r.Method == http.MethodPatch:
+			var p map[string]any
+			json.NewDecoder(r.Body).Decode(&p)
+			f.patched = append(f.patched, p)
+			if f.patchErr {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]any{"message": "boom"})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"id": 700, "tag_name": model.IncomingTag})
+		case r.Method == http.MethodDelete:
+			f.deletes++
+			w.WriteHeader(http.StatusNoContent)
+		default: // asset 下载：给一段不是 APK 的内容，读元数据必失败
+			w.Write(emptyZip)
+		}
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
+// ctx 造一个打在这台假 store 上的 Ctx。
+func (f *fakeStore) ctx(t *testing.T) *Ctx {
+	t.Helper()
+	ghc, err := gh.New(gh.Config{Token: "t", BaseURL: f.URL, UploadBaseURL: f.URL})
+	if err != nil {
+		t.Fatalf("建客户端：%v", err)
+	}
+	return &Ctx{Env: &Env{Token: "t", StoreRepo: "o/store"}, GH: ghc, Log: func(string, ...any) {}}
+}
+
 // 队列**从哪条路出去都必须留在 draft** —— 一次漏掉就是一个静默死锁：
 // 发布过的 Release 在网页上只有 Update / Delete、没有 Publish 按钮，而往它上传
 // APK 不触发任何事件（03 §3.3），于是"传了文件却没反应"，用户也没有按钮能把它
@@ -123,39 +190,8 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var patched []map[string]any
-			var deletes int
-
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch {
-				case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases":
-					// 队列在列表里以 **draft** 出现 —— 这是常态（§3.2：队列不经过发布）。
-					// 旁边放一个别的 Release，钉住筛选是"按 tag 挑"而不是"拿第一个"。
-					json.NewEncoder(w).Encode([]map[string]any{
-						{"id": 1, "tag_name": "com.example.other", "draft": false},
-						{"id": 700, "tag_name": model.IncomingTag, "draft": true},
-					})
-				case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases/700/assets":
-					json.NewEncoder(w).Encode(tc.assets)
-				case r.Method == http.MethodPatch:
-					var p map[string]any
-					json.NewDecoder(r.Body).Decode(&p)
-					patched = append(patched, p)
-					json.NewEncoder(w).Encode(map[string]any{"id": 700, "tag_name": model.IncomingTag})
-				case r.Method == http.MethodDelete:
-					deletes++
-					w.WriteHeader(http.StatusNoContent)
-				default: // asset 下载：给一段不是 APK 的内容，读元数据必失败
-					w.Write(emptyZip)
-				}
-			}))
-			defer srv.Close()
-
-			ghc, err := gh.New(gh.Config{Token: "t", BaseURL: srv.URL, UploadBaseURL: srv.URL})
-			if err != nil {
-				t.Fatalf("建客户端：%v", err)
-			}
-			c := &Ctx{Env: &Env{Token: "t", StoreRepo: "o/store"}, GH: ghc, Log: func(string, ...any) {}}
+			f := newFakeStore(t, tc.assets, false)
+			c := f.ctx(t)
 
 			res, err := IntakeIncoming(context.Background(), c)
 			if err != nil {
@@ -166,16 +202,95 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 			}
 
 			// 一处 PATCH，且是 draft:true —— 队列被重新武装起来。
-			if len(patched) != 1 || patched[0]["draft"] != true {
-				t.Fatalf("队列必须被改回 draft，实际 PATCH 了 %d 次：%v", len(patched), patched)
+			if len(f.patched) != 1 || f.patched[0]["draft"] != true {
+				t.Fatalf("队列必须被改回 draft，实际 PATCH 了 %d 次：%v", len(f.patched), f.patched)
+			}
+			// make_latest=false（规则 4）。它只有走 gh.Unpublish 才带得上 —— 这里手写过
+			// 一遍 UpdateRelease 时漏的就是它，所以这条断言同时钉住"别再手写"。
+			if f.patched[0]["make_latest"] != "false" {
+				t.Errorf("复位必须带 make_latest=false（规则 4），实际：%v", f.patched[0])
 			}
 			if !res.Cleaned {
 				t.Error("复位成功了，res.Cleaned 该是 true")
 			}
 			// 什么都没搬成 ⇒ 一个 asset 都不许删（§3.2：不安置就不丢）。
-			if deletes != 0 {
-				t.Errorf("没搬成的 asset 被删了 %d 个", deletes)
+			if f.deletes != 0 {
+				t.Errorf("没搬成的 asset 被删了 %d 个", f.deletes)
 			}
 		})
+	}
+}
+
+// 复位失败和"删掉已搬走的 asset"是**两件事**，前者失败不许短路掉后者。
+//
+// 从前那条路径是 `PATCH 失败 → return`，于是掰不回 draft 时那些存根一个都不删。
+// 它们的正文已经在正式 Release 里了，留着毫无用处，只会让队列越积越脏、下一轮再被
+// 幂等闸门挨个挡一遍 —— 2026-09-12 那个已发布的队列真撞上时就是这个后果。
+func TestCleanIncoming_StillDeletesWhenRearmFails(t *testing.T) {
+	f := newFakeStore(t, nil, true)
+	c := f.ctx(t)
+
+	err := c.cleanIncoming(context.Background(),
+		&gh.Release{ID: 700, TagName: model.IncomingTag}, []int64{11, 12}, 3)
+	if err == nil {
+		t.Fatal("掰不回 draft 必须报出去：调用方要据此把这次运行染色（03 §3.2）")
+	}
+	if len(f.patched) != 1 {
+		t.Fatalf("该只 PATCH 一次，实际 %d 次", len(f.patched))
+	}
+	if f.deletes != 2 {
+		t.Errorf("已搬运的 asset 该照删不误（2 个），实际删了 %d 个", f.deletes)
+	}
+}
+
+// 清场失败必须把运行**染红**，不能只是一行 ⚠️。
+//
+// 这条路径的返回值从前是写死的 nil，而 res.Cleaned 只有测试在读 —— 于是"队列没掰回
+// draft"在 Actions 里表现为一次绿色运行加一行容易被略过的告警。而它恰恰是唯一
+// 需要人立刻接手的失败：published → draft 那条回头路见 gh.Unpublish 的说明，
+// 真走不通时规则 6 又禁止删 Release，只剩人工介入。
+//
+// 用空队列当场景：主路径本来就是"无事可做"，没有任何别的错可以替它背锅。
+func TestIntakeIncoming_RedWhenQueueCannotBeRearmed(t *testing.T) {
+	f := newFakeStore(t, nil, true)
+	c := f.ctx(t)
+
+	res, err := IntakeIncoming(context.Background(), c)
+	if err == nil {
+		t.Fatal("清场失败必须报出来，否则这次运行是绿的")
+	}
+	if !strings.Contains(err.Error(), "draft") {
+		t.Errorf("错误该点明是哪一步，得到：%v", err)
+	}
+	if res == nil {
+		t.Fatal("res 不该是 nil（清场的日志要用它数保留了几个）")
+	}
+	if res.Cleaned {
+		t.Error("清场失败了，Cleaned 不该是 true")
+	}
+}
+
+// 有主错时**主错说话**，清场失败不许把它盖掉 —— 真正的原因比"收尾没做完"值钱。
+// 这条和上面那条是同一个 defer 的两半，缺哪一半都是隐形的。
+//
+// 场景要两错并存才测得到那一半：列 asset 失败（主路径带错出去）+ PATCH 失败
+// （defer 里的清场也带错）。
+func TestIntakeIncoming_PrimaryErrorWinsOverCleanupError(t *testing.T) {
+	f := newFakeStore(t, nil, true)
+	f.assetsErr = true
+	c := f.ctx(t)
+
+	_, err := IntakeIncoming(context.Background(), c)
+	if err == nil {
+		t.Fatal("列 asset 失败该报错")
+	}
+	if !strings.Contains(err.Error(), "asset") {
+		t.Errorf("主错（列 asset）该原样透出来，实际：%v", err)
+	}
+	if strings.Contains(err.Error(), "清场") {
+		t.Errorf("主错被清场的错盖掉了：%v", err)
+	}
+	if len(f.patched) != 1 {
+		t.Errorf("清场该照常试着复位（PATCH 一次），实际 %d 次", len(f.patched))
 	}
 }

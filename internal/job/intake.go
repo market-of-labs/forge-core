@@ -568,11 +568,11 @@ type IncomingResult struct {
 // 删除是单向的：删掉就没了，而"这个 asset 有别的问题"正是最需要人来看一眼的情况。
 // 所以本函数只删除**确认已安置**的 asset，其余的原样留在 `_incoming` 里并逐个
 // 说明原因（§3.2：不静默丢弃）。
-func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
+func IntakeIncoming(ctx context.Context, c *Ctx) (res *IncomingResult, err error) {
 	if err := c.Env.RequireToken("搬运 _incoming"); err != nil {
 		return nil, err
 	}
-	res := &IncomingResult{}
+	res = &IncomingResult{}
 
 	rel, err := c.incomingRelease(ctx)
 	if err != nil {
@@ -597,19 +597,29 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (*IncomingResult, error) {
 		// 收尾要给足机会：ctx 可能已经超时/被取消，而这一步恰恰是那时最要紧的
 		// 一件事 —— 用一个不受取消影响的 ctx 去发它。
 		cctx := context.WithoutCancel(ctx)
-		if err := c.cleanIncoming(cctx, rel, movedIDs, len(res.Kept)); err != nil {
-			// 不复写返回值：真正的原因（上面那个 err）比收尾失败更重要，别把它盖掉。
-			// 但必须吼出来，并把手工出路写在脸上。
-			c.Log("⚠️ `%s` 清场失败：%v —— 请手动把队列改回 draft 并删掉已搬走的 asset（03 §3.2）",
-				model.IncomingTag, err)
+		cerr := c.cleanIncoming(cctx, rel, movedIDs, len(res.Kept))
+		if cerr == nil {
+			res.Cleaned = true
 			return
 		}
-		res.Cleaned = true
+		// 必须吼出来，并把手工出路写在脸上。
+		c.Log("⚠️ `%s` 清场失败：%v —— 请手动把队列改回 draft 并删掉已搬走的 asset（03 §3.2）",
+			model.IncomingTag, cerr)
+
+		// 清场失败只在**这一轮本来就没出别的事**时才把运行染红。有主错时让主错说话：
+		// 它比"收尾没做完"更值钱，盖掉它就等于把真正的现场藏起来（那个 err 上面
+		// 逐条 return 时已经带出来了）。
+		if err == nil {
+			err = fmt.Errorf("清场失败：%w", cerr)
+		}
 	}()
 
 	assets, err := c.GH.ListAssets(ctx, c.Env.StoreRepo, rel.ID)
 	if err != nil {
-		return nil, fmt.Errorf("列 %s 的 asset：%w", model.IncomingTag, err)
+		// ⚠️ 出了这个函数体，返回的 res **必须**是非 nil 的：上面那个 defer 要读
+		// res.Kept 去写清场日志，`return nil, ...` 会让它空指针。
+		// 调用方都是拿到 err 就立刻返回，不会去碰这个 res。
+		return res, fmt.Errorf("列 %s 的 asset：%w", model.IncomingTag, err)
 	}
 	if len(assets) == 0 {
 		// 规则 3：空队列没有可搬的东西。点错了按钮、或上一轮刚搬完又点一次，
@@ -840,15 +850,22 @@ func (c *Ctx) moveAsset(ctx context.Context, rel *gh.Release, releaseID int64, t
 // 万一有人按习惯点了，下一次搬运就把它掰回来，而不是让队列悄没声地变成已发布。
 // 幂等，多余的一次 PATCH 不值一提。
 //
+// ⚠️ **但它是这里唯一会失败、且失败很要紧的一步**：PATCH 没能把队列掰回 draft，
+// 说明队列卡在"已发布"上 —— 而 published → draft 这条回头路**从没在真环境里验证过**
+// （见 gh.Unpublish 的说明），失败时唯一的出路是人去网页上看一眼（03 §3.2）。
+// 所以它失败**不再短路掉下面的删除**：要删的是"已经安置好的那份的存根"，留着它
+// 一点用都没有，只会让队列越积越脏、下一轮再被幂等闸门挨个挡一遍。两件事都做完，
+// 再把 draft 那个错报上去。
+//
 // **绝不用 delete release**（规则 6）：删 Release 会让 tag 消失，
 // 而若曾开启 Immutable Releases，那个 tag 会被**永久烧毁**，再建同名会 422。
-// draft 只是个状态位，永远可逆。
 func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int64, keptCount int) error {
-	draft := true
-	if _, err := c.GH.UpdateRelease(ctx, c.Env.StoreRepo, rel.ID, gh.ReleasePatch{Draft: &draft}); err != nil {
-		return fmt.Errorf("把 %s 保持在 draft：%w", model.IncomingTag, err)
+	// 走 Unpublish 而不是手写一遍 UpdateRelease：make_latest=false 那条规矩（规则 4）
+	// 在那里拧着，而这里手写时漏了它。
+	_, draftErr := c.GH.Unpublish(ctx, c.Env.StoreRepo, rel.ID)
+	if draftErr == nil {
+		c.Log("`%s` 保持在 draft", model.IncomingTag)
 	}
-	c.Log("`%s` 保持在 draft", model.IncomingTag)
 
 	for _, id := range movedIDs {
 		if err := c.GH.DeleteAsset(ctx, c.Env.StoreRepo, id); err != nil {
@@ -858,6 +875,10 @@ func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int
 		}
 	}
 	c.Log("清场完成：删除 %d 个已搬运 asset，保留 %d 个待人工处理", len(movedIDs), keptCount)
+
+	if draftErr != nil {
+		return fmt.Errorf("把 %s 保持在 draft：%w", model.IncomingTag, draftErr)
+	}
 	return nil
 }
 

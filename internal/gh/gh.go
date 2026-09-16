@@ -151,6 +151,12 @@ type ReleasePatch struct {
 	Draft      *bool   `json:"draft,omitempty"`
 	Prerelease *bool   `json:"prerelease,omitempty"`
 	Name       *string `json:"name,omitempty"`
+	// TagName 改 Release 的 tag 名。**发 draft 的时候必须一并带上它**，否则 GitHub 会把
+	// tag 名换成一个 `untagged-<sha>` 占位名 —— 见 Unpublish 的说明。
+	//
+	// 对 draft 改 tag 名不会 422，即使同名的 ref 已经存在（2026-09-16 在 store 的队列上
+	// 实测：`refs/tags/_incoming` 在改之前就在）。ref 与 Release 是两回事，各自独立。
+	TagName *string `json:"tag_name,omitempty"`
 	// Body 是 Release 正文（description）。用来把上游 README 同步过去（D51）——
 	// 改正文不产生状态跃迁，所以不会触发 `release` 事件（03 §3.2）。
 	Body *string `json:"body,omitempty"`
@@ -342,26 +348,35 @@ func (c *Client) UpdateRelease(ctx context.Context, repo string, id int64, patch
 	return &r, nil
 }
 
-// Unpublish 把 Release 改回 draft。
+// Unpublish 把 Release 改回 draft，并把它本来该有的 tag 名一并带回去。
 //
 // **这是清场的唯一手段，绝不用 DELETE**（03 §4.5 规则 6）：删 Release 会让 tag 消失，
 // 而若该仓库曾开启 Immutable Releases，删除会**永久烧毁该 tag**
 // （再建同名会 422 `tag_name was used by an immutable release`）—— 而 tag = {appId}
 // 是不可重建的安装身份。
 //
-// ⚠️ 这么写的前提是"published → draft 走得通"，而这一步**从没在真环境里验证过**：
-// 拿得出手的证据只有 GitHub 自己的文档说 Update a release 能改 draft 字段，以及
-// 社区里有人用 `gh release edit --draft=true` 这么干过；反例（改回去报 422）一次都
-// 没见到 —— 但"没见到"不等于"不会"。整条队列的可恢复性都押在这上面：真要是哪天
-// 改不回去了，队列就卡在已发布上，而规则 6 又禁止删 Release，那时只剩人工介入
-// （03 §3.2 的手工出路）。所以调用方**必须把这里的错误当成要紧事报出去**，
-// 不能只记一行日志 —— 见 job.cleanIncoming。
+// 前提"published → draft 走得通"已在真环境验证过（2026-09-16），不再是纸面推断。
+//
+// ⚠️ **tag 必须传，而且正是这一步非传不可**：PATCH 一个 draft 时若不带 `tag_name`，
+// GitHub 会把 tag 名换成一个 `untagged-<sha>` 占位名 —— 和它原来叫什么无关，**哪怕它
+// 本来就已是 draft**（2026-09-16 在 store 的队列上实测，PATCH 前后各做了一次独立 GET
+// 复核：`_incoming` → `untagged-eea0ca81…`）。这条占位名有两个后果：
+//
+//   - 队列是按 tag 名认的（job.incomingRelease），名字一掉就**再也认不出来**，人传上去
+//     的 APK 停在队列里不动，而运行还是绿的 —— 一天里连撞两次的"传了却没反应"；
+//   - 它**不会自愈**：下一次搬运照样认不出，于是队列成了单次使用的东西。
+//
+// 带上 tag 名就没有这个问题（同一次实测：三个字段一起发的 PATCH，tag 名稳住了）。
+// 顺手记下另一条实测：对 draft 改 tag 名**不会** 422，即使同名 ref 已存在 —— ref 与
+// Release 各自独立，别被"tag 已存在"吓住。
+//
+// 调用方**必须把这里的错误当成要紧事报出去**，不能只记一行日志 —— 见 job.cleanIncoming。
 //
 // make_latest 一律 "false"（规则 4）。
-func (c *Client) Unpublish(ctx context.Context, repo string, id int64) (*Release, error) {
+func (c *Client) Unpublish(ctx context.Context, repo string, id int64, tag string) (*Release, error) {
 	draft := true
 	no := "false"
-	return c.UpdateRelease(ctx, repo, id, ReleasePatch{Draft: &draft, MakeLatest: &no})
+	return c.UpdateRelease(ctx, repo, id, ReleasePatch{Draft: &draft, MakeLatest: &no, TagName: &tag})
 }
 
 // ---- 仓库内容 ----------------------------------------------------------------

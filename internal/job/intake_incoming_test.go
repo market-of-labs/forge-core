@@ -110,7 +110,7 @@ type fakeStore struct {
 	patchErr  bool   // PATCH 一律 500：模拟"队列掰不回 draft"
 	assetsErr bool   // 列 asset 一律 500：用来制造一个"主路径自己就带错"的出口
 	noQueue   bool   // 列表里没有 `_incoming`：模拟队列被降级成 untagged-* / 压根没建
-	patchTag  string // PATCH 回应里的 tag_name；空 = 仍是 `_incoming`
+	patchTag  string // 强制 PATCH 回应里的 tag_name：模拟"GitHub 没按我们发的 tag 名办"
 
 	patched []map[string]any
 	deletes int
@@ -153,9 +153,18 @@ func newFakeStore(t *testing.T, assets []map[string]any, patchErr bool) *fakeSto
 				json.NewEncoder(w).Encode(map[string]any{"message": "boom"})
 				return
 			}
-			tag := f.patchTag
-			if tag == "" {
-				tag = model.IncomingTag
+			// **照实模拟**：PATCH 一个 draft 时若不带 tag_name，GitHub 会把 tag 名换成
+			// `untagged-<sha>` 占位名 —— 与它原本叫什么无关，**哪怕它本来就已是 draft**
+			// （2026-09-16 在真队列上实测，PATCH 前后各做一次独立 GET 复核）。
+			//
+			// 这个 fake 从前一律回 `_incoming`，等于替真实 API 打了保票，于是"每次复位都会
+			// 把队列打废"这件事被藏住了整整一天 —— 用例全绿，线上每次都坏。所以这里必须
+			// 按实测行为来，而不是按我们希望的来。
+			tag, _ := p["tag_name"].(string)
+			if f.patchTag != "" {
+				tag = f.patchTag // 显式覆盖：模拟 GitHub 收了 tag_name 却不照办
+			} else if tag == "" {
+				tag = "untagged-9d3d2b2b06d800c8cc0f"
 			}
 			json.NewEncoder(w).Encode(map[string]any{"id": 700, "tag_name": tag})
 		case r.Method == http.MethodDelete:
@@ -235,10 +244,15 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 			if f.deletes != 0 {
 				t.Errorf("没搬成的 asset 被删了 %d 个", f.deletes)
 			}
-			// 队列本来就在 draft ⇒ PATCH 是幂等的、tag_name 不变，这里不该出现降级告警：
-			// 那条告警只对"已发布 → 改回 draft"这一步有意义，正常路径上报它就是噪音。
-			if logs := strings.Join(f.logs, "\n"); strings.Contains(logs, "降级") {
-				t.Errorf("正常路径不该报 tag 名降级：\n%s", logs)
+			// 复位必须**把队列的 tag 名一起发回去**：不带就等于把队列报废（见 cleanIncoming
+			// 与 gh.Unpublish 的说明）。这条是本次修复的要害 —— 少了它，fake 会照实测行为
+			// 回一个 `untagged-*`，下面的告警断言随之变红。
+			if f.patched[0]["tag_name"] != model.IncomingTag {
+				t.Errorf("复位必须把队列的 tag 名发回去（否则队列当场报废），实际 PATCH：%v", f.patched[0])
+			}
+			// 队列本来就在 draft ⇒ 这次 PATCH 什么都不改，tag 名该原样留住、不该报异常。
+			if logs := strings.Join(f.logs, "\n"); strings.Contains(logs, "没留住") {
+				t.Errorf("正常路径不该报 tag 名没留住：\n%s", logs)
 			}
 		})
 	}
@@ -349,11 +363,14 @@ func TestIntakeIncoming_RedWhenQueueMissing(t *testing.T) {
 	}
 }
 
-// tag 名被降级必须**当场**喊出来，而且照常把已搬走的 asset 删干净、不染红。
+// tag 名没留住必须**当场**喊出来，而且照常把已搬走的 asset 删干净、不染红。
 //
-// 降级本身不是失败（draft 这个状态是对的），代价要**下一次**搬运才显现；而等它显现时，
-// 能指认原因的现场只剩 PATCH 的返回值 —— 所以那一下不喊，就再没机会了。
-func TestCleanIncoming_WarnsWhenTagNameDowngraded(t *testing.T) {
+// 复位现在会把 tag 名一起发回去（那就是修法），所以这条告警不再是"我们知道会降级"的
+// 提示，而是**哨兵**：GitHub 收了 tag_name 却不照办时，队列下一次就认不出来，而等到
+// 那时，能指认原因的现场只剩这个返回值 —— 所以那一下不喊，就再没机会了。
+//
+// 用 patchTag 模拟"不照办"（fake 的默认行为是照办）。
+func TestCleanIncoming_WarnsWhenTagNameDropped(t *testing.T) {
 	f := newFakeStore(t, nil, false)
 	f.patchTag = "untagged-9d3d2b2b06d800c8cc0f"
 	c := f.ctx(t)
@@ -361,14 +378,14 @@ func TestCleanIncoming_WarnsWhenTagNameDowngraded(t *testing.T) {
 	err := c.cleanIncoming(context.Background(),
 		&gh.Release{ID: 700, TagName: model.IncomingTag}, []int64{11, 12}, 0)
 	if err != nil {
-		t.Fatalf("降级不是失败，不该报错：%v", err)
+		t.Fatalf("没留住 tag 名不是失败（draft 这个状态是对的），不该报错：%v", err)
 	}
 	if f.deletes != 2 {
 		t.Errorf("已搬运的 asset 该照删不误（2 个），实际删了 %d 个", f.deletes)
 	}
 	logs := strings.Join(f.logs, "\n")
-	// 两样都要在：降成了什么（好让人认出现场）、以及该改回什么（好让人直接动手）。
+	// 两样都要在：成了什么（好让人认出现场）、以及该改回什么（好让人直接动手）。
 	if !strings.Contains(logs, f.patchTag) || !strings.Contains(logs, "改回") {
-		t.Errorf("降级该被当场喊出来（点明降成了什么 + 该改回什么），实际日志：\n%s", logs)
+		t.Errorf("tag 名没留住该被当场喊出来（点明成了什么 + 该改回什么），实际日志：\n%s", logs)
 	}
 }

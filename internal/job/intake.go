@@ -867,8 +867,8 @@ func (c *Ctx) moveAsset(ctx context.Context, rel *gh.Release, releaseID int64, t
 // 幂等，多余的一次 PATCH 不值一提。
 //
 // ⚠️ **但它是这里唯一会失败、且失败很要紧的一步**：PATCH 没能把队列掰回 draft，
-// 说明队列卡在"已发布"上 —— 而 published → draft 这条回头路**从没在真环境里验证过**
-// （见 gh.Unpublish 的说明），失败时唯一的出路是人去网页上看一眼（03 §3.2）。
+// 说明队列卡在"已发布"上 —— published → draft 这条回头路已在真环境验证过走得通
+// （2026-09-16），真失败时唯一的出路是人去网页上看一眼（03 §3.2）。
 // 所以它失败**不再短路掉下面的删除**：要删的是"已经安置好的那份的存根"，留着它
 // 一点用都没有，只会让队列越积越脏、下一轮再被幂等闸门挨个挡一遍。两件事都做完，
 // 再把 draft 那个错报上去。
@@ -877,24 +877,27 @@ func (c *Ctx) moveAsset(ctx context.Context, rel *gh.Release, releaseID int64, t
 // 而若曾开启 Immutable Releases，那个 tag 会被**永久烧毁**，再建同名会 422。
 func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int64, keptCount int) error {
 	// 走 Unpublish 而不是手写一遍 UpdateRelease：make_latest=false 那条规矩（规则 4）
-	// 在那里拧着，而这里手写时漏了它。
+	// 在那里拧着，而这里手写时漏了它。tag 名也一样 —— 见下。
 	//
-	// 返回值不能丢 —— 它带回 PATCH 之后的 tag_name，而"已发布 → 改回 draft"这一步会
-	// **把它降级**（见下）。
-	after, draftErr := c.GH.Unpublish(ctx, c.Env.StoreRepo, rel.ID)
+	// 返回值不能丢：下面拿它核对 tag 名有没有留住。
+	after, draftErr := c.GH.Unpublish(ctx, c.Env.StoreRepo, rel.ID, model.IncomingTag)
 	if draftErr == nil {
 		c.Log("`%s` 保持在 draft", model.IncomingTag)
 
-		// ⚠️ GitHub 会把改回 draft 的 Release 挪回 `untagged-<sha>` 引用，返回的 tag_name
-		// 随之变成那个占位名（2026-09-16 实测：一次清场之后 tag_name 从 `_incoming` 变成
-		// `untagged-9d3d2b2b06d800c8cc0f`）。而 incomingRelease 正是按 tag_name 认队列的，
-		// 于是**下一次搬运认不出队列** —— 症状是点完按钮的运行绿色、一个 asset 都没搬，
-		// 只留一句"store 里没有 tag 为 `_incoming` 的 Release"。
+		// ⚠️ 这一步从前只发 {draft, make_latest}，而**光发那两个字段就等于把队列报废**：
+		// 不带 tag_name 时 GitHub 会把 tag 名换成一个 `untagged-<sha>` 占位名 —— 与它原本
+		// 叫什么无关，哪怕它本来就已是 draft（2026-09-16 在真队列上实测两次 PATCH 各配一次
+		// 独立 GET：`_incoming` → `untagged-9d3d2b2b…`；带上 tag_name 则稳住）。
 		//
-		// 这不是本步的失败（draft 这个状态本身是对的），所以不染红；但必须**当场**喊出来：
-		// 等下次上传才暴露时，能指认原因的现场只剩这一步的返回值，而它刚才被丢掉了。
+		// 于是每次搬运成功都会把队列打废一次：incomingRelease 按 tag_name 认队列，名字一掉
+		// 就再也认不出来，人传上去的 APK 停在队列里不动、运行还是绿的 —— 一天里连撞两次的
+		// 「传了却没反应」。现在 tag 名跟着一起发回去了，这条不变量就由这一步自己维持。
+		//
+		// 留这个核对是**当哨兵**，不是补丁：发是发了，但"GitHub 老实按它说的做"这件事我们
+		// 只能从外面观察（它就是刚刚才教会我们别信默认行为）。真响起来说明修法失效了，那时
+		// 现场只剩这个返回值。
 		if after != nil && after.TagName != model.IncomingTag {
-			c.Log("⚠️ 队列的 tag 名被降级成 %q（不再是 `%s`）—— 下一次搬运会认不出它，"+
+			c.Log("⚠️ tag 名没留住，成了 %q（发的是 `%s`）—— 下一次搬运会认不出队列，"+
 				"要先把 tag 名改回 `%s`（03 §3.2 的手工出路）",
 				after.TagName, model.IncomingTag, model.IncomingTag)
 		}

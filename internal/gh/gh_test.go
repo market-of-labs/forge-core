@@ -288,6 +288,9 @@ func TestPaginationSendsPerPage100(t *testing.T) {
 //
 // 删 Release 会让 tag 消失；若曾开启 Immutable Releases 则**永久烧毁该 tag**，
 // 而 tag = appId 是不可重建的安装身份。所以清场只能用 draft:true。
+//
+// 同时钉住 tag_name 必须跟着一起发：不带它的 PATCH draft 会让 GitHub 把 tag 名换成
+// `untagged-<sha>` 占位名，队列从此认不出来 —— 见 gh.Unpublish 的说明与那两次实测。
 func TestUnpublishUsesDraftNotDelete(t *testing.T) {
 	var method string
 	var body string
@@ -298,7 +301,7 @@ func TestUnpublishUsesDraftNotDelete(t *testing.T) {
 		io.WriteString(w, `{"id":7,"draft":true}`)
 	})
 
-	rel, err := c.Unpublish(context.Background(), "market-of-labs/store", 7)
+	rel, err := c.Unpublish(context.Background(), "market-of-labs/store", 7, "_incoming")
 	if err != nil {
 		t.Fatalf("Unpublish：%v", err)
 	}
@@ -307,6 +310,10 @@ func TestUnpublishUsesDraftNotDelete(t *testing.T) {
 	}
 	if !strings.Contains(body, `"draft":true`) {
 		t.Errorf("请求体里没有 draft:true：%s", body)
+	}
+	// 少了这一条，GitHub 就会把 tag 名换成 `untagged-*` —— 队列当场报废。
+	if !strings.Contains(body, `"tag_name":"_incoming"`) {
+		t.Errorf("请求体里没有 tag_name（会让 GitHub 把 tag 名换成占位名）：%s", body)
 	}
 	// 规则 4：每次 draft→published 都会重打 published_at，make_latest 必须显式 false。
 	if !strings.Contains(body, `"make_latest":"false"`) {

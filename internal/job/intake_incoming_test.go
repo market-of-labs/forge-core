@@ -3,6 +3,7 @@ package job
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -106,11 +107,14 @@ func TestCreateManualSource_RejectsReservedAppID(t *testing.T) {
 type fakeStore struct {
 	*httptest.Server
 	assets    []map[string]any
-	patchErr  bool // PATCH 一律 500：模拟"队列掰不回 draft"
-	assetsErr bool // 列 asset 一律 500：用来制造一个"主路径自己就带错"的出口
+	patchErr  bool   // PATCH 一律 500：模拟"队列掰不回 draft"
+	assetsErr bool   // 列 asset 一律 500：用来制造一个"主路径自己就带错"的出口
+	noQueue   bool   // 列表里没有 `_incoming`：模拟队列被降级成 untagged-* / 压根没建
+	patchTag  string // PATCH 回应里的 tag_name；空 = 仍是 `_incoming`
 
 	patched []map[string]any
 	deletes int
+	logs    []string
 }
 
 // newFakeStore 起一台假 store。assets 是队列里的内容；patchErr 见上。
@@ -122,10 +126,17 @@ func newFakeStore(t *testing.T, assets []map[string]any, patchErr bool) *fakeSto
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases":
 			// 队列在列表里以 **draft** 出现 —— 这是常态（§3.2：队列不经过发布）。
 			// 旁边放一个别的 Release，钉住筛选是"按 tag 挑"而不是"拿第一个"。
-			json.NewEncoder(w).Encode([]map[string]any{
+			rels := []map[string]any{
 				{"id": 1, "tag_name": "com.example.other", "draft": false},
 				{"id": 700, "tag_name": model.IncomingTag, "draft": true},
-			})
+			}
+			if f.noQueue {
+				// 降级之后的真实样子：队列还在、还是 draft，但 tag_name 已经是 untagged-*，
+				// 于是"按 tag 挑"这件事必然挑不到它。这时**只留那个不相干的 Release**，
+				// 才逼得出"认不出来"那条出口。
+				rels = rels[:1]
+			}
+			json.NewEncoder(w).Encode(rels)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/store/releases/700/assets":
 			if f.assetsErr {
 				w.WriteHeader(http.StatusInternalServerError)
@@ -142,7 +153,11 @@ func newFakeStore(t *testing.T, assets []map[string]any, patchErr bool) *fakeSto
 				json.NewEncoder(w).Encode(map[string]any{"message": "boom"})
 				return
 			}
-			json.NewEncoder(w).Encode(map[string]any{"id": 700, "tag_name": model.IncomingTag})
+			tag := f.patchTag
+			if tag == "" {
+				tag = model.IncomingTag
+			}
+			json.NewEncoder(w).Encode(map[string]any{"id": 700, "tag_name": tag})
 		case r.Method == http.MethodDelete:
 			f.deletes++
 			w.WriteHeader(http.StatusNoContent)
@@ -161,7 +176,10 @@ func (f *fakeStore) ctx(t *testing.T) *Ctx {
 	if err != nil {
 		t.Fatalf("建客户端：%v", err)
 	}
-	return &Ctx{Env: &Env{Token: "t", StoreRepo: "o/store"}, GH: ghc, Log: func(string, ...any) {}}
+	// 日志收进 f.logs：这一组里有两条断言要读它 —— 降级告警该在、正常路径不该在。
+	return &Ctx{Env: &Env{Token: "t", StoreRepo: "o/store"}, GH: ghc, Log: func(format string, args ...any) {
+		f.logs = append(f.logs, fmt.Sprintf(format, args...))
+	}}
 }
 
 // 队列**从哪条路出去都必须留在 draft** —— 一次漏掉就是一个静默死锁：
@@ -216,6 +234,11 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 			// 什么都没搬成 ⇒ 一个 asset 都不许删（§3.2：不安置就不丢）。
 			if f.deletes != 0 {
 				t.Errorf("没搬成的 asset 被删了 %d 个", f.deletes)
+			}
+			// 队列本来就在 draft ⇒ PATCH 是幂等的、tag_name 不变，这里不该出现降级告警：
+			// 那条告警只对"已发布 → 改回 draft"这一步有意义，正常路径上报它就是噪音。
+			if logs := strings.Join(f.logs, "\n"); strings.Contains(logs, "降级") {
+				t.Errorf("正常路径不该报 tag 名降级：\n%s", logs)
 			}
 		})
 	}
@@ -292,5 +315,60 @@ func TestIntakeIncoming_PrimaryErrorWinsOverCleanupError(t *testing.T) {
 	}
 	if len(f.patched) != 1 {
 		t.Errorf("清场该照常试着复位（PATCH 一次），实际 %d 次", len(f.patched))
+	}
+}
+
+// 队列认不出来时**必须染红**，而且错误里要给出那条手工出路。
+//
+// 这是「传了文件却没反应」这个故障的完整外观：人点按钮的前提是"我刚往队列传了文件"，
+// 所以认不出队列 ≈ 那次上传白传了。从前这条出口只记一行日志、返回 `nil` 错误 ——
+// 于是一次绿色运行加一句没人翻的日志（2026-09-16 实际撞上：队列被发布过一次，
+// tag_name 被降级成 `untagged-*`，从此认不出它，点按钮毫无反馈）。
+func TestIntakeIncoming_RedWhenQueueMissing(t *testing.T) {
+	f := newFakeStore(t, nil, false)
+	f.noQueue = true
+	c := f.ctx(t)
+
+	res, err := IntakeIncoming(context.Background(), c)
+	if err == nil {
+		t.Fatal("认不出队列必须报错，否则这次运行的结论是绿色")
+	}
+	// 错误要能照着做：点明队列的 tag 名，以及"改回 tag 名"这条出路。
+	if !strings.Contains(err.Error(), model.IncomingTag) {
+		t.Errorf("错误里该点明队列的 tag 名，得到：%v", err)
+	}
+	if !strings.Contains(err.Error(), "tag 名改回") {
+		t.Errorf("错误里该给出那条手工出路，得到：%v", err)
+	}
+	if res == nil {
+		t.Fatal("res 不该是 nil")
+	}
+	// 队列都没认出来，就不该有任何写动作：既不 PATCH，也不删东西。
+	if len(f.patched) != 0 || f.deletes != 0 {
+		t.Errorf("认不出队列时一个写动作都不该发：PATCH %d 次、删除 %d 个", len(f.patched), f.deletes)
+	}
+}
+
+// tag 名被降级必须**当场**喊出来，而且照常把已搬走的 asset 删干净、不染红。
+//
+// 降级本身不是失败（draft 这个状态是对的），代价要**下一次**搬运才显现；而等它显现时，
+// 能指认原因的现场只剩 PATCH 的返回值 —— 所以那一下不喊，就再没机会了。
+func TestCleanIncoming_WarnsWhenTagNameDowngraded(t *testing.T) {
+	f := newFakeStore(t, nil, false)
+	f.patchTag = "untagged-9d3d2b2b06d800c8cc0f"
+	c := f.ctx(t)
+
+	err := c.cleanIncoming(context.Background(),
+		&gh.Release{ID: 700, TagName: model.IncomingTag}, []int64{11, 12}, 0)
+	if err != nil {
+		t.Fatalf("降级不是失败，不该报错：%v", err)
+	}
+	if f.deletes != 2 {
+		t.Errorf("已搬运的 asset 该照删不误（2 个），实际删了 %d 个", f.deletes)
+	}
+	logs := strings.Join(f.logs, "\n")
+	// 两样都要在：降成了什么（好让人认出现场）、以及该改回什么（好让人直接动手）。
+	if !strings.Contains(logs, f.patchTag) || !strings.Contains(logs, "改回") {
+		t.Errorf("降级该被当场喊出来（点明降成了什么 + 该改回什么），实际日志：\n%s", logs)
 	}
 }

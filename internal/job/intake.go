@@ -518,6 +518,12 @@ func IntakeIssue(ctx context.Context, c *Ctx, number int) (*IntakeDecision, *Rec
 // Release，于是队列在哪个状态都找得到 —— 这正是要的：状态不该决定能不能搬运。
 // 分页不能省（ListReleases 里已按 per_page=100 翻页）：Release 数随收录数增长，
 // 越过一页之后队列会被挤出去，症状是静默的「store 里没有 _incoming」。
+//
+// ⚠️ **认不出队列时的修法是把队列的 tag 名改回去，不是把这里的比对放宽。**
+// 别加"draft 且 tag 是 `untagged-*` 就当队列"这类看似容错的条件：下游的 cleanIncoming
+// 会**删掉**它匹配到的那个 Release 里的 asset —— 认错对象就是删错文件，而 store 里的
+// draft 并不只有队列（人可以用 draft 起草任何东西）。所以这里只能按 tag 名严格认；
+// 认不出就报错，由 IntakeIncoming 把运行染红，让人去修队列。
 func (c *Ctx) incomingRelease(ctx context.Context) (*gh.Release, error) {
 	rels, err := c.GH.ListReleases(ctx, c.Env.StoreRepo)
 	if err != nil {
@@ -579,11 +585,21 @@ func IntakeIncoming(ctx context.Context, c *Ctx) (res *IncomingResult, err error
 		return nil, err
 	}
 	if rel == nil {
-		// 队列不存在：通常是把 tag 打错了，或者还没建。
-		// 不自动建 —— 一个空的 draft 建出来只会掩盖"你其实传到了别处"这个事实。
-		c.Log("store 里没有 tag 为 `%s` 的 Release（03 §3.2：它是常驻队列，不自动建）",
-			model.IncomingTag)
-		return res, nil
+		// 队列不存在：通常是把 tag 打错了，或者还没建。**不自动建** —— 一个空的 draft
+		// 建出来只会掩盖"你其实传到了别处"这个事实。
+		//
+		// 但这条路**必须染红**，不能只是记一行日志就 `return nil`：人点这个按钮的前提
+		// 是"我刚往队列传了文件"，所以这里认不出队列 ≈ 那次上传白传了。从前它是一行
+		// 日志加一次绿色运行 —— 而"绿色且什么都没发生"正是这类故障的完整外观，人不会
+		// 去翻日志（2026-09-16 实际撞上过：队列被发布过一次，tag_name 被降级成
+		// `untagged-*`，incomingRelease 从此认不出它，点按钮毫无反馈）。
+		//
+		// 错误里要给出那一条手工出路：tag_name 被降级是**已知**的成因，而用户此刻
+		// 需要的正是"那我去把什么改回什么"。
+		return res, fmt.Errorf("store 里没有 tag 为 `%s` 的 Release（03 §3.2：它是常驻队列，"+
+			"不自动建）。若队列其实在、只是 tag 名被降级成了 `untagged-*`（发布过又被改回 "+
+			"draft 会这样，见 cleanIncoming 的告警），把它的 tag 名改回 `%s` 再重试",
+			model.IncomingTag, model.IncomingTag)
 	}
 
 	// 清场是**退出时的无条件动作**，不是"搬成功之后再做的一件事"（§3.2 / 规则 6）。
@@ -862,9 +878,26 @@ func (c *Ctx) moveAsset(ctx context.Context, rel *gh.Release, releaseID int64, t
 func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int64, keptCount int) error {
 	// 走 Unpublish 而不是手写一遍 UpdateRelease：make_latest=false 那条规矩（规则 4）
 	// 在那里拧着，而这里手写时漏了它。
-	_, draftErr := c.GH.Unpublish(ctx, c.Env.StoreRepo, rel.ID)
+	//
+	// 返回值不能丢 —— 它带回 PATCH 之后的 tag_name，而"已发布 → 改回 draft"这一步会
+	// **把它降级**（见下）。
+	after, draftErr := c.GH.Unpublish(ctx, c.Env.StoreRepo, rel.ID)
 	if draftErr == nil {
 		c.Log("`%s` 保持在 draft", model.IncomingTag)
+
+		// ⚠️ GitHub 会把改回 draft 的 Release 挪回 `untagged-<sha>` 引用，返回的 tag_name
+		// 随之变成那个占位名（2026-09-16 实测：一次清场之后 tag_name 从 `_incoming` 变成
+		// `untagged-9d3d2b2b06d800c8cc0f`）。而 incomingRelease 正是按 tag_name 认队列的，
+		// 于是**下一次搬运认不出队列** —— 症状是点完按钮的运行绿色、一个 asset 都没搬，
+		// 只留一句"store 里没有 tag 为 `_incoming` 的 Release"。
+		//
+		// 这不是本步的失败（draft 这个状态本身是对的），所以不染红；但必须**当场**喊出来：
+		// 等下次上传才暴露时，能指认原因的现场只剩这一步的返回值，而它刚才被丢掉了。
+		if after != nil && after.TagName != model.IncomingTag {
+			c.Log("⚠️ 队列的 tag 名被降级成 %q（不再是 `%s`）—— 下一次搬运会认不出它，"+
+				"要先把 tag 名改回 `%s`（03 §3.2 的手工出路）",
+				after.TagName, model.IncomingTag, model.IncomingTag)
+		}
 	}
 
 	for _, id := range movedIDs {

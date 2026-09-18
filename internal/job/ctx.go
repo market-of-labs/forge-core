@@ -150,14 +150,24 @@ func (c *Ctx) Source(id string) *model.Source {
 // 刻意列出而不是 `git add .`：
 //
 //   - `sources/` 整个目录（含删除）—— issue 流程与对账（写 `versions` 账本）都会改它。
-//   - `apps.json` 根目录的清单，是客户端直接伺服的文件。
+//   - `repo/` 对外伺服的索引（`index-v2.json` / `entry.jar` / `index-v1.jar` / …）。
+//     它的 APK 是 `.gitignore` 掉的（见 store 的包注释），所以这一条实际只会暂存索引。
+//   - `store/fdroid/metadata/` —— fdroidserver 读的那份输入，也是人**唯一**能审阅的那半。
 //
-// **不含 `store/`**：那里只剩 endpoints.json，是人改的部署配置，forge 永远不写它。
+// ⚠️ 第三项刻意写的是 `store/fdroid/metadata` 而**不是** `store/fdroid`（计划里写的是后者）。
+// 差别是安全性的：`store/fdroid/` 里还躺着 `config.yml`，而那个文件里**明文放着签名私钥的口令**
+// （见 fdroid.RenderConfig 的说明）。把整个 `store/fdroid` 纳入暂存范围，就变成了
+// "靠 store 的 `.gitignore` 记得排除它" —— 而 `.gitignore` 是一份**数据仓库里**的文件，
+// 它可以被误删、可以被一条 `git add -f` 绕过、也可以在 03 的第一次部署里还没到位。
+// 收窄到 metadata 之后，口令在**结构上**进不了暂存区，与它是否被忽略无关。
+//
+// **不含 `store/endpoints.json`**：那是人改的部署配置，forge 永远不写它。
 // 把它纳入暂存范围等于给"某次误改模板"开了一条自动提交的路。
 func (c *Ctx) TrackedPaths() []string {
 	return []string{
 		store.SourcesDirName,
-		store.ManifestName,
+		store.RepoDirName,
+		store.FdroidMetadataDirRel(),
 	}
 }
 

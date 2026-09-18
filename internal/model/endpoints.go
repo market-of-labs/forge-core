@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -11,11 +12,15 @@ import (
 
 // 模板里允许出现的占位符（03 §2.3）。**这是全部** —— 未知占位符一律报错，
 // 不静默留空，因为静默留空会让一个拼错的模板产出"看起来对"的地址。
+//
+// 曾经这里还有第四个 `fileName`，服务于 `assetUrlTemplate`：那时地址由 forge 拼好、
+// 逐条写进 Obtainium 的清单。F-Droid 那条路把它整条去掉了（D58/D62）——
+// 地址不再由我们产出，而是**客户端拿 `repo.address + "/" + 文件名` 自拼**，
+// 于是"模板"这个概念在地址这一侧彻底没有了。剩下的两个模板都只描述**名字**。
 const (
-	VarAppID    = "appId"
-	VarVersion  = "version"
-	VarABI      = "abi"
-	VarFileName = "fileName"
+	VarAppID   = "appId"
+	VarVersion = "version"
+	VarABI     = "abi"
 )
 
 // Tag 按 tagTemplate 渲染 Release 的 tag（03 §3.1）。
@@ -30,32 +35,6 @@ func (e Endpoints) AssetName(appID, version, abi string) (string, error) {
 		VarVersion: version,
 		VarABI:     abi,
 	})
-}
-
-// AssetURL 按 assetUrlTemplate 渲染下载地址（03 §2.3）。
-//
-// `fileName` 是独立变量而不是"由另外三个拼出来"：第一期模板是
-// `.../download/{appId}/{fileName}`，于是文件名必须能独立代入；
-// 若模板改成 `.../{appId}/{version}/{fileName}`，同一份调用也照样成立。
-func (e Endpoints) AssetURL(appID, version, fileName string) (string, error) {
-	return render(e.AssetURLTemplate, map[string]string{
-		VarAppID:    appID,
-		VarVersion:  version,
-		VarFileName: fileName,
-	})
-}
-
-// AssetURLForABI 是 AssetName + AssetURL 的组合，返回清单里 apkUrls 需要的那一对。
-func (e Endpoints) AssetURLForABI(appID, version, abi string) (APKRef, error) {
-	name, err := e.AssetName(appID, version, abi)
-	if err != nil {
-		return APKRef{}, err
-	}
-	u, err := e.AssetURL(appID, version, name)
-	if err != nil {
-		return APKRef{}, err
-	}
-	return APKRef{Name: name, URL: u}, nil
 }
 
 // render 做占位符替换。
@@ -94,14 +73,14 @@ func render(tmpl string, vars map[string]string) (string, error) {
 }
 
 func knownVars() []string {
-	v := []string{VarAppID, VarVersion, VarABI, VarFileName}
+	v := []string{VarAppID, VarVersion, VarABI}
 	sort.Strings(v)
 	return v
 }
 
-// Validate 检查模板自身是否自洽。
+// Validate 检查这份地址配置是否自洽：①② 看两个名字模板，③ 看成品地址。
 //
-// **它不检查模板"写了什么"，而是检查模板"渲染出什么"** —— 用两个不同的探针值渲染，
+// **①② 不检查模板"写了什么"，而是检查模板"渲染出什么"** —— 用两个不同的探针值渲染，
 // 断言结果与 naming 的实现逐字相等。这是本文件最重要的一条：
 //
 //	解析一侧（naming.Split）**无法**由模板驱动 —— 给定一个文件名，你得先知道形状才能切分。
@@ -118,8 +97,8 @@ func (e Endpoints) Validate() error {
 	if strings.TrimSpace(e.AssetNameTemplate) == "" {
 		return fmt.Errorf("endpoints.assetNameTemplate 为空")
 	}
-	if strings.TrimSpace(e.AssetURLTemplate) == "" {
-		return fmt.Errorf("endpoints.assetUrlTemplate 为空")
+	if strings.TrimSpace(e.RepoURL) == "" {
+		return fmt.Errorf("endpoints.repoUrl 为空")
 	}
 
 	// ① tag 必须就是 appId 本身（03 §3.1：tag 不含版本段、无斜杠）。
@@ -152,28 +131,54 @@ func (e Endpoints) Validate() error {
 		}
 	}
 
-	// ③ assetUrlTemplate 必须是 https，且真的用到了 {fileName}。
-	if !strings.Contains(e.AssetURLTemplate, "{"+VarFileName+"}") {
-		return fmt.Errorf("endpoints.assetUrlTemplate 里没有 {%s}：模板 %q 无法定位到具体文件",
-			VarFileName, e.AssetURLTemplate)
-	}
-	probeURL, err := e.AssetURL("com.example.probe", "1.2.3", "com.example.probe-1.2.3-universal.apk")
+	// ③ repoUrl 必须是 https、有 host、且**不带尾斜杠**。
+	//
+	// 它与上面两条不同：那两条校验的是"模板渲染出来的形状"，这一条校验的是一个**成品地址**。
+	// 而它值得校验的理由，是它同时是**客户端要用的那个地址**：fdroidserver 会把这个字符串
+	// 逐字写进 `index-v2.json` 的 `repo.address`，客户端随后拿 `address + "/" + 文件名`
+	// 去取每一个 APK（03 §4.4）。所以这个字符串里多一个字符就多在所有 APK 地址里。
+	//
+	// 尾斜杠正是那种多出来的字符：`.../repo/` + `/` + `x.apk` 是双斜杠。多数服务端会
+	// 把双斜杠折掉，于是它**看起来能用** —— 而"看起来能用"的配置一旦发出去就会成为事实，
+	// 之后想改回来就要所有人重新添加这个源（地址是用户添加源时存下来的）。
+	u, err := url.Parse(e.RepoURL)
 	if err != nil {
-		return fmt.Errorf("endpoints.assetUrlTemplate 渲染失败：%w", err)
-	}
-	u, err := url.Parse(probeURL)
-	if err != nil {
-		return fmt.Errorf("endpoints.assetUrlTemplate 渲染出的地址无法解析（%q）：%w", probeURL, err)
+		return fmt.Errorf("endpoints.repoUrl 无法解析（%q）：%w", e.RepoURL, err)
 	}
 	if u.Scheme != "https" {
-		return fmt.Errorf("endpoints.assetUrlTemplate 渲染出的地址协议是 %q（%q），必须是 https —— "+
-			"明文 http 会让客户端拒绝下载，而哨兵 url 的 `.invalid` 约束只约束哨兵、不约束这里",
-			u.Scheme, probeURL)
+		// 豁免只有一格，且精确限制在回环上（见 isLoopbackHost）。
+		if !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
+			return fmt.Errorf("endpoints.repoUrl 的协议是 %q（%q），必须是 https —— "+
+				"客户端的源地址是明文可读的，而它是这套私有市场唯一对外暴露的地址；"+
+				"唯一的例外是回环 http（本机验证用）", u.Scheme, e.RepoURL)
+		}
 	}
 	if u.Host == "" {
-		return fmt.Errorf("endpoints.assetUrlTemplate 渲染出的地址没有 host：%q", probeURL)
+		return fmt.Errorf("endpoints.repoUrl 没有 host：%q", e.RepoURL)
+	}
+	if strings.HasSuffix(e.RepoURL, "/") {
+		return fmt.Errorf("endpoints.repoUrl 带尾斜杠（%q）—— 它会被逐字写进索引，"+
+			"而客户端是拿 `address + \"/\" + 文件名` 取文件的，于是每个 APK 地址都是双斜杠", e.RepoURL)
 	}
 	return nil
+}
+
+// isLoopbackHost 报告 host 是不是回环地址（`localhost` / 127.0.0.0 段 / `::1`）。
+//
+// 存在的唯一理由是**本机验证**：规格 03 §7 #11 那条"整机装一个真客户端、添加自定义源、
+// 装一个应用"必须走 http（`python -m http.server` 不做 TLS），而它连的必然是回环地址。
+//
+// 把豁免精确地卡在回环上，是为了让这条豁免**不可能**落到一件真要发布的东西上：
+// 一个对外的 repo 地址不可能是 `localhost`。
+//
+// ⚠️ 注意参数是 `u.Hostname()` 而不是 `u.Host` —— 后者带端口（`localhost:8000`），
+// 而带端口的串与任何固定值比对都会漏；`Hostname()` 已经把端口剥掉了。
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Validate 检查一份 sources/{appId}.json 是否符合 03 §2.2。
@@ -201,14 +206,14 @@ func (s *Source) Validate(fileName string) error {
 	}
 	// desc 是可选字段，但**手改文件这条入口必须自己把关**：issue 那条路会在
 	// 解析时先裁到上限（issue 里不能拒，见 TruncateDesc），这里若也不管，
-	// 一个手写的超长 desc 会一路拼进清单，把列表标题挤成省略号。
+	// 一个手写的超长 desc 会一路渲染成 metadata 的 Summary，把客户端列表里那一行挤没。
 	if n := len([]rune(s.Desc)); n > MaxDescRunes {
-		return fmt.Errorf("desc 有 %d 个字，超过上限 %d（02 §2.3）—— "+
-			"它在客户端是列表标题的一部分，长了就显示不全", n, MaxDescRunes)
+		return fmt.Errorf("desc 有 %d 个字，超过上限 %d（02 §2.5）—— "+
+			"它渲染成 metadata 的 Summary，也就是客户端列表里应用名下面那一行小字", n, MaxDescRunes)
 	}
 	if strings.ContainsAny(s.Desc, "\r\n") {
-		return fmt.Errorf("desc 含换行符 —— 它在客户端是**单行**列表标题的一部分，" +
-			"换行不会渲染成两行而是被吞掉")
+		return fmt.Errorf("desc 含换行符 —— 它渲染成 metadata 的 Summary，而那一行在客户端是**单行**：" +
+			"换行不会渲染成两行，只会被吞掉")
 	}
 
 	switch s.Source {
@@ -227,26 +232,10 @@ func (s *Source) Validate(fileName string) error {
 		return fmt.Errorf("source = %q，只能是 %q 或 %q", s.Source, SourceGitHub, SourceManual)
 	}
 
-	if err := ValidateKind(s.Kind); err != nil {
-		return err
-	}
-
 	for _, a := range s.ABIWhitelist {
 		if !naming.IsABI(a) {
 			return fmt.Errorf("abiWhitelist 里的 %q 不在固定集 %v 内", a, naming.ABISet)
 		}
-	}
-	return nil
-}
-
-// ValidateKind 检查 kind 是不是 02 规则 9 允许的取值。空串合法 = "普通应用"。
-//
-// 抽成独立函数而不是留在 Source.Validate 里，理由与 Upstream.Validate 一样：还没有 appId
-// 的那半条申请（issue 新增单）也要能复用同一条规则 —— 它同样写得出 kind，
-// 而 `Source.Validate` 此刻会先因为 `ID == ""` 判失败。规则写两遍就一定会漂移。
-func ValidateKind(kind string) error {
-	if kind != "" && kind != KindObtainium && kind != KindCompanion {
-		return fmt.Errorf("kind = %q，只能是 %q 或 %q（02 规则 9）", kind, KindObtainium, KindCompanion)
 	}
 	return nil
 }

@@ -32,7 +32,7 @@ type ReconcileResult struct {
 
 // Reconcile 是 03 §4.4 的幂等全量对账，也是**唯一的"日常收敛"入口**。
 //
-// 它把 §4.4 的四步串起来：解析上游 → 镜像缺失版本 → 重建清单与索引 → 回写。
+// 它把 §4.4 的四步串起来：解析上游 → 镜像缺失版本 → 重建索引（并重跑一次仓库生成）→ 回写。
 // `handle-dispatch` 的 push / workflow_dispatch 分支最终都调它，区别只在 OnlyID；
 // `issues` 分支在收录完一张新增单之后也调它一次 —— 那次只带刚收录的那一个 appId，
 // 好让新应用在设备端"一分钟内可装"，而不是等到明天。
@@ -52,9 +52,13 @@ type ReconcileResult struct {
 //
 // # 为什么"重建"这一步不能省
 //
-// 镜像只动 Release 与 index；清单（apps.json）是**另一个**产物，它由 sources +
-// endpoints + index 三者合成。改了任一输入却不重建，清单就与事实漂移了 ——
-// 而漂移的清单在设备端表现为"点进去装的是旧版本"，一个没人会想到来查对账的症状。
+// 镜像只动 Release 与账本，而**对外那一份产物是另一回事** —— 它由 sources（账本）+
+// endpoints 渲染出来，再由 fdroidserver 扫目录扫成索引。改了任一输入却不重建，
+// 产物就与事实漂移了；而漂移的产物在设备端表现为"点进去装的是旧版本"或者
+// "某个应用干脆没出现"，两个都没人会想到来查对账的症状。
+//
+// 反过来也有一层：这一轮的 APK 是**从 Release 取**的（见 downloadNewest），
+// 所以"镜像"与"生成仓库"是两个独立的消费者，谁都不能替谁把对方的活干了。
 func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileResult, error) {
 	res := &ReconcileResult{Report: &model.Report{}}
 
@@ -98,7 +102,7 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 		return res, err
 	}
 
-	// 4 步：回写。**只有 check-manifest 过了才有这一步**（见 RebuildAndCheck）。
+	// 4 步：回写。**只有 check-repo 过了才有这一步**（见 RebuildAndCheck）。
 	committed, err := c.CommitBack(ctx, commitMessage(opts, res))
 	if err != nil {
 		return res, err
@@ -113,32 +117,40 @@ func commitMessage(opts ReconcileOptions, res *ReconcileResult) string {
 		scope = "对账 " + opts.OnlyID
 	}
 	if res.Uploaded == 0 {
-		// 没镜像任何东西也提交，是因为"重建清单/索引"本身可能就是改动
-		// （比如上游把某个 asset 改名了，index 会跟着变）。CommitBack 在没有
-		// 实际改动时会安静地不提交，所以这里无需自己判断。
-		return fmt.Sprintf("%s：重建清单与索引", scope)
+		// 没镜像任何东西也提交，是因为"重建产物"本身可能就是改动（比如某个来源
+		// 被 paused 了、或者上一轮缺的分片这一轮从 cache 里补上了，索引都会跟着变）。
+		// CommitBack 在没有实际改动时会安静地不提交，所以这里无需自己判断。
+		return fmt.Sprintf("%s：重建索引", scope)
 	}
 	return fmt.Sprintf("%s：镜像 %d 个新 asset", scope, res.Uploaded)
 }
 
-// RebuildAndCheck 依次跑 build-index → build-manifest → check-manifest。
+// RebuildAndCheck 依次跑 build-index → build-repo → check-repo。
 //
 // 三步必须按这个顺序，且**必须一起跑**：
 //
-//	build-index     事实来自 Release，元数据来自旧账本 → 必须先于清单
-//	build-manifest  把 sources（自带账本）+ endpoints 合成 apps.json
-//	check-manifest  **读回磁盘上的** apps.json 跑 02 §2.8，是唯一的阻断点
+//	build-index  事实来自 Release、元数据来自旧账本 → 必须先于后面两步：
+//	             repo 该摆哪些文件，完全由这一步重建出来的账本决定
+//	build-repo   把 sources（自带账本）+ endpoints 渲染成 fdroid 的输入，
+//	             跑一次 `fdroid update`，再把产物搬进根 `repo/`
+//	check-repo   **读回磁盘上的**产物跑 02 §2.8，是唯一的阻断点
+//
+// ⚠️ 与它的前身（build-manifest + check-manifest）有一处结构性差别：那两步之间
+// 只传一份 JSON，自检读的就是刚写下的那份字节。这里中间多了**一个外部工具**，
+// 索引是 `fdroid update` 扫目录扫出来的 —— 所以自检读的是"别人写的东西"，
+// 而它可能因为无数种与 Go 代码无关的原因不合规格。这正是自检在这一条路上
+// 比在清单那条路上更重要的原因。
 //
 // # 自检不过就不回写
 //
-// 03 §5.3 说 check-manifest「除硬错误外只告警不阻断」。这里的实现是：
+// 03 §5.3 说 check-repo「除硬错误外只告警不阻断」。这里的实现是：
 // 告警全部打进日志、**硬错误返回 error**，于是调用方在 CommitBack 之前就停下了。
 // 代价是这一轮"什么都没有落地"——包括已经镜像好的 asset（它们在 Release 里，
-// 不依赖提交）。这个取舍是对的：把一份违反契约的 apps.json 推上去，会让**所有**
-// 客户端立刻拿到坏数据；而不推，最坏情况是"多跑一轮"。
+// 不依赖提交）。这个取舍是对的：把一份客户端会拒绝的索引推上去，会让**所有**
+// 客户端立刻同步失败；而不推，最坏情况是"多跑一轮"。
 func RebuildAndCheck(ctx context.Context, c *Ctx) error {
 	// 账本：事实来自 Release 现状（D23：账本是派生数据，可以随时从 Release 重建）。
-	// 它**就地改写 c.Sources 并落盘**，所以下一步 build-manifest 拿到的已经是新账本 ——
+	// 它**就地改写 c.Sources 并落盘**，所以下一步 build-repo 拿到的已经是新账本 ——
 	// 这里不需要"把新值替换回内存"这一步，那正是合并（D48）消掉的东西。
 	ixRep, err := BuildIndex(ctx, c)
 	if err != nil {
@@ -146,15 +158,15 @@ func RebuildAndCheck(ctx context.Context, c *Ctx) error {
 	}
 	c.Reportf(ixRep)
 
-	// 清单：只需要 sources（自带账本）+ endpoints。
-	if _, mRep, err := BuildManifest(c); err != nil {
+	// 产物：渲染 metadata + 凑齐 APK + `fdroid update` + 拷进根 `repo/`。
+	rRep, err := BuildRepo(ctx, c)
+	if err != nil {
 		return err
-	} else {
-		c.Reportf(mRep)
 	}
+	c.Reportf(rRep)
 
-	// 自检：读回磁盘上的 apps.json。这一步是"产出对不对"的唯一判据。
-	_, chkRep, err := CheckManifest(c)
+	// 自检：读回磁盘上的产物。这一步是"产出对不对"的唯一判据。
+	chkRep, err := CheckRepo(ctx, c)
 	if err != nil {
 		return err
 	}
@@ -278,9 +290,10 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 // 返回 "" 表示"应该按全量处理"：没改任何 sources/ 文件，或者改了**多个**
 // （批量改动时逐个收敛反而更慢、更容易撞上并发上传）。
 //
-// 只看 `sources/{appId}.json` 这一种形状 —— `apps.json` 是 forge 自己的产物，
-// 它的 push 只会来自 forge 自己的回写，而那已经带着 [skip-dispatch] 被 store 侧
-// 挡掉了（规则 7）。真收到了，说明有人在手改产物，那更该全量重算把它盖回去。
+// 只看 `sources/{appId}.json` 这一种形状 —— 根 `repo/` 与 `store/fdroid/metadata/`
+// 都是 forge 自己的产物，它们的 push 只会来自 forge 自己的回写，而那已经带着
+// [skip-dispatch] 被 store 侧挡掉了（规则 7）。真收到了，说明有人在手改产物，
+// 那更该全量重算把它盖回去。
 //
 // sources/ 里的文件现在**一半是输入、一半是产物**（`versions` 账本是 forge 写的，
 // D48），所以"改了 sources"既可能是人改了元数据、也可能是 forge 回写了账本 ——
@@ -311,7 +324,8 @@ func affectedAppID(ctx context.Context, c *Ctx) (string, error) {
 		return "", nil
 	case 1:
 		if c.Source(hit[0]) == nil {
-			// 提交删掉了这个来源文件。没有上游要解析，全量重算把清单里的条目去掉即可。
+			// 提交删掉了这个来源文件。没有上游要解析，全量重算把它的 metadata 清掉、
+			// 索引里那个包自然就没了（见 BuildRepo 的 metadata 清理）。
 			c.Log("来源 %s 已被删除，走全量重算把它从清单里去掉", hit[0])
 			return "", nil
 		}

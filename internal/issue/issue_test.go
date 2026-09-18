@@ -115,27 +115,24 @@ func TestAddRequestHasNoDerivedFields(t *testing.T) {
 	}
 }
 
-// TestParseAddKindAndPrerelease 钉住两个新字段的取值，重点是**它们的空值**。
+// TestParseAddPrerelease 钉住那个勾选项的取值，重点是**它的空值**。
 //
-// 空值是这里的实质：
-//   - 下拉里的「普通应用」必须落到**空串**上（= `Source.Kind` 的零值），而不是一个叫
-//     "普通应用"的 kind —— 后者会被 ValidateKind 判成非法，于是模板的默认值本身成了陷阱。
-//   - 勾选项未勾 → GitHub 渲染成 `- [ ] xxx`（**在正文里，不是消失**）→ 必须解析成 false。
-//     写成"没出现在正文里就是 false"是错的，那等于把"用户明确没勾"和"这个字段不存在"
-//     混成一个状态，而前者在模板里永远是出现过的。
-func TestParseAddKindAndPrerelease(t *testing.T) {
+// 勾选项未勾 → GitHub 渲染成 `- [ ] xxx`（**在正文里，不是消失**）→ 必须解析成 false。
+// 写成"没出现在正文里就是 false"是错的，那等于把"用户明确没勾"和"这个字段不存在"
+// 混成一个状态，而前者在模板里永远是出现过的。
+//
+// 第二段用的是一份**带着「应用类型」那一段**的老正文（那个下拉随 D58 一起从模板里删了）。
+// 留这个用例是因为已开着的单子里满是它：多出来的段落在解析器眼里只是一个没人认领的
+// 标题，必须被忽略而不是让整份申请读不出来。
+func TestParseAddPrerelease(t *testing.T) {
 	r, err := issue.ParseAdd(issue.Parse(addBody))
 	if err != nil {
 		t.Fatalf("ParseAdd：%v", err)
-	}
-	if r.Kind != "" {
-		t.Errorf("kind = %q，期望空串（下拉默认项「普通应用」）", r.Kind)
 	}
 	if !r.IncludePrerelease {
 		t.Error("勾了 prerelease，期望 true")
 	}
 
-	// 选了 companion、且没勾 prerelease。
 	body := `### 上游 GitHub 仓库
 
 ImranR98/Obtainium
@@ -152,21 +149,11 @@ companion
 	if err != nil {
 		t.Fatalf("ParseAdd：%v", err)
 	}
-	if r.Kind != model.KindCompanion {
-		t.Errorf("kind = %q，期望 %q", r.Kind, model.KindCompanion)
-	}
 	if r.IncludePrerelease {
 		t.Error("没勾 prerelease，期望 false")
 	}
-
-	// 这次模板改动**之前**提交的老单子：正文里根本没有「应用类型」那一段。
-	// 它必须仍然解析成普通应用（空串），否则新模板一上线，所有已开着的单子全体失效。
-	r, err = issue.ParseAdd(issue.Parse("### 上游 GitHub 仓库\n\nImranR98/Obtainium\n"))
-	if err != nil {
-		t.Fatalf("ParseAdd：%v", err)
-	}
-	if r.Kind != "" {
-		t.Errorf("没有「应用类型」那一段时 kind = %q，期望空串", r.Kind)
+	if r.Repo != "ImranR98/Obtainium" {
+		t.Errorf("repo = %q", r.Repo)
 	}
 }
 
@@ -415,8 +402,7 @@ func TestLabelsMatchStoreTemplates(t *testing.T) {
 	}{
 		{"add-source.yml", []string{
 			issue.LabelRepo, issue.LabelAssetPat, issue.LabelDesc,
-			issue.LabelCategories, issue.LabelABIs,
-			issue.LabelKind, issue.LabelPrerelease,
+			issue.LabelCategories, issue.LabelABIs, issue.LabelPrerelease,
 		}},
 		{"change-source.yml", []string{
 			issue.LabelTargetAppID, issue.LabelAction, issue.LabelNewName,

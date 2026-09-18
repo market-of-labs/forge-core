@@ -17,26 +17,8 @@ import (
 // 是为了让"改契约"变成一次编译期可见的改动，而不是一次 grep。
 
 const (
-	// SchemaVersion 恒为 2 —— 沿用原版 Obtainium 的 ExportSchema v2（02 §2.1）。
-	SchemaVersion = 2
-
-	// SentinelHost 是哨兵源地址的前缀。`.invalid` 是 RFC 2606 保留 TLD，
-	// **规范保证不可解析** —— 所以这个地址永不联网，纯粹当唯一键与展示用（02 规则 8）。
-	//
-	// 绝不要改成 `.local`：那是 mDNS 保留域，在真实网络里**可能真的被解析**，
-	// 于是哨兵地址会变成一次真实请求。
-	SentinelHost = "https://market.invalid/"
-
-	// OverrideSource 恒为 "HTML"（02 §2.2）：哨兵 host 走不到任何源时 getSource 会抛
-	// UnsupportedURLError，虽然被 Obtainium 吞掉，但会在设备日志里留噪声。
-	OverrideSource = "HTML"
-
-	// KindObtainium / KindCompanion 是 02 规则 9 允许的**全部** kind 取值。
-	KindObtainium = "obtainium"
-	KindCompanion = "companion"
-
 	// IncomingTag 是手动上传暂存 Release 的 tag（03 §3.2）。它不是合法 appId，
-	// check-manifest 对它直接判失败（03 §3.1）。
+	// check-repo 对它直接判失败（03 §3.1）。
 	IncomingTag = "_incoming"
 
 	// SourceGitHub / SourceManual 是 sources/{appId}.json 的 source 取值（03 §2.2）。
@@ -49,21 +31,26 @@ const (
 
 	// AuthorUnknown 是**自动收录**的手动来源在拿到真作者之前的占位值（03 §2.5.3 / §3.2）。
 	//
-	// 为什么必须有值、不能留空：`author` 是 02 规则 2 的必填字段，而那条规则是 **Errorf** ——
-	// 一个空 author 会让**整份清单**判失败，市场里所有条目一起下架，不是只废掉这一条。
-	// 而 `paused: true` 也救不了它（那个布尔只管"要不要去上游看新版本"，条目照样渲染）。
+	// 为什么必须有值、不能留空：`author` 渲染成 metadata 的 `AuthorName`，而
+	// `fdroid.Render` 见空 author 直接报错 —— 于是 `build-repo` **整轮中止**，
+	// 一个字节都不会回写，市场从那一刻起停止更新（不是"只少一个应用"）。
+	//
+	// `paused: true` 确实能绕过它（paused 的来源根本不渲染），但代价是这个应用
+	// **从索引里消失** —— 已经装了的用户不会掉，但也再也收不到更新。那是停用一个
+	// 来源的手段，不是给一条待补录的条目打补丁的手段。
 	//
 	// 它只会出现在"APK 先传上来、条目由搬运流程当场建出来"这条路上：手动上传不再走新增单，
 	// 所以收录时没有人可以问作者；APK 里没有作者字段，也没有上游仓库可以取 owner。
 	// **看到这个值就等于"这条来源还在等一张 change-source.yml"** —— 它是唯一的提示信号。
 	AuthorUnknown = "未知"
 
-	// EntryCountWarn 是清单条目数的软告警阈值（03 §5.3）：全量推送把市场规模
-	// 直接暴露为设备端单次 deep-link URI 的大小（01 §3.6），超过就该警觉。
-	EntryCountWarn = 150
-
 	// ReleaseAssetCountWarn 是单个 Release 的 asset 数软告警阈值。硬上限是 1000
 	// （03 §3.3，GitHub 官方明文），提前在 800 报警是为了不撞顶。
+	//
+	// 关于这条阈值在 F-Droid 路线下的**新**处境：索引不再由我们手工组装，而是
+	// fdroidserver 扫 `repo/` 扫出来的 —— 但 APK 仍然一个一个躺在 Release 里，
+	// 所以这条上限一点没变松。恰恰相反：老版本靠 CI cache 累积保留（D 轮的 cache 决定）
+	// 意味着 asset 数**单调增长**，而每轮只下最新版意味着我们不会主动重下老版本来稀释它。
 	ReleaseAssetCountWarn = 800
 )
 
@@ -79,70 +66,16 @@ const (
 // 那个的顺序是排序位次，动不得。
 var ReviewCategories = []string{"工具", "效率", "媒体", "通讯", "开发", "游戏", "其他"}
 
-// SentinelURL 渲染条目的哨兵源地址。
-func SentinelURL(id string) string { return SentinelHost + id }
-
-// NowISO 是 exportedAt 的取值格式（02 §2.1：ISO-8601 UTC）。
-// 手动上传的版本也用它填 Version.PublishedAt（见 job.recordPlaced）。
+// NowISO 是 RFC3339 UTC 时间戳的取值格式。
+//
+// 它曾经只服务于清单的 `exportedAt`（02 §2.1），那个字段随 F-Droid 那条路一起没了。
+// 现在唯一的调用点是手动上传记版本时填 `Version.PublishedAt` —— 但格式没变：
+// 规格里凡是要写一个时刻的地方都写 RFC3339 UTC，所以它作为**格式**的单一出处留着。
 func NowISO() string { return time.Now().UTC().Format(time.RFC3339) }
-
-// ReleaseDate 把发布时间转成清单 releaseDate 字段的整数形式。
-//
-// ⚠️ **单位是微秒**，权威是 Obtainium 的解析器而不是本仓库里的任何一份数据：
-//
-//	lib/providers/source_provider.dart:301-303
-//	    releaseDate: json['releaseDate'] == null
-//	        ? null
-//	        : DateTime.fromMicrosecondsSinceEpoch(json['releaseDate']),
-//
-// 旁边 292 行的 lastUpdateCheck 同样是微秒，两者是一致的。
-//
-// 曾经这里用的是 UnixMilli()，理由是"store 里现存的 apps.json 写的是 13 位毫秒"。
-// 那个理由只比对了「文档 vs 数据」两个候选，漏掉了真正说了算的第三方 —— 结果
-// 13 位被 Obtainium 当微秒读，每个 App 的发布日期都显示成 **1970-01-21**，且静默。
-// 数据文件错得和代码一模一样，所以互相印证、谁都没发现。数据已一并改正。
-//
-// 这个字段也不是纯展示：additionalSettings.releaseDateAsVersion 会拿它当版本号
-// 参与比较（Obtainium lib/providers/app_json_migration.dart:58），差 1000 倍会直接
-// 影响判更新。
-func ReleaseDate(t time.Time) int64 { return t.UTC().UnixMicro() }
-
-// ---- 02 §2.1 清单信封 -------------------------------------------------------
-
-// Manifest 是 apps.json 的顶层结构。
-type Manifest struct {
-	SchemaVersion int     `json:"schemaVersion"`
-	ExportedAt    string  `json:"exportedAt"`
-	GeneratedBy   string  `json:"generatedBy,omitempty"`
-	Apps          []Entry `json:"apps"`
-}
-
-// Entry 是清单里的一个 App 条目（02 §2.2）。字段顺序即 JSON 输出顺序 ——
-// 保持它在规范里的顺序，让生成的 apps.json 有稳定的 diff。
-type Entry struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	Author          string `json:"author"`
-	URL             string `json:"url"`
-	OverrideSource  string `json:"overrideSource"`
-	LatestVersion   string `json:"latestVersion"`
-	APKUrls         string `json:"apkUrls"`
-	OtherAssetUrls  string `json:"otherAssetUrls"`
-	PreferredAPKIdx int    `json:"preferredApkIndex"`
-	// AdditionalSettings 是 JSON **字符串** map（02 §2.3），不是嵌套对象 ——
-	// 原版 Obtainium 的 ExportSchema 就是这么存的，改不了。
-	AdditionalSettings string   `json:"additionalSettings"`
-	ReleaseDate        int64    `json:"releaseDate,omitempty"`
-	ChangeLog          string   `json:"changeLog"`
-	Categories         []string `json:"categories"`
-	// Kind 是**清单侧元数据**，不是 Obtainium 字段：伴侣应用生成 deep link 前
-	// 必须把带 kind 的条目整体剔除（01 §3.11）。omitempty 让普通 App 不出现该键。
-	Kind string `json:"kind,omitempty"`
-}
 
 // ---- 03 §2.2 sources/{appId}.json ------------------------------------------
 
-// Source 是一个 App 的**维护输入**。它是唯一事实源：apps.json 与 Release 现状
+// Source 是一个 App 的**维护输入**。它是唯一事实源：metadata、Release 现状
 // 全部可以从它 + 上游推出。
 //
 // 上半部分是人填的（走 issue 表单），下半部分的 Versions 是 forge 写的（见那里的说明）。
@@ -150,14 +83,16 @@ type Source struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Author string `json:"author"`
-	// Desc 是一句话简介，可选。它**独立存**，只在合成清单时拼到 Name 后面
-	// （由 DisplayName 决定怎么拼）—— 存成拼接后的整串，将来改分隔符就得重写全部数据，
-	// 而且申请人"改简介"会变成"改显示名"。
+	// Desc 是一句话简介，可选。它**独立存**，只在渲染 metadata 时落成 F-Droid 的
+	// `Summary` 字段（02 §2.5）—— 与 `name` 是两个字段、不是一个拼接结果的来源。
+	//
+	// 它曾经是"拼到显示名后面"的那半段（`名字 · 简介`，D42）。F-Droid 的
+	// `Name`/`Summary` 本来就是两字段，于是那套拼接连同它的分隔符一起作废了：
+	// 客户端怎么摆这两段是**客户端**的事，不是数据的事。
 	Desc       string   `json:"desc,omitempty"`
 	Source     string   `json:"source"` // SourceGitHub | SourceManual
 	Paused     bool     `json:"paused"`
 	Categories []string `json:"categories,omitempty"`
-	Kind       string   `json:"kind,omitempty"`
 	// Upstream 仅在 source == "github" 时必填。
 	Upstream *Upstream `json:"upstream,omitempty"`
 	// ABIWhitelist 缺省空 = 该版本全 ABI 分片都镜像；用于控体积（D14）。
@@ -179,29 +114,12 @@ type Source struct {
 
 // 简介的长度上限，单位是 **rune**（汉字算一个）。
 //
-// 20 这个数字是**量出来的**，不是拍的：Obtainium 列表行的标题是
-// `maxLines: 1` + `TextOverflow.ellipsis`（`app_list_tile.dart`），手机上一行
-// 连名字带简介大约放得下 17 个汉字 —— 所以 20 rune 的简介在大多数条目上不会把
-// 标题挤成省略号，而再长就一定挤。它同时也是"这是简介不是描述"的强制提醒。
+// 20 这个数字是**量出来的**，不是拍的：它当初是照着 Obtainium 列表行的标题
+// （`maxLines: 1` + `TextOverflow.ellipsis`，`app_list_tile.dart`）定的，一行
+// 大约放得下 17 个汉字。F-Droid 客户端那边 `Summary` 的处境一样 —— 它同样是
+// 列表行里的一行小字。所以这个上限**没变**，只是现在它约束的是 `Summary` 本身，
+// 而不再是"标题里跟在名字后面的那半段"。
 const MaxDescRunes = 20
-
-// DescSeparator 是 Name 与 Desc 之间的分隔符。
-//
-// 用中点而不是 `-`/`()`/`|`：Obtainium 的显示名里本来就允许出现后三者
-// （`app-suffix`、`Foo (Bar)`），而中点几乎不会自然出现在应用名里 ——
-// 一眼就能看出"中点两边是两个不同的字段"。
-const DescSeparator = " · "
-
-// DisplayName 是**清单里的**显示名：有简介时拼成 `名字 · 简介`。
-//
-// 这是 desc 唯一被消费的地方（D42）—— `sources/` 里两者始终分开存，
-// 于是改分隔符、改拼法都不用重写数据。
-func (s *Source) DisplayName() string {
-	if s.Desc == "" {
-		return s.Name
-	}
-	return s.Name + DescSeparator + s.Desc
-}
 
 // TruncateDesc 把一份申请里填的简介裁到 MaxDescRunes 个 rune 并去掉首尾空白。
 //
@@ -238,18 +156,37 @@ type Upstream struct {
 
 // ---- 03 §2.3 store/endpoints.json ------------------------------------------
 
-// Endpoints 是地址模板。**它是人改的配置，不是产物** —— 第一期与部署期的唯一差别
-// 就是这个文件里的第三行（03 §2.3）。
+// Endpoints 是地址配置。**它是人改的配置，不是产物** —— 第一期与部署期的差别
+// 就落在 repoUrl 这一行上（03 §2.3）。
+//
+// 它的形状从"三个模板"变成了"两个模板 + 一个成品地址"：
+//
+//	· 前两个仍然只描述**名字**（Release tag 与 asset 文件名），本机可校验；
+//	· 第三个的**替代品** repoUrl 不是一个模板，而是一个可以直接用的地址 ——
+//	  因为下载地址不再由我们产出（客户端拿 `address + "/" + 文件名` 自拼，D62），
+//	  于是 `{fileName}` 这个占位符连同它那一整套模板机制一起没有了。
+//
+// repoUrl 是 `index-v2.json` 里 `repo.address` 的**唯一出处**，也就是客户端的源地址。
 type Endpoints struct {
 	TagTemplate       string `json:"tagTemplate"`
 	AssetNameTemplate string `json:"assetNameTemplate"`
-	AssetURLTemplate  string `json:"assetUrlTemplate"`
+	RepoURL           string `json:"repoUrl"`
 }
 
 // ---- 03 §2.4 版本账本（Source.Versions） -------------------------------------
 
-// Version 是一个已镜像版本的全部 ABI 分片。apps.json 只描述最新版，历史版本无处存放
-// （tag 里没有版本段），这块由它补上。
+// Version 是一个已镜像版本的全部 ABI 分片。
+//
+// ⚠️ F-Droid 路线下它与索引的关系**反过来了**，这一点值得先看清楚再读下面的字段：
+// 以前是账本 → 清单的 `apkUrls`，索引里有什么完全由账本决定；现在索引由 fdroidserver
+// 扫 `repo/` 目录扫出来（以 APK 的 sha256 为键），所以**索引的事实源是磁盘上的文件**，
+// 不是这里。账本记错了不会让索引跟着错，只会让"该去 cache 里取哪些文件"这件事失准。
+//
+// 那它还剩什么用？两件，都不是可有可无的：
+//
+//	· `UpstreamTag` 是**对账的幂等键**（见那个字段）—— 与路线无关，且不可替代；
+//	· 它是一个可读的"这个应用镜像过什么"的记录。老版本靠 CI cache 累积保留，
+//	  而 cache 是一个二进制目录、里面没有清单 —— 出问题时账本是唯一能对得上的东西。
 //
 // 整块是**机器写的**（见 Source.Versions 的说明）：每次对账都由 BuildIndex 重写。
 type Version struct {
@@ -260,17 +197,23 @@ type Version struct {
 	VersionCode int32 `json:"versionCode,omitempty"`
 	// VersionName 是 APK 的**原始** versionName，与 Version（清洗后的 token）区分开。
 	//
-	// 为什么必须存这一份：03 §5.1 要求清单的 `latestVersion` 存**原始 versionName**
-	// （展示与判更新用，原版语义），而文件名里只有清洗后的 token。两者在
-	// versionName 含空白/斜杠时**不同**，只存 token 就永远推不回原始值。
+	// 两者在 versionName 含空白/斜杠时**不同**，而文件名的 charset 是硬契约（02 §2.4），
+	// 于是 token 是有损的 —— 只存 token 就永远推不回原值。
 	//
-	// 这一块不是客户端契约（D23），所以多存一份不违反任何东西。缺该字段时按 Version
-	// 兜底，所以缺元数据的版本照样能读。
+	// 它曾经只服务于清单的 `latestVersion`。那个字段随清单一起没了，而这一份留着
+	// 是因为它**取不回来**：索引里的 versionName 由 fdroidserver 从 APK 现读，
+	// 谁都不会去记"这一版当时叫什么"，除了账本。
+	//
+	// 缺该字段时按 Version 兜底，所以缺元数据的版本照样能读。
 	VersionName string `json:"versionName,omitempty"`
-	// PublishedAt 是该版本的上游发布时间（RFC3339 UTC），用来回填清单的 releaseDate。
+	// PublishedAt 是该版本的上游发布时间（RFC3339 UTC）。
 	//
-	// 不存它，第一次重建清单就会把 releaseDate 丢掉，而那是个**静默的数据退化** ——
-	// 清单格式合法、客户端只是不再显示日期。
+	// 它曾经只服务于清单的 `releaseDate`（那个字段连同它的微秒单位一起没了）。
+	// 现在它是账本里**唯一的时间坐标** —— "最新"这个判断本身就依赖"账本按时间追加"
+	// 这一写入顺序（见 Source.Latest）。
+	//
+	// 不存它，首次重建账本就会把它丢掉，而那是**静默的**数据退化：账本仍然完全合法，
+	// 只是版本之间的先后关系没了，不会有任何一层为此报错。
 	PublishedAt string `json:"publishedAt,omitempty"`
 	// UpstreamTag 是产出这一版本的**上游 Release tag**，用来让对账变成一次集合差。
 	//
@@ -294,9 +237,17 @@ type Version struct {
 	// versionName/versionCode/publishedAt/upstreamTag 是同一类东西：重建账本时只能从
 	// 旧账本里继承回来，否则 build-index 会**静默**丢掉它。
 	//
-	// 暂时不进清单（`changeLog` 仍然留空，理由见 manifest.Build 里的 URI 预算）。
+	// ⚠️ 它目前**没有任何消费者**：F-Droid 的 `ChangeLog` 字段我们没写（02 §2.5 的映射
+	// 表里没有它），而清单的 `changeLog` 随清单一起没了。
+	//
+	// 留着是因为它是**上游写的、丢了就找不回来的**东西 —— "暂时没地方用"和"该删"
+	// 是两回事，而这条数据的来源（上游 Release 正文）在下一次对账之后就变了。
 	ReleaseNote string `json:"releaseNote,omitempty"`
-	// Assets 是该版本的全部分片，**顺序即 apkUrls 的顺序**（02 §2.4：universal 在前）。
+	// Assets 是该版本的全部分片。
+	//
+	// 顺序在这里仍然是**有意义的**：universal 在前（02 §2.4）。它曾经直接决定清单
+	// `apkUrls` 的次序，现在次序由客户端自己折叠 ABI 时决定 —— 但账本是喂给
+	// `job` 的那份输入，保留一个稳定的顺序仍然是对的，否则同一份数据会产出两种 diff。
 	Assets []Asset `json:"assets"`
 }
 
@@ -313,15 +264,10 @@ func (s *Source) MirroredUpstreamTag(tag string) bool {
 	return false
 }
 
-// DisplayVersion 返回用于清单 `latestVersion` 的原始版本名，见 VersionName 的说明。
-func (v *Version) DisplayVersion() string {
-	if v.VersionName != "" {
-		return v.VersionName
-	}
-	return v.Version
-}
-
 // ABIs 按 assets 出现顺序返回 ABI token 列表。
+//
+// 与 Latest 是一对：`src.Latest().ABIs()` 就是"这个应用最新版的全部 ABI 分片"，
+// 而那正是每轮要去上游取的那组文件（索引覆盖的决定：只取最新版，老版本走 cache）。
 func (v *Version) ABIs() []string {
 	out := make([]string, 0, len(v.Assets))
 	for _, a := range v.Assets {
@@ -347,7 +293,7 @@ func (s *Source) FindVersion(version string) *Version {
 	return nil
 }
 
-// Latest 返回"最新"的那个版本，供清单的 latestVersion / apkUrls 使用。
+// Latest 返回"最新"的那个版本，供组装每轮的下载清单使用（见 ABIs）。
 //
 // **判据是"列表最后一个"，不是"versionCode 最大"** —— 这是刻意的：
 //
@@ -358,8 +304,10 @@ func (s *Source) FindVersion(version string) *Version {
 // （reconcile 按上游发布时间顺序镜像，build-index 保留已知版本的位置、新版本追加到末尾）。
 // 所以"最后一个 = 最新"是这套写入顺序的直接推论，不需要再猜排序规则。
 //
-// check-manifest 会额外检查"最新版的 versionCode 是否是该 App 里最大的"，
-// 把反常情形作为告警暴露出来，而不是由这里悄悄替人做决定。
+// ⚠️ 这与**上游**判"哪个 Release 最新"是两件事：那边按 GitHub 给的时间排
+// （`job/upstream` 的候选序），这边按账本的写入序。两者在正常流向下一致，
+// 而一旦不一致，`Latest()` 会说的是"账本认为最新的那个"——
+// 所以它只该被用在"从账本取东西"的场景，不该被用来判定要不要去上游取新版本。
 func (s *Source) Latest() *Version {
 	if len(s.Versions) == 0 {
 		return nil

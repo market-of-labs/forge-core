@@ -66,9 +66,10 @@ func run(args []string) int {
 	// 规则 9：GitHub 自动脱敏的模式表里只有 ghp_/gho_/ghu_/ghs_/ghr_，**不含
 	// github_pat_** —— 而我们用的正是 fine-grained PAT，所以这一行不是可选的。
 	// 而 forge 是公有仓库，它的 Actions 日志任何登录用户都能读（§6.2 不变量 3）。
-	if line := env.AddMask(); line != "" {
-		fmt.Println(line)
-	}
+	//
+	// 掩的是全部秘密（PAT + keystore 的 base64 + 两个口令），见 Env.AddMask。
+	// 这里**不检查返回值**：它自己负责打印，返回的只是给测试看的那几行。
+	env.AddMask()
 
 	log("forge %s | %s", verb, env.Sanitized())
 
@@ -188,21 +189,24 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 		}
 		return exitFailed, err
 
-	case "build-manifest":
+	case "build-repo":
 		// 一个开关都没有（从前也没真有过一个 `--check` 预演模式）。留下 flagset 只为了
 		// 让多余参数报错，而不是被静静忽略 —— 与 build-index 同一个理由。
 		fs := newFlagSet(verb)
 		if err := fs.Parse(args); err != nil {
 			return exitUsage, err
 		}
-		_, rep, err := job.BuildManifest(c)
+		// ⚠️ 这个动词**必须在 debian:trixie 容器里跑**：它要调 `fdroid update`
+		// （见 job.runFdroidUpdate 里那条指名道姓的错误）。
+		rep, err := job.BuildRepo(ctx, c)
 		if rep != nil {
 			c.Reportf(rep)
 		}
 		return exitFailed, err
 
-	case "check-manifest":
-		_, rep, err := job.CheckManifest(c)
+	case "check-repo":
+		// 与 build-repo 一样依赖容器 —— `jarsigner -verify` 是它唯一的子进程。
+		rep, err := job.CheckRepo(ctx, c)
 		if err != nil {
 			return exitFailed, err
 		}
@@ -268,8 +272,8 @@ var verbDoc = []struct{ name, doc string }{
 	{"resolve-upstream", "只算出该镜像哪些版本，打印计划（不下载不上传）"},
 	{"mirror-upstream", "下载 → 按内容判 ABI → 改名 → 幂等上传（§4.4 第 3 步）"},
 	{"build-index", "从 Release 现状重建各 sources 条目的 versions 账本（§5.2）"},
-	{"build-manifest", "由 sources（自带账本）+ endpoints 合成 apps.json（§5.1）"},
-	{"check-manifest", "对 apps.json 跑 02 §2.8 自检 + 阈值告警（§5.3）"},
+	{"build-repo", "渲染 metadata → 凑齐 APK → fdroid update → 产物进 repo/（§5.1，需容器）"},
+	{"check-repo", "对磁盘上的产物跑 02 §2.8 自检 + 阈值告警（§5.3，需容器）"},
 	{"reconcile", "幂等全量对账：解析 → 镜像 → 重建 → 回写（§4.4）"},
 	{"commit-back", "把工作副本的改动按固定路径提交并推送（§5.5，自动加 [skip-dispatch]）"},
 	{"verbs", "列出全部子命令（供脚本消费）"},
@@ -300,5 +304,9 @@ func usage() {
 	fmt.Fprintf(w, "  FORGE_API_BASE      API 根地址（默认 %s；Actions 里自动取 $GITHUB_API_URL）\n", job.DefaultAPIBase)
 	fmt.Fprintf(w, "  EVENT / ISSUE / SHA / REF\n")
 	fmt.Fprintf(w, "                      事件字段（03 §2.6）；手动按钮走 EVENT\n")
+	fmt.Fprintf(w, "  APK_CACHE_DIR       跨轮持久的 APK 目录；为空 = 索引里只会有最新版本\n")
+	fmt.Fprintf(w, "  REPO_KEYSTORE_B64   签名 keystore 的 base64（build-repo 必需，03 §5.1）\n")
+	fmt.Fprintf(w, "  REPO_KEYSTORE_PASS  它的口令\n")
+	fmt.Fprintf(w, "  REPO_KEY_PASS       私钥口令（JKS 允许与上面不同）\n")
 	fmt.Fprintf(w, "\n退出码：0 成功 · 1 执行失败 · 2 用法或配置错误 · 3 自检发现硬错误\n")
 }

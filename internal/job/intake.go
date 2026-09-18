@@ -118,7 +118,8 @@ func DecideIntake(c *Ctx, body string) *IntakeDecision {
 // 是纯函数、不许联网。所以这里只做两件不需要网络的事：取值、本地校验 —— 真正的解析与
 // 落盘紧接着在同一条链上做（见 newsource.go）。
 //
-// 手动上传**不经过这里**（03 §3.2）：没有「来源类型」下拉，也就没有手动源的单子。
+// 手动上传**不经过这里**（03 §3.2）：把 APK 传进 `_incoming` 就行，条目由搬运流程
+// 当场建出来，没有人会去填这张单。
 //
 // 这里也**不再回一段"已收到"**。那一段只是把申请人刚填的东西复述回去，而它与落盘后的
 // 「已收录」回评几乎逐行重叠 —— 一张单要读两条一样的表，还得分辨哪条是现在的。留下的
@@ -131,15 +132,6 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 	if err := validateAdd(r); err != nil {
 		return reject(fmt.Sprintf("申请内容不合法：%v", err))
 	}
-	if other := companionConflict(c, r); other != nil {
-		return reject(fmt.Sprintf(
-			"`kind: companion` 全局至多一条（02 规则 9），现在已经是 `%s`（%s）了。\n\n"+
-				"伴侣应用换成另一个是维护者改 `sources/%s.json` 的事 —— "+
-				"**这一条刻意不给申请改**：让一张申请能把整个市场的伴侣应用顶掉，"+
-				"代价是全部设备的自更新源被换走。",
-			other.ID, originOf(other), other.ID))
-	}
-
 	// 简介**裁而不拒**：上限 20 rune 是量出来的（见 model.MaxDescRunes），为一个纯装饰
 	// 字段让人重填不值得。但**裁了就必须说** —— 默默把人写的东西切掉、再回评一句
 	// "已收录"，是最难发现的那种假回评。这句话跟着决定走到落盘后的那条回评里去。
@@ -148,7 +140,7 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 	if desc != strings.TrimSpace(r.Desc) {
 		note = fmt.Sprintf(
 			"⚠️ 你填的简介超过了 %d 个字的长度上限，上面显示的是**截断**后的。"+
-				"它进的是 Obtainium 列表里的标题行（单行、超出即省略号），写长了显示不全；"+
+				"它落成客户端列表里那一行小字（单行、超出即省略号），写长了显示不全；"+
 				"想换一个的话，**编辑正文**重填即可。\n\n",
 			model.MaxDescRunes)
 	}
@@ -169,7 +161,6 @@ func decideAdd(c *Ctx, f *issue.Form) *IntakeDecision {
 				// 探身份时若把它跳掉，会从一个更老的 release 里读出身份（甚至报"没有可镜像的发布"）。
 				IncludePrerelease: r.IncludePrerelease,
 			},
-			Kind:         r.Kind,
 			Categories:   r.Categories,
 			ABIWhitelist: r.ABIWhitelist,
 			Desc:         desc,
@@ -205,54 +196,21 @@ func validateAdd(r *issue.AddRequest) error {
 				a, naming.ABISet)
 		}
 	}
-	// kind 的规则与手改文件那条入口共用同一个函数，不另写一份判断。
-	return model.ValidateKind(r.Kind)
+	return nil
 }
 
 // originOf 用一句话说明这条来源的二进制从哪来：上游仓库，或手动上传队列。
 //
-// 两处拒绝回评要念它（撞包名、撞 companion），而"手动来源没有上游"是个会让消息直接
-// 崩掉的 nil —— 所以这句话只在这里说一次。
+// 撞包名的拒绝回评要念它，而"手动来源没有上游"是个会让消息直接崩掉的 nil ——
+// 所以这句话只在这里说一次。
+//
+// ⚠️ 它曾经还有第二个调用点（撞 companion 的那条拒绝，D58 作废）—— 那个闸门连同
+// `kind` 一起没了：市场上只有"应用"这一种东西，没有全局唯一的第二条来源可言。
 func originOf(s *model.Source) string {
 	if s.Upstream == nil {
 		return "手动上传来源，没有上游"
 	}
 	return fmt.Sprintf("来自 `%s`", s.Upstream.Repo)
-}
-
-// companionConflict 检查这份申请会不会造出**第二条** kind=companion —— 是的话返回占位
-// 的那一条，否则 nil。
-//
-// 为什么这条规则要提前到这里判：`CheckSourceSet` 已经有一条同样的规则（02 规则 9），
-// 但它在**落盘之后**才跑 —— 那时第二份文件已经在 `sources/` 里了，而后续的
-// check-manifest 会因此判**硬失败**，整份清单推不出去，直到有人手动删掉那个文件。
-// 一张陌生人的申请能把整个 store 卡住，这是这套流程里唯一一处"外部输入能造成持续故障"
-// 的地方，堵在门口最省事。
-//
-// **同一条目重跑不算冲突**：编辑正文重新发车是这套设计的重试路径（见 landNewSource），
-// 而那时已有的 companion 就是这份申请自己写的 —— 判据见 sameCompanionRequest。
-func companionConflict(c *Ctx, r *issue.AddRequest) *model.Source {
-	if r.Kind != model.KindCompanion {
-		return nil
-	}
-	// 逐条扫、**不按来源种类筛**：`kind` 只有新增单能写（D47），而手动来源没有新增单
-	// （D52），所以"有没有上游"在这里不是判据 —— 判据就是 `kind` 本身。
-	for i := range c.Sources {
-		s := &c.Sources[i]
-		if s.Kind != model.KindCompanion || sameCompanionRequest(s, r) {
-			continue
-		}
-		return s
-	}
-	return nil
-}
-
-// sameCompanionRequest 判断一条已落的 companion 来源是不是**这份申请自己**写出来的。
-//
-// 与 sameRequest 同一套思路（比"这份申请能决定的那一半"）：此刻 appId 还没探出来，
-// 所以比的是上游仓库。
-func sameCompanionRequest(s *model.Source, r *issue.AddRequest) bool {
-	return s.Upstream != nil && s.Upstream.Repo == r.Repo
 }
 
 func decideChange(c *Ctx, f *issue.Form) *IntakeDecision {

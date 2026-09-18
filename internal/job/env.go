@@ -36,6 +36,28 @@ const (
 	// 所以默认由 API 地址推导（api.github.com → uploads.github.com）。
 	EnvUploadBase = "FORGE_UPLOAD_BASE"
 
+	// EnvAPKCacheDir 指向一个**跨轮持久**的 APK 目录，为空表示没有 cache。
+	//
+	// 它是"索引里保留老版本"这条需求的**唯一实现手段**：CI 里每轮 store 都是全新浅克隆
+	// （见 Ctx.Open），所以一个不落在克隆之外的目录活不过一轮。工作流那边由一个
+	// `actions/cache` 步骤维护它（用的是滚动 key，**不能** key 在 sources 的哈希上 ——
+	// 那样每次改来源 cache 就整个失效，老版本一起丢）。
+	//
+	// 语义只有一条：**里面躺着以前下过的 APK 文件，文件名就是 Release asset 名**。
+	// 没有清单、没有元数据 —— 那正是 `sources/*.json` 的 `versions` 账本存在的理由
+	// （见 model.Version），cache 自己回答不了"我有哪些版本"。
+	EnvAPKCacheDir = "APK_CACHE_DIR"
+
+	// 签名密钥三件套（03 §5.1）。keystore 的字节走 base64（它能装进一个 secret），
+	// 两个口令分开存：JKS 允许 storepass 与 keypass 不同，虽然我们生成时用的是一个值。
+	//
+	// ⚠️ 它们**不是**"跑起来才需要的输入"，而是**每次 build-repo 都必须有**的：
+	// `fdroid update` 没有密钥就签不出 `entry.jar`，而 `entry.jar` 缺失不是"少一个文件"，
+	// 是**所有客户端拒绝这个源**。所以缺密钥时要在读配置那一层就拒绝（见 Keystore）。
+	EnvKeystoreB64  = "REPO_KEYSTORE_B64"
+	EnvKeystorePass = "REPO_KEYSTORE_PASS"
+	EnvKeyPass      = "REPO_KEY_PASS"
+
 	// 以下是 repository_dispatch 的 client_payload 带过来的事件字段（03 §2.6）。
 	//
 	// 这里**没有** releaseTag / prerelease：它们只服务过 `release: published`
@@ -74,6 +96,15 @@ type Env struct {
 	SHA   string
 	Ref   string
 
+	// APKCacheDir 见 EnvAPKCacheDir。为空 = 这一轮**没有** cache：
+	// 于是本轮只有最新版本会进索引，老版本一个都不会有。
+	APKCacheDir string
+
+	// 签名密钥（见上面那三个环境变量）。它们是**秘密**，与 Token 同级。
+	KeystoreB64  string
+	KeystorePass string
+	KeyPass      string
+
 	// InCI 表示跑在 GitHub Actions 里。只影响 ::add-mask:: 要不要发。
 	InCI bool
 }
@@ -93,6 +124,16 @@ func FromEnv() (*Env, error) {
 		SHA:   os.Getenv(EnvSHA),
 		Ref:   os.Getenv(EnvRef),
 		InCI:  os.Getenv("GITHUB_ACTIONS") == "true",
+
+		APKCacheDir: strings.TrimSpace(os.Getenv(EnvAPKCacheDir)),
+
+		// 口令**不 TrimSpace**：JKS 的口令是任意字节串，首尾空格是合法且常见的一部分，
+		// 而"顺手 trim 一下"会把一个正确的口令变成错的 —— 且症状是"keystore was tampered
+		// with, or password was incorrect"，跟口令错一模一样，根本指不回这里。
+		// base64 那一段可以 trim（它由 `base64 -w0` 产出，换行只会来自粘贴）。
+		KeystoreB64:  strings.TrimSpace(os.Getenv(EnvKeystoreB64)),
+		KeystorePass: os.Getenv(EnvKeystorePass),
+		KeyPass:      os.Getenv(EnvKeyPass),
 	}
 
 	if v := strings.TrimSpace(os.Getenv(EnvIssue)); v != "" {
@@ -141,36 +182,77 @@ func (e *Env) RequireToken(what string) error {
 // IsOwnCheckout 报告工作副本是不是调用方给的（true）还是我们临时克隆的（false）。
 func (e *Env) IsOwnCheckout() bool { return e.StoreDir != "" }
 
+// RequireKeystore 断言签名密钥齐全。`build-repo` 之前调用。
+//
+// 失败信息里点名**它存哪**（仓库级 secret），因为这条配置错误的唯一修法是去仓库设置里加一个，
+// 而报错发生在容器深处、离那个设置页很远。
+func (e *Env) RequireKeystore() error {
+	if e.KeystoreB64 == "" {
+		return fmt.Errorf("%s 为空 —— build-repo 靠它签 `entry.jar`，而 entry.jar 缺失或验签失败"+
+			"不是「少一个文件」，是**所有客户端拒绝这个源**（02 §2.2）。它是 `base64 -w0 <keystore>` "+
+			"的结果，存在 %s 的仓库级 secret 里（03 §5.1）", EnvKeystoreB64, e.ForgeRepo)
+	}
+	if e.KeystorePass == "" || e.KeyPass == "" {
+		return fmt.Errorf("%s / %s 为空 —— 它们分别是 keystore 与私钥的口令。"+
+			"JKS 允许两者不同（我们生成时用的是同一个值），所以两个都要设",
+			EnvKeystorePass, EnvKeyPass)
+	}
+	return nil
+}
+
 // AddMask 发出 GitHub 的 ::add-mask:: 掩码指令（03 §4.5 规则 9）。
 //
 // 为什么必须自己做：GitHub 的自动脱敏表里只有 `ghp_/gho_/ghu_/ghs_/ghr_` 前缀，
 // **不含 `github_pat_`** —— 而我们用的正是 fine-grained PAT。不发这一行，
 // token 会以明文出现在 Actions 日志里，而公有仓库的日志任何登录用户都能读。
 //
-// 只在 Actions 里发：本地跑时这一行的作用是把 token 打到自己的终端上，
-// 那正是我们要避免的。返回值是实际发出的那一行（测试用），没发则为空。
-func (e *Env) AddMask() string {
-	if !e.InCI || e.Token == "" {
-		return ""
+// 掩的是**全部秘密**，不是只有 token：签名密钥的两个口令与 keystore 的 base64 与 PAT 同级。
+// keystore 字节 + 口令 = 能签出任何东西，而这把 key **一旦发布不可轮换**（D61）——
+// 泄了就是所有客户端删源重加。所以这里的规则是"凡是秘密一律掩"，而不是逐个判断谁需要。
+//
+// 只在 Actions 里发：本地跑时这一行的作用是把秘密打到自己的终端上，那正是我们要避免的。
+// 返回值是实际发出的那些行（测试用），没发则为 nil。
+func (e *Env) AddMask() []string {
+	if !e.InCI {
+		return nil
 	}
-	line := "::add-mask::" + e.Token
-	fmt.Println(line)
-	return line
+	var lines []string
+	for _, secret := range []string{e.Token, e.KeystoreB64, e.KeystorePass, e.KeyPass} {
+		if secret == "" {
+			continue
+		}
+		line := "::add-mask::" + secret
+		fmt.Println(line)
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // Sanitized 返回一份可以安全打进日志的输入摘要。
 //
-// token 只以"有没有 / 多长"的形式出现 —— 长度足够用来判断"是不是把 token 和
+// 秘密只以"有没有 / 多长"的形式出现 —— 长度足够用来判断"是不是把 token 和
 // 别的变量搞混了"，又不足以还原它。
+//
+// `cache=` 要照实打出来（它是路径不是秘密）：**"这一轮有没有 cache"直接决定索引里
+// 会不会有老版本**，而它出问题时的症状是"某个应用的旧版本在某天之后就不见了"——
+// 一个没人会想到去看环境变量的症状。
 func (e *Env) Sanitized() string {
-	tok := "未设置"
-	if e.Token != "" {
-		tok = fmt.Sprintf("已设置(%d 字符)", len(e.Token))
+	secret := func(name, v string) string {
+		if v == "" {
+			return name + "=未设置"
+		}
+		return fmt.Sprintf("%s=已设置(%d 字符)", name, len(v))
+	}
+	cache := e.APKCacheDir
+	if cache == "" {
+		cache = "无（老版本不会进索引）"
 	}
 	return fmt.Sprintf(
-		"event=%q issue=%d sha=%q store=%s forge=%s api=%s token=%s",
+		"event=%q issue=%d sha=%q store=%s forge=%s api=%s %s %s %s cache=%s",
 		e.Event, e.Issue, shortSHA(e.SHA),
-		e.StoreRepo, e.ForgeRepo, e.APIBase, tok)
+		e.StoreRepo, e.ForgeRepo, e.APIBase,
+		secret("token", e.Token), secret("keystore", e.KeystoreB64),
+		secret("pass", e.KeystorePass), cache)
 }
 
 func shortSHA(s string) string {

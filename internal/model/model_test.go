@@ -9,11 +9,15 @@ import (
 )
 
 // phase1Endpoints 是第一期真实使用的模板（03 §2.3）。
+//
+// 与它前身的差别只有第三行：`assetUrlTemplate` 整条没了，换成一个成品地址 `repoUrl`。
+// 前者是"我们怎么拼每个 APK 的地址"，后者是"客户端去哪找这个仓库" ——
+// F-Droid 那条路上地址不再由我们逐条产出（D62）。
 func phase1Endpoints() model.Endpoints {
 	return model.Endpoints{
 		TagTemplate:       "{appId}",
 		AssetNameTemplate: "{appId}-{version}-{abi}.apk",
-		AssetURLTemplate:  "https://github.com/market-of-labs/store/releases/download/{appId}/{fileName}",
+		RepoURL:           "https://apps.example.com/fdroid/repo",
 	}
 }
 
@@ -21,10 +25,23 @@ func TestEndpointsValidateAcceptsRealTemplates(t *testing.T) {
 	real := []model.Endpoints{
 		phase1Endpoints(),
 		{
-			// 部署期：只有第三行不同（03 §2.3）
+			// 部署期的真实形态：同一个仓库地址，但换成最终的 CF 域。
 			TagTemplate:       "{appId}",
 			AssetNameTemplate: "{appId}-{version}-{abi}.apk",
-			AssetURLTemplate:  "https://cf.example.com/asset/{appId}/{version}/{fileName}",
+			RepoURL:           "https://cf.example.com/fdroid/repo",
+		},
+		{
+			// 本机验证那种：`python -m http.server` 不做 TLS，所以回环 http 开了一格
+			// （见 isLoopbackHost）。它连的必然是一个回环地址。
+			TagTemplate:       "{appId}",
+			AssetNameTemplate: "{appId}-{version}-{abi}.apk",
+			RepoURL:           "http://localhost:8000/repo",
+		},
+		{
+			// 带端口 + 127.0.0.1：Hostname() 剥端口那条逻辑的回归位。
+			TagTemplate:       "{appId}",
+			AssetNameTemplate: "{appId}-{version}-{abi}.apk",
+			RepoURL:           "http://127.0.0.1:8080",
 		},
 	}
 	for i, ep := range real {
@@ -47,7 +64,7 @@ func TestEndpointsValidateRejectsDivergence(t *testing.T) {
 			ep: model.Endpoints{
 				TagTemplate:       "{appId}",
 				AssetNameTemplate: "{appId}_{version}_{abi}.apk", // 下划线而不是连字符
-				AssetURLTemplate:  "https://example.com/{appId}/{fileName}",
+				RepoURL:           "https://example.com/repo",
 			},
 			want: "命名契约",
 		},
@@ -57,7 +74,7 @@ func TestEndpointsValidateRejectsDivergence(t *testing.T) {
 			ep: model.Endpoints{
 				TagTemplate:       "release",
 				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
-				AssetURLTemplate:  "https://example.com/{appId}/{fileName}",
+				RepoURL:           "https://example.com/repo",
 			},
 			want: "tag 必须恒等于 appId",
 		},
@@ -67,35 +84,16 @@ func TestEndpointsValidateRejectsDivergence(t *testing.T) {
 			ep: model.Endpoints{
 				TagTemplate:       "{appId}",
 				AssetNameTemplate: "{appId}-{abi}.apk",
-				AssetURLTemplate:  "https://example.com/{appId}/{fileName}",
+				RepoURL:           "https://example.com/repo",
 			},
 			want: "命名契约",
-		},
-		{
-			name: "assetUrlTemplate 缺 fileName",
-			ep: model.Endpoints{
-				TagTemplate:       "{appId}",
-				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
-				AssetURLTemplate:  "https://example.com/{appId}/",
-			},
-			want: "没有 {fileName}",
-		},
-		{
-			// 明文 http 会被客户端拒绝；而 `.invalid` 那条约束只管哨兵地址，管不到这里。
-			name: "assetUrlTemplate 是 http",
-			ep: model.Endpoints{
-				TagTemplate:       "{appId}",
-				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
-				AssetURLTemplate:  "http://example.com/{appId}/{fileName}",
-			},
-			want: "必须是 https",
 		},
 		{
 			name: "占位符拼错",
 			ep: model.Endpoints{
 				TagTemplate:       "{appId}",
-				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
-				AssetURLTemplate:  "https://example.com/{appid}/{fileName}", // 大小写错
+				AssetNameTemplate: "{appId}-{version}-{ABI}.apk", // 大小写错
+				RepoURL:           "https://example.com/repo",
 			},
 			want: "不是已知变量",
 		},
@@ -104,9 +102,48 @@ func TestEndpointsValidateRejectsDivergence(t *testing.T) {
 			ep: model.Endpoints{
 				TagTemplate:       "",
 				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
-				AssetURLTemplate:  "https://example.com/{fileName}",
+				RepoURL:           "https://example.com/repo",
 			},
 			want: "tagTemplate 为空",
+		},
+		{
+			name: "repoUrl 为空",
+			ep: model.Endpoints{
+				TagTemplate:       "{appId}",
+				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
+				RepoURL:           "  ",
+			},
+			want: "repoUrl 为空",
+		},
+		{
+			// 明文 http 会被客户端拒绝；回环那一格豁免管不到这里。
+			name: "repoUrl 是 http（非回环）",
+			ep: model.Endpoints{
+				TagTemplate:       "{appId}",
+				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
+				RepoURL:           "http://example.com/repo",
+			},
+			want: "必须是 https",
+		},
+		{
+			// 这条是"看起来能用"的典型：多数服务端会把双斜杠折掉，于是它跑得通 ——
+			// 而地址是用户添加源时存下来的，发出去就改不回来了。
+			name: "repoUrl 带尾斜杠",
+			ep: model.Endpoints{
+				TagTemplate:       "{appId}",
+				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
+				RepoURL:           "https://example.com/repo/",
+			},
+			want: "尾斜杠",
+		},
+		{
+			name: "repoUrl 没有 host",
+			ep: model.Endpoints{
+				TagTemplate:       "{appId}",
+				AssetNameTemplate: "{appId}-{version}-{abi}.apk",
+				RepoURL:           "https:///repo",
+			},
+			want: "没有 host",
 		},
 	}
 
@@ -123,11 +160,33 @@ func TestEndpointsValidateRejectsDivergence(t *testing.T) {
 	}
 }
 
+// TestLoopbackExemptionIsPrecise 钉住那条 http 豁免**只**落在回环上。
+//
+// 它是本机验证（03 §7 #11）唯一的入口，而一条写松了的豁免会直接变成
+// "线上跑了一份明文 http 的源地址"—— 那是客户端拒绝、而我们会一直不知道的形态。
+func TestLoopbackExemptionIsPrecise(t *testing.T) {
+	base := phase1Endpoints()
+
+	for _, host := range []string{
+		"http://localhost.evil.com/repo",
+		"http://127.0.0.1.evil.com/repo",
+		"http://[::1].evil.com/repo",
+		"http://192.168.1.10/repo", // 内网但不是回环
+	} {
+		ep := base
+		ep.RepoURL = host
+		if err := ep.Validate(); err == nil {
+			t.Errorf("%s 不该被豁免", host)
+		}
+	}
+}
+
 func TestRenderRejectsEmptyValueAndUnclosedBrace(t *testing.T) {
 	ep := phase1Endpoints()
 
-	// 空 appId 渲染出的地址指向仓库根而不是某个 Release —— 必然 404 的地址不该被静默写进清单。
-	if _, err := ep.AssetURL("", "1.0", "a-1.0-universal.apk"); err == nil {
+	// 空 appId 渲染出的文件名以 `-` 开头、且切不出版本 —— 这种"能构造出来但必然错"的
+	// 名字不该被静默经手。
+	if _, err := ep.AssetName("", "1.0", "universal"); err == nil {
 		t.Error("空 appId 应当报错")
 	} else if !strings.Contains(err.Error(), "空值") {
 		t.Errorf("错误信息不对：%v", err)
@@ -136,353 +195,11 @@ func TestRenderRejectsEmptyValueAndUnclosedBrace(t *testing.T) {
 	broken := model.Endpoints{
 		TagTemplate:       "{appId",
 		AssetNameTemplate: "{appId}-{version}-{abi}.apk",
-		AssetURLTemplate:  "https://example.com/{fileName}",
 	}
 	if _, err := broken.Tag("com.foo"); err == nil {
 		t.Error("未闭合的 { 应当报错")
 	} else if !strings.Contains(err.Error(), "未闭合") {
 		t.Errorf("错误信息不对：%v", err)
-	}
-}
-
-func TestAPKRefsRoundTrip(t *testing.T) {
-	refs := []model.APKRef{
-		{Name: "com.foo-1.0-universal.apk", URL: "https://example.com/a"},
-		{Name: "com.foo-1.0-arm64-v8a.apk", URL: "https://example.com/b"},
-	}
-	s, err := model.MarshalAPKRefs(refs)
-	if err != nil {
-		t.Fatalf("MarshalAPKRefs：%v", err)
-	}
-
-	got, err := model.UnmarshalAPKRefs(s)
-	if err != nil {
-		t.Fatalf("UnmarshalAPKRefs：%v", err)
-	}
-	if len(got) != len(refs) {
-		t.Fatalf("往返后 %d 项，期望 %d 项", len(got), len(refs))
-	}
-	for i := range refs {
-		if got[i] != refs[i] {
-			t.Errorf("第 %d 项：得到 %+v，期望 %+v", i, got[i], refs[i])
-		}
-	}
-
-	// 空列表必须渲染成 `[]` 而不是 `null`：客户端侧 decode 出 null 再 map 会炸。
-	empty, err := model.MarshalAPKRefs(nil)
-	if err != nil {
-		t.Fatalf("MarshalAPKRefs(nil)：%v", err)
-	}
-	if empty != "[]" {
-		t.Errorf("空列表渲染成 %q，期望 %q", empty, "[]")
-	}
-}
-
-func TestUnmarshalAPKRefsRejectsMalformed(t *testing.T) {
-	tests := []struct{ name, in string }{
-		{"不是 JSON", "not json"},
-		{"不是数组", `{"a":"b"}`},
-		{"元素不是数组", `[["a"],"b"]`},
-		{"元素少于两个", `[["only-name"]]`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := model.UnmarshalAPKRefs(tt.in); err == nil {
-				t.Errorf("UnmarshalAPKRefs(%q) 该报错", tt.in)
-			}
-		})
-	}
-
-	// 多出来的元素被忽略而不是报错 —— 将来若扩成 [name,url,size]，旧解析器不该炸（02 §2.9）。
-	refs, err := model.UnmarshalAPKRefs(`[["n","u","extra"]]`)
-	if err != nil {
-		t.Fatalf("多余元素应当被忽略：%v", err)
-	}
-	if len(refs) != 1 || refs[0].Name != "n" || refs[0].URL != "u" {
-		t.Errorf("得到 %+v", refs)
-	}
-
-	// 空串按"没有"处理，不是错误。
-	if refs, err := model.UnmarshalAPKRefs(""); err != nil || refs != nil {
-		t.Errorf("空串：得到 (%v, %v)", refs, err)
-	}
-}
-
-func TestSetVersionCodePreservesOtherKeys(t *testing.T) {
-	e := &model.Entry{AdditionalSettings: `{"sha256":"deadbeef","useVersionCodeAsOSVersion":true}`}
-
-	if err := e.SetVersionCode(1615); err != nil {
-		t.Fatalf("SetVersionCode：%v", err)
-	}
-	// 02 §2.3：「清单显式给出的值全部保留」—— 只覆盖一个键，不整份替换。
-	m, err := e.Settings()
-	if err != nil {
-		t.Fatalf("Settings：%v", err)
-	}
-	if m["sha256"] != "deadbeef" || m["useVersionCodeAsOSVersion"] != true {
-		t.Errorf("别的键被弄丢了：%v", m)
-	}
-
-	got, ok := e.VersionCode()
-	if !ok || got != 1615 {
-		t.Errorf("VersionCode = (%d,%v)，期望 (1615,true)", got, ok)
-	}
-
-	// 稳定渲染：同一个 map 永远产出同一个字符串，否则每次重建清单都会产生无意义的 diff。
-	before := e.AdditionalSettings
-	if err := e.SetVersionCode(1615); err != nil {
-		t.Fatal(err)
-	}
-	if e.AdditionalSettings != before {
-		t.Errorf("同一个值写了两次却产生不同字符串：\n  %q\n  %q", before, e.AdditionalSettings)
-	}
-}
-
-func TestVersionCodeMissingVsZero(t *testing.T) {
-	// "缺字段"与"值是 0"要能区分开，否则排查时看不出区别。
-	missing := &model.Entry{AdditionalSettings: `{"sha256":"x"}`}
-	if _, ok := missing.VersionCode(); ok {
-		t.Error("缺 versionCode 时 ok 必须是 false")
-	}
-
-	zero := &model.Entry{AdditionalSettings: `{"versionCode":0}`}
-	v, ok := zero.VersionCode()
-	if !ok || v != 0 {
-		t.Errorf("versionCode=0 应当解析成 (0,true)，得到 (%d,%v)", v, ok)
-	}
-}
-
-// validManifest 造一份**应当通过**全部规则的清单，供下面的变异测试逐条破坏。
-func validManifest(t *testing.T, ep model.Endpoints) *model.Manifest {
-	t.Helper()
-
-	refs := make([]model.APKRef, 0, 2)
-	for _, abi := range []string{"universal", "arm64-v8a"} {
-		ref, err := ep.AssetURLForABI("com.foo", "1.2.3", abi)
-		if err != nil {
-			t.Fatalf("造 refs：%v", err)
-		}
-		refs = append(refs, ref)
-	}
-
-	e := model.Entry{
-		ID:             "com.foo",
-		Name:           "Foo",
-		Author:         "you",
-		URL:            model.SentinelURL("com.foo"),
-		OverrideSource: model.OverrideSource,
-		LatestVersion:  "1.2.3",
-		OtherAssetUrls: "[]",
-		Categories:     []string{},
-	}
-	if err := e.SetAPKRefs(refs); err != nil {
-		t.Fatalf("SetAPKRefs：%v", err)
-	}
-	if err := e.SetVersionCode(10203); err != nil {
-		t.Fatalf("SetVersionCode：%v", err)
-	}
-
-	return &model.Manifest{
-		SchemaVersion: model.SchemaVersion,
-		ExportedAt:    model.NowISO(),
-		Apps:          []model.Entry{e},
-	}
-}
-
-// TestValidateCatchesEachRule 逐条破坏 02 §2.8 的规则，确认**每一条都真的会响**。
-//
-// 只测"合法输入通过"是不够的 —— 那样的测试在规则被整段删掉时依然会绿。
-func TestValidateCatchesEachRule(t *testing.T) {
-	ep := phase1Endpoints()
-
-	tests := []struct {
-		name    string
-		mutate  func(*model.Manifest)
-		want    string
-		isError bool
-	}{
-		{
-			name:    "规则 1：schemaVersion 不是 2",
-			mutate:  func(m *model.Manifest) { m.SchemaVersion = 3 },
-			want:    "schemaVersion",
-			isError: true,
-		},
-		{
-			name:    "规则 1：apps 为空",
-			mutate:  func(m *model.Manifest) { m.Apps = nil },
-			want:    "apps 为空",
-			isError: true,
-		},
-		{
-			name: "规则 1：id 重复",
-			mutate: func(m *model.Manifest) {
-				m.Apps = append(m.Apps, m.Apps[0])
-			},
-			want:    "id 重复",
-			isError: true,
-		},
-		{
-			name:    "规则 2：name 为空",
-			mutate:  func(m *model.Manifest) { m.Apps[0].Name = "" },
-			want:    "name 为空",
-			isError: true,
-		},
-		{
-			name:    "规则 4：latestVersion 为空",
-			mutate:  func(m *model.Manifest) { m.Apps[0].LatestVersion = "" },
-			want:    "latestVersion 为空",
-			isError: true,
-		},
-		{
-			// 规则 3 的核心：清单里不得出现上游直链。
-			name: "规则 3：apkUrls 里是上游直链",
-			mutate: func(m *model.Manifest) {
-				m.Apps[0].APKUrls = `[["com.foo-1.2.3-universal.apk","https://github.com/upstream/foo/releases/download/v1.2.3/app.apk"]]`
-			},
-			want:    "不得出现上游直链",
-			isError: true,
-		},
-		{
-			// 02 §2.4：文件名形状是硬依赖，解析失败是**静默降级**，所以必须拦住。
-			name: "02 §2.4：文件名不合契约",
-			mutate: func(m *model.Manifest) {
-				m.Apps[0].APKUrls = `[["app-release.apk","https://github.com/market-of-labs/store/releases/download/com.foo/app-release.apk"]]`
-			},
-			want:    "不符合命名契约",
-			isError: true,
-		},
-		{
-			name: "规则 4：apkUrls 为空数组",
-			mutate: func(m *model.Manifest) {
-				m.Apps[0].APKUrls = "[]"
-			},
-			want:    "apkUrls 为空",
-			isError: true,
-		},
-		{
-			name:    "规则 6：缺 versionCode",
-			mutate:  func(m *model.Manifest) { m.Apps[0].AdditionalSettings = `{"sha256":"x"}` },
-			want:    "缺 versionCode",
-			isError: true,
-		},
-		{
-			name:    "规则 6：versionCode 是 0",
-			mutate:  func(m *model.Manifest) { m.Apps[0].AdditionalSettings = `{"versionCode":0}` },
-			want:    "必须是正整数",
-			isError: true,
-		},
-		{
-			name:    "规则 8：url 不是哨兵地址",
-			mutate:  func(m *model.Manifest) { m.Apps[0].URL = "https://github.com/market-of-labs/store" },
-			want:    "哨兵地址",
-			isError: true,
-		},
-		{
-			name:    "规则 8：overrideSource 不是 HTML",
-			mutate:  func(m *model.Manifest) { m.Apps[0].OverrideSource = "APP" },
-			want:    "overrideSource",
-			isError: true,
-		},
-		{
-			name:    "规则 9：kind 取值非法",
-			mutate:  func(m *model.Manifest) { m.Apps[0].Kind = "system" },
-			want:    "kind = ",
-			isError: true,
-		},
-		{
-			// 03 §3.1：`_incoming` 是保留名。
-			name: "保留名：id 是 _incoming",
-			mutate: func(m *model.Manifest) {
-				m.Apps[0].ID = model.IncomingTag
-				m.Apps[0].URL = model.SentinelURL(model.IncomingTag)
-			},
-			want:    "保留名",
-			isError: true,
-		},
-		{
-			name:    "规则 2：otherAssetUrls 不是合法 JSON",
-			mutate:  func(m *model.Manifest) { m.Apps[0].OtherAssetUrls = "oops" },
-			want:    "otherAssetUrls",
-			isError: true,
-		},
-		{
-			// 只告警不阻断：02 §2.8 没有这条规则，但 ABI 顺序有约定（02 §2.4）。
-			name: "02 §2.4：ABI 顺序不符合约定",
-			mutate: func(m *model.Manifest) {
-				m.Apps[0].APKUrls = `[["com.foo-1.2.3-arm64-v8a.apk","https://github.com/market-of-labs/store/releases/download/com.foo/com.foo-1.2.3-arm64-v8a.apk"],` +
-					`["com.foo-1.2.3-universal.apk","https://github.com/market-of-labs/store/releases/download/com.foo/com.foo-1.2.3-universal.apk"]]`
-			},
-			want:    "ABI 顺序",
-			isError: false,
-		},
-		{
-			name: "latestVersion 在 apkUrls 里找不到对应版本",
-			mutate: func(m *model.Manifest) {
-				m.Apps[0].LatestVersion = "9.9.9"
-			},
-			want:    "找不到对应版本",
-			isError: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := validManifest(t, ep)
-			// 先确认基线是干净的，否则下面的断言可能命中"别的问题"。
-			if rep := m.Validate(ep); rep.HasErrors() {
-				t.Fatalf("基线清单本身就不合法，变异测试无意义：%v", rep.Problems)
-			}
-
-			tt.mutate(m)
-			rep := m.Validate(ep)
-
-			hit := false
-			for _, p := range rep.Problems {
-				if strings.Contains(p.Msg, tt.want) {
-					hit = true
-					if tt.isError && p.Sev != model.SeverityError {
-						t.Errorf("期望阻断项，得到告警：%s", p)
-					}
-					if !tt.isError && p.Sev != model.SeverityWarn {
-						t.Errorf("期望告警，得到阻断项：%s", p)
-					}
-				}
-			}
-			if !hit {
-				t.Errorf("没有任何结论包含 %q，实际结论：%v", tt.want, rep.Problems)
-			}
-			if tt.isError && !rep.HasErrors() {
-				t.Error("期望 HasErrors() = true")
-			}
-			if !tt.isError && rep.HasErrors() {
-				t.Errorf("这条只该告警，却产生了阻断项：%v", rep.Errors())
-			}
-		})
-	}
-}
-
-func TestValidateWarnsOnTooManyEntries(t *testing.T) {
-	ep := phase1Endpoints()
-	m := validManifest(t, ep)
-
-	// 复制到超过阈值。id 会重复，所以硬错误本来就有 —— 这里只关心条数告警是否触发。
-	base := m.Apps[0]
-	for i := 0; i < model.EntryCountWarn+1; i++ {
-		e := base
-		e.ID = "com.foo." + strings.Repeat("x", i+1)
-		e.URL = model.SentinelURL(e.ID)
-		m.Apps = append(m.Apps, e)
-	}
-
-	rep := m.Validate(ep)
-	found := false
-	for _, p := range rep.Problems {
-		if strings.Contains(p.Msg, "deep-link") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("条目数 %d 超过阈值 %d，应当告警", len(m.Apps), model.EntryCountWarn)
 	}
 }
 
@@ -533,11 +250,6 @@ func TestValidateSource(t *testing.T) {
 			mutate: func(s *model.Source) { s.ABIWhitelist = []string{"mips"} },
 			want:   "不在固定集",
 		},
-		{
-			name:   "kind 非法",
-			mutate: func(s *model.Source) { s.Kind = "system" },
-			want:   "kind = ",
-		},
 	}
 
 	for _, tt := range tests {
@@ -564,22 +276,25 @@ func TestValidateSource(t *testing.T) {
 	}
 }
 
-func TestCheckSourceSetRejectsTwoCompanions(t *testing.T) {
-	mk := func(id string, kind string) model.Source {
-		return model.Source{
-			ID: id, Name: "n", Author: "a", Source: model.SourceManual, Kind: kind,
-		}
+// TestCheckSourceSetRejectsDuplicateID 钉住那**唯一**剩下的跨条目规则。
+//
+// 从前这里还有第二条：`kind: companion` 至多一条 —— 那是给自研伴侣应用留的全局闸门，
+// 随 D58 一起作废（companion 这条路整条没了，`Source` 上已经没有 kind 字段）。
+// 而 id 唯一仍然必须是硬错误：两条同 id 的来源会让 `sources/{appId}.json`
+// 这个文件名约定本身失效 —— 先写的赢，后写的不报错，表现是"改了没生效"。
+func TestCheckSourceSetRejectsDuplicateID(t *testing.T) {
+	mk := func(id string) model.Source {
+		return model.Source{ID: id, Name: "n", Author: "a", Source: model.SourceManual}
 	}
 
-	// 两条 companion → 硬错误（与清单侧不同：sources 是输入，此时就该拦住）。
-	rep := model.CheckSourceSet([]model.Source{mk("a", model.KindCompanion), mk("b", model.KindCompanion)})
+	rep := model.CheckSourceSet([]model.Source{mk("com.a"), mk("com.a")})
 	if !rep.HasErrors() {
-		t.Error("两条 companion 应当判失败")
+		t.Error("两个同 id 的条目应当判失败")
 	}
 
-	rep = model.CheckSourceSet([]model.Source{mk("a", model.KindCompanion), mk("b", model.KindObtainium)})
+	rep = model.CheckSourceSet([]model.Source{mk("com.a"), mk("com.b")})
 	if rep.HasErrors() {
-		t.Errorf("一条 companion 应当通过：%v", rep.Errors())
+		t.Errorf("id 各不相同应当通过：%v", rep.Errors())
 	}
 }
 
@@ -603,35 +318,7 @@ func TestCheckReleaseAssetCounts(t *testing.T) {
 	}
 }
 
-func TestSentinelURL(t *testing.T) {
-	// `.invalid` 是 RFC 2606 保留 TLD，规范保证不可解析（02 规则 8）。
-	// 绝不能改成 `.local` —— 那是 mDNS 保留域，在真实网络里可能真的被解析。
-	got := model.SentinelURL("com.foo")
-	if got != "https://market.invalid/com.foo" {
-		t.Errorf("SentinelURL = %q", got)
-	}
-	if !strings.Contains(got, ".invalid") {
-		t.Error("哨兵地址必须用 .invalid 保留 TLD")
-	}
-}
-
-// ---- desc：显示名拼接与长度上限（D42）--------------------------------------
-
-// TestDisplayName 钉住清单里的显示名怎么拼。
-//
-// 拼法在 **manifest 合成时**才生效，`sources/` 里两者始终分开存 ——
-// 这正是"以后改分隔符不用重写数据"的前提，所以这里连"没简介时不出现光秃秃的
-// 分隔符"一起钉住（`Foo · ` 这种尾巴在列表里看起来就是个 bug）。
-func TestDisplayName(t *testing.T) {
-	withDesc := model.Source{Name: "Obtainium", Desc: "应用更新器"}
-	if got, want := withDesc.DisplayName(), "Obtainium · 应用更新器"; got != want {
-		t.Errorf("DisplayName = %q，期望 %q", got, want)
-	}
-	bare := model.Source{Name: "Obtainium"}
-	if got := bare.DisplayName(); got != "Obtainium" {
-		t.Errorf("没简介时 DisplayName = %q，期望就是 Name 本身", got)
-	}
-}
+// ---- desc：长度上限 ---------------------------------------------------------
 
 // TestTruncateDescIsRuneSafe 是"不许按 byte 切"的落地检查。
 //
@@ -675,7 +362,7 @@ func TestSourceValidateRejectsBadDesc(t *testing.T) {
 	multiline := base
 	multiline.Desc = "第一行\n第二行"
 	if err := multiline.Validate("com.example.app.json"); err == nil {
-		t.Error("含换行的 desc 该被拒绝（它在客户端是单行标题的一部分）")
+		t.Error("含换行的 desc 该被拒绝（它渲染成 metadata 的单行 Summary）")
 	}
 
 	ok := base

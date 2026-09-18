@@ -56,7 +56,7 @@ func (c *Ctx) intakeNewSource(ctx context.Context, is gh.Issue, d *IntakeDecisio
 	}
 
 	// 只收敛这一个 appId（03 §4.3）：进来的是一张单，不是"该全局收敛了"。全量的成本是
-	// 遍历所有上游，而申请人只关心他提交的那一个。这一步顺带把 apps.json 重建出来，
+	// 遍历所有上游，而申请人只关心他提交的那一个。这一步顺带把仓库产物重建出来，
 	// 所以新应用是"一分钟内可装"，而不是"最多一天"。
 	r, rerr := Reconcile(ctx, c, ReconcileOptions{OnlyID: src.ID})
 	if r != nil {
@@ -155,17 +155,16 @@ func landedReply(src *model.Source, tag, note string, r *ReconcileResult, rerr e
 		"已收录 `%s`。\n\n"+
 			"| 字段 | 值 |\n|---|---|\n"+
 			"| 包名（appId） | `%s` |\n| 显示名（列表里显示的） | %s |\n| 作者 / 组织 | %s |\n"+
-			"| 上游仓库 | `%s` |\n| 资产正则 | `%s` |\n| 应用类型 | %s |\n| 拉取预发布版本 | %s |\n"+
+			"| 上游仓库 | `%s` |\n| 资产正则 | `%s` |\n| 拉取预发布版本 | %s |\n"+
 			"| 分类标签 | %s |\n| 只镜像 ABI | %s |\n\n"+
 			"%s**包名与显示名是从 APK 里读出来的**（上游发布 `%s`），作者取仓库 owner —— "+
 			"都不是申请时填的，所以**请核对一下上面那个包名确实是你要的那个应用**："+
 			"仓库填错时会静默收错一个应用，而这条回评是唯一的发现机会。\n"+
 			"显示名不对的话请另开一张 `change-source.yml`。\n"+
-			"显示名里中点后面那段是**你填的简介**（超过 %d 个字会在这里显示成裁过的样子）。\n\n"+
+			"你填的简介就是客户端里应用名下面那一行小字（超过 %d 个字会被裁短）。\n\n"+
 			"%s",
-		src.ID, src.ID, src.DisplayName(), src.Author, src.Upstream.Repo,
+		src.ID, src.ID, src.Name, src.Author, src.Upstream.Repo,
 		orDefault(src.Upstream.AssetPattern, DefaultAssetPatternNote),
-		orDefault(src.Kind, "普通应用"),
 		yesNo(src.Upstream.IncludePrerelease),
 		orDefault(strings.Join(src.Categories, " / "), "未勾选"),
 		orDefault(strings.Join(src.ABIWhitelist, " / "), "全部"),
@@ -245,7 +244,7 @@ func syncedNote(r *ReconcileResult, err error) string {
 			"来源本身已经落盘，每日对账会继续试（03 §4.4）。"
 	default:
 		return fmt.Sprintf("**这一轮已经把上游最新的版本镜像进来了**（新上传 %d 个 asset）—— "+
-			"它现在就在 `apps.json` 里，打开 Obtainium 刷新一下就能装。", r.Uploaded)
+			"它现在就在仓库索引里，在客户端里刷新一下源就能看到并安装。", r.Uploaded)
 	}
 }
 

@@ -550,23 +550,42 @@ func runFdroidUpdate(ctx context.Context, c *Ctx) error {
 
 // copyProducts 把工作区里的产物拷进对外伺服的 `repo/`（§5.1 第 5 步）。
 //
-// 规则是"**除了 APK 全拷**"，而不是"拷那五六个已知的文件名"。理由是这份清单不由我们
-// 定义：fdroidserver 每加一个版本就可能多出一类文件（实测已经并存着 `index-v1.jar` 与
-// `index.jar`，还有 `index.html`/`index.xml`/`index.png`/`icons/`……），
-// 而漏拷一个的症状是**客户端某个功能静默失效**（比如它按 `index-v1.jar` 走的兼容路径
-// 拿到 404）。D59 明说不裁剪，所以这里用排除法而不是列举法。
+// 规则是"**除了下面三类，全拷**"，而不是"拷那五六个已知的文件名"。理由是这份清单不由
+// 我们定义：fdroidserver 每加一个版本就可能多出一类文件（实测产物里并存着
+// `index.html`/`index.png`/`icons/`……），而漏拷一个的症状是**客户端某个功能静默失效**
+// （比如它按某条兼容路径拿到了 404）。所以这里用排除法而不是列举法。
 //
-// 排除的只有两样：
+// 排除三类：
 //
-//	.apk     体积量级与 git 不合，而且它们本来就有家（各自 appId 的 Release）——
-//	         见 store 的包注释。客户端拿到的 APK 地址由 CF 网关映射过去（02 §2.3）。
-//	status/  fdroidserver 自己的运行状态（`running.json` **每轮都被重写**）。它不是
-//	         仓库的一部分，拷出去只会让每一轮都产生一个无意义的 diff（spike ④）。
+//	.apk       体积量级与 git 不合，而且它们本来就有家（各自 appId 的 Release）——
+//	           见 store 的包注释。客户端拿到的 APK 地址由 CF 网关映射过去（02 §2.3）。
+//	status/    fdroidserver 自己的运行状态（`running.json` **每轮都被重写**）。它不是
+//	           仓库的一部分，拷出去只会让每一轮都产生一个无意义的 diff（spike ④）。
+//	v0/v1 索引 见下。
+//
+// ⚠️ 第三类是**对 D59 的改写**，值得说清楚它为什么不算违反"不裁剪"。
+//
+// D59 说不裁剪，那是针对 `index.html`/`index.png`/`icons/` 这些**给人看的**产物说的，
+// 它们照旧全拷。但同一句话顺带把 `index.xml`/`index.jar`/`index-v1.jar` 也放行了，
+// 而那三个是**给客户端看的**，是另一回事：本市场只支持 v2（已明确"不需要兜底"），
+// 留着它们等于对外宣称支持两代索引协议。代价不是白占几 MB，而是**行为分叉** ——
+// 一个只会读 v1 的老客户端会照着 v1 索引把包装上，然后在它读不懂的 v2 上做增量同步。
+// 失败发生在客户端一侧，我们这边不会有任何日志。
+//
+// 而且"留着"这个选择本身是有维护成本的：承认支持两代，就得测两代。不承认，
+// 就该让 `index-v1.jar` 老老实实是个 404。判据见 legacyIndexPath。
+//
+// 命中的文件名会同其余产物一起打进日志。丢掉的那几个必须出现在日志里 —— 否则
+// "某个文件为什么不在仓库里"就只能靠读代码回答，而这是每轮都会发生的事。
+//
+// ⚠️ 这里只**不拷**，不删：`repo/` 是一棵跨轮保留的 git 工作树，所以它里面若已经
+// 躺着旧二进制写下的 `index-v1.jar`（迁移期真会发生，比如手工跑过一次老版本），
+// 这一轮不会替它消失。那种情况要人工 `git rm` 一次。
 func copyProducts(c *Ctx) error {
 	root := c.Repo.FdroidRepoDir()
 	dst := c.Repo.RepoDir()
 
-	var copied []string
+	var copied, dropped []string
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -583,6 +602,10 @@ func copyProducts(c *Ctx) error {
 			return nil
 		}
 		if strings.EqualFold(filepath.Ext(p), naming.Ext) {
+			return nil
+		}
+		if legacyIndexPath(rel) {
+			dropped = append(dropped, rel)
 			return nil
 		}
 		out := filepath.Join(dst, filepath.FromSlash(rel))
@@ -603,7 +626,50 @@ func copyProducts(c *Ctx) error {
 	// 二来会让"这两轮产物一样吗"这个问题变得没法用眼睛回答。
 	sort.Strings(copied)
 	c.Log("产物 %d 个文件 → %s：\n  %s", len(copied), dst, strings.Join(copied, "\n  "))
+
+	// 丢掉的那几个也打出来，理由见函数注释：它是"文件为什么不在仓库里"这个问题的
+	// 唯一现场证据，而这件事每轮都在发生。
+	if len(dropped) > 0 {
+		sort.Strings(dropped)
+		c.Log("只支持 v2，丢掉 %d 个 v0/v1 索引产物：\n  %s",
+			len(dropped), strings.Join(dropped, "\n  "))
+	}
 	return nil
+}
+
+// legacyIndexPath 报告一个**相对仓库根**的路径（斜杠分隔）是不是 v0/v1 那两代索引的
+// 产物，也就是 copyProducts 该跳过的那一类。
+//
+// 认法是"只在根目录上认，名字走前缀 + 穷举"：
+//
+//	index-v1*  v1 的全部文件。用前缀而不是列名字，是因为 v1 的名字里带版本号，
+//	           而 fdroidserver 只会往这一格里加东西（`index-v1.jar`、`index-v1.json`、
+//	           两者各自的 `.asc`，将来还可能有别的后缀）—— 列名字必漏。
+//	index.xml / index.jar / index_unsigned.jar
+//	           v0 那三个。它们是**定名**的，没有版本号可前缀，只能逐个列。
+//
+// ⚠️ 前缀必须停在 `index-v1` 上。`index-v2.json` 与它只差一个数字，写成
+// `HasPrefix(p, "index-")` 就会把要伺服的那一个也砍掉 —— 而症状不是报错，
+// 是客户端拿到 404、这个源整个不可用。`TestLegacyIndexPath` 把这条钉死了。
+//
+// ⚠️ 只在根目录认（`!strings.Contains(p, "/")`）：这几代产物都躺在仓库根上，而若不
+// 限定层级，一个叫 `index-v1` 开头的**目录**（`index-v1.d/…`）会让它整个消失 ——
+// 那种名字今天不存在，但失败模式是"一整棵子树不见了"，不值得为省一个判断去赌。
+//
+// `index.html` / `index.png` / `icons/` 这些**给人看的**产物不在其中：它们不属于
+// "索引协议"，留着不构成任何客户端会走错的分叉（D59 的"不裁剪"对它们仍然成立）。
+func legacyIndexPath(p string) bool {
+	if strings.Contains(p, "/") {
+		return false
+	}
+	if strings.HasPrefix(p, "index-v1") {
+		return true
+	}
+	switch p {
+	case "index.xml", "index.jar", "index_unsigned.jar":
+		return true
+	}
+	return false
 }
 
 // copyFile 按**覆盖**语义复制一个文件，且保证落地的一定是完整内容。

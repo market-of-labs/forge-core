@@ -177,6 +177,12 @@ func TestReadEntryJarRejects(t *testing.T) {
 // 变成了一份"未知键被忽略"的测试（那也是有用的，但属于另一条）。
 // 两个变体刻意用**同一个 versionCode 的不同 ABI**：索引里它们靠 sha256 区分，
 // 这正是 §2.3 里那个最反直觉的地方。
+//
+// ⚠️ 这份 fixture 是**手写的**，所以它的每一个形状都必须对着 fdroidserver 的**真实
+// 输出**核过，而不是照着规格的描述写。这条不是洁癖 —— 它已经栽过一次：`manifest.signer`
+// 当初被写成字符串，fixture 也写成字符串，于是"索引里其实是个对象"这个错在单测里
+// 一直是绿的，一路绿到真实索引进来。**规格是给人看的，fixture 必须是给编译器看的**：
+// 凡是能从真产物里抄的形状（键名、嵌套、类型），就别凭规格推。
 const realIndexJSON = `{
   "repo": {
     "address": "https://example.invalid/fdroid/repo",
@@ -191,11 +197,11 @@ const realIndexJSON = `{
       "versions": {
         "aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff001122": {
           "file": {"name": "dev.imranr.obtainium-1.6.17-arm64-v8a.apk", "sha256": "aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff001122", "size": 25165824},
-          "manifest": {"versionCode": 23563, "nativecode": ["arm64-v8a"], "signer": "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"}
+          "manifest": {"versionCode": 23563, "nativecode": ["arm64-v8a"], "signer": {"sha256": ["1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"]}}
         },
         "bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233": {
           "file": {"name": "dev.imranr.obtainium-1.6.17-armeabi-v7a.apk", "sha256": "bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233", "size": 20971520},
-          "manifest": {"versionCode": 23562, "nativecode": ["armeabi-v7a"], "signer": "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"}
+          "manifest": {"versionCode": 23562, "nativecode": ["armeabi-v7a"], "signer": {"sha256": ["1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"]}}
         }
       }
     },
@@ -204,7 +210,7 @@ const realIndexJSON = `{
       "versions": {
         "cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233445": {
           "file": {"name": "com.example.universal-2.0-universal.apk", "sha256": "cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233445", "size": 10485760},
-          "manifest": {"versionCode": 20, "signer": "2222333344445555666677778888999900001111bbbbccccddddeeeeffffaaaa"}
+          "manifest": {"versionCode": 20, "signer": {"sha256": ["2222333344445555666677778888999900001111bbbbccccddddeeeeffffaaaa"]}}
         }
       }
     }
@@ -265,8 +271,11 @@ func TestReadIndexV2(t *testing.T) {
 	if !slices.Equal(v.Manifest.NativeCode, []string{"arm64-v8a"}) {
 		t.Errorf("manifest.nativecode 走样：%v", v.Manifest.NativeCode)
 	}
-	if v.Manifest.Signer == "" {
-		t.Error("manifest.signer 为空 —— 它是硬错误第 6 条")
+	// 断言的是**整个值**而不是"非空"：这个字段曾经是 `Signer string`，而 fixture 也是
+	// 照规格手写的字符串，于是"索引里其实是个对象"这件事被两边一起瞒了很久。
+	// 只判非空的话，那种错法照样能过 —— 这里要的是逐字符相等。
+	if want := []string{"1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"}; !slices.Equal(v.Manifest.Signer.SHA256, want) {
+		t.Errorf("manifest.signer.sha256 走样：%v", v.Manifest.Signer.SHA256)
 	}
 }
 

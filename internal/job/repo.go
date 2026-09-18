@@ -830,7 +830,10 @@ func checkPackages(c *Ctx, rep *model.Report, idx *fdroid.IndexV2, apkDir string
 					"前者说明它不是 universal 包，后者说明它不符合命名契约（02 §2.4）",
 					f.Name, naming.ABIUniversal)
 			}
-			if strings.TrimSpace(v.Manifest.Signer) == "" {
+			// 取**第一个**而不是要求"恰好一个"：一份 APK 理论上可以有多个签名者
+			// （联合签名），fdroidserver 会把它们都记下来，而客户端比对签名时
+			// 也是拿第一个。缺失或空串才说明"这个包没有上游签名"。
+			if len(v.Manifest.Signer.SHA256) == 0 || strings.TrimSpace(v.Manifest.Signer.SHA256[0]) == "" {
 				rep.Errorf(pkg, "%s 没有 signer —— 客户端要靠它与已装版本的签名比对来决定能不能升级",
 					f.Name)
 			}

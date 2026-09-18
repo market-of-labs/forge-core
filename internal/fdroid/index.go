@@ -112,7 +112,31 @@ type Manifest struct {
 	// 见 AppVersion.HasNativeCodeOrUniversal。
 	NativeCode []string `json:"nativecode"`
 	// Signer 是 APK 自己的签名者（**不是**仓库签名，两把完全不同的钥匙，02 §2.7）。
-	Signer string `json:"signer"`
+	//
+	// ⚠️ 它在索引里**不是字符串，是一个对象**：
+	//
+	//	"manifest": { "signer": { "sha256": ["a47e2f7…3dc8"] }, "versionCode": 1234 }
+	//
+	// 这一点当初写错过 —— 这里曾经是 `Signer string`，而单测用的 fixture 是照规格
+	// 手写的、也写成了字符串，于是"类型不对"这件事在本机一直被两边一起瞒着，
+	// 直到真实索引进来才暴露。所以这段的形状**不是照规格抄的，是照真东西核对过的**：
+	// fdroidserver `update.py` 里那一句 `manifest = {'signer': {'sha256': [signer]}, …}`
+	// 与 `internal/job/repo.go` 里 check-repo 的判据都对着它。
+	//
+	// 用数组而不是单个字符串：一份 APK 理论上可以有多个签名者（联合签名），
+	// fdroidserver 记的是全部。我们只收上游签名的包、也只有一个提取器，
+	// 所以**取值时只看第一个**（见 job/repo.go 的 checkPackages）。
+	Signer Signer `json:"signer"`
+}
+
+// Signer 是 `manifest.signer` 那个对象。目前只有 `sha256` 一个键（见 Manifest.Signer）。
+//
+// SHA256 里每一项是**证书 DER 的** SHA-256，小写十六进制、不带分隔符 ——
+// 不是对 APK 整体算，也不是对公钥算。这个取值由 `internal/apksig` 提取，
+// 与 fdroidserver 的 `signer_fingerprint` 逐字节一致（那是本市场"上游签名"这条
+// 原则的唯一凭据，客户端靠它与已装版本比对来决定能不能升级）。
+type Signer struct {
+	SHA256 []string `json:"sha256"`
 }
 
 // HasNativeCodeOrUniversal 回答 02 §2.8 硬错误第 5 条的"非空的 nativecode **或**显式的 universal"。

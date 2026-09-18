@@ -358,6 +358,31 @@ func TestDeleteTagRefToleratesNotFound(t *testing.T) {
 	}
 }
 
+// 但"引用不存在"在这条端点上**回的是 422，不是 404**（404 留给"仓库找不到"）。
+// 空队列那一轮清场照样会来删（cleanIncoming 是无条件 defer），所以只认 404 的写法
+// 会让**每一轮**都报一次永远不成立的"删除失败：下一次 Publish 可能仍旧解析到旧的
+// intake-incoming.yml"。这一条钉住那个真实故障。
+func TestDeleteTagRefToleratesUnprocessable(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		io.WriteString(w, `{"message":"Reference does not exist"}`)
+	})
+	if err := c.DeleteTagRef(context.Background(), "market-of-labs/store", "_incoming"); err != nil {
+		t.Errorf("422（引用不存在）应当被吞掉，却报了：%v", err)
+	}
+}
+
+// 吞掉 422 不能滑成"吞掉一切"：真故障必须照样报出来。
+func TestDeleteTagRefSurfacesRealFailures(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"message":"Resource not accessible by personal access token"}`)
+	})
+	if err := c.DeleteTagRef(context.Background(), "market-of-labs/store", "_incoming"); err == nil {
+		t.Error("403 被吞掉了 —— 权限不足必须报出来，否则这条清场会静默地永远失败")
+	}
+}
+
 func TestRepoSlugStaysInPath(t *testing.T) {
 	var gotPath string
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {

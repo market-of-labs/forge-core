@@ -499,12 +499,26 @@ func (c *Client) DeleteAsset(ctx context.Context, repo string, assetID int64) er
 // 上把它重建出来（`target_commitish` 是分支名 `master`，不是 sha，所以每次都取当下），
 // 跑的就永远是最新那份。
 //
-// 没有这个引用是**常态**（队列常驻 draft 时就没有），所以 404 不算失败。
+// 没有这个引用是**常态**（队列常驻 draft 时就没有），所以"不存在"不算失败 —— 但
+// DELETE 这个端点回的码与直觉不同：**引用不存在是 422 `Reference does not exist`**，
+// 404 留给"仓库本身找不到"。实测踩到过：清场是无条件 defer，空队列那一轮照样来删，
+// 于是**每一轮**都报一次"删除失败：下一次 Publish 可能仍旧解析到旧的 intake-incoming.yml"
+// —— 一条永远存在、又永远不成立的告警（永远存在的告警等于没有告警，见 repo.go 里
+// 图标那条的写法）。
+//
+// 整个 422 都可以吞：这个端点的 422 只来自"引用名非法或不存在"一种原因，而 tag 是固定
+// 的字面量 `_incoming`，"非法"不可能；权限不足走的是 403，不落这一支。
 func (c *Client) DeleteTagRef(ctx context.Context, repo, tag string) error {
 	// 逐段传 "git"/"refs"/"tags"/tag：repoURL 会对每一段做 PathEscape，把
 	// "tags/_incoming" 整段塞进去会把那个斜杠转义成 %2F，就不是 GitHub 认的端点了。
-	_, err := c.do(ctx, http.MethodDelete, c.repoURL(repo, "git", "refs", "tags", tag), nil, nil)
-	if errors.Is(err, ErrNotFound) {
+	resp, err := c.do(ctx, http.MethodDelete, c.repoURL(repo, "git", "refs", "tags", tag), nil, nil)
+	if err == nil {
+		return nil
+	}
+	// do 在失败路径上也把 resp 带回来（见它的实现），所以这里拿得到状态码 —— 不必去
+	// 匹配错误文本，那文本是要被 scrub 的，拿它当判据本来就脆。
+	if errors.Is(err, ErrNotFound) ||
+		(resp != nil && resp.StatusCode == http.StatusUnprocessableEntity) {
 		return nil
 	}
 	return err

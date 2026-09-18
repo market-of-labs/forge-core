@@ -246,18 +246,40 @@ func (c *Ctx) EnsureRelease(ctx context.Context, appID, name string) (*gh.Releas
 	return c.GH.CreateRelease(ctx, c.Env.StoreRepo, tag, name, false)
 }
 
-// ReleaseAssets 列出某个 Release 现有 asset 的**名字集合**。
-// 镜像的幂等判据就是它（03 §3.1：按名字判断，禁止 --clobber）。
-func (c *Ctx) ReleaseAssets(ctx context.Context, rel *gh.Release) (map[string]gh.Asset, error) {
+// assetsOf 列全一个 Release 的 asset，并按"背后有没有字节"分成两组。
+//
+// ghosts 是那些**占着名字却取不到字节**的（`gh.Asset.Downloadable` 为假）。两组必须
+// 分开，混在一起就是 2026-09-17 那次事故的成因：幽灵被当成"文件在" ⇒ 镜像按名幂等跳过
+// （那一版永远不重传）、账本记下一个取不到的版本 ⇒ 水位线一跳跳过它 ⇒ 上游 p26 卡住，
+// p27…p35 永远轮不到，而**整轮是绿的**（两条 WARN，`committed=true`）。
+//
+// 所以「名字在 ⟺ 文件在」这条不变量要在这里恢复 —— 它是 03 §3.1"幂等按 asset 名判断"
+// 那条规则的前提，而幽灵恰好能证伪它。幽灵单独给出来只为一个用途：镜像撞上它时必须
+// **喊出来**（同名不能覆盖、又不能替人删，见 mirrorPlan）。
+func (c *Ctx) assetsOf(ctx context.Context, rel *gh.Release) (live, ghosts map[string]gh.Asset, err error) {
 	as, err := c.GH.ListAssets(ctx, c.Env.StoreRepo, rel.ID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out := make(map[string]gh.Asset, len(as))
+	live = make(map[string]gh.Asset, len(as))
 	for _, a := range as {
-		out[a.Name] = a
+		if !a.Downloadable() {
+			if ghosts == nil {
+				ghosts = map[string]gh.Asset{}
+			}
+			ghosts[a.Name] = a
+			continue
+		}
+		live[a.Name] = a
 	}
-	return out, nil
+	return live, ghosts, nil
+}
+
+// ReleaseAssets 列出某个 Release 现有 asset 的**名字集合**（只含真的能下载的那些）。
+// 镜像的幂等判据就是它（03 §3.1：按名字判断，禁止 --clobber）。
+func (c *Ctx) ReleaseAssets(ctx context.Context, rel *gh.Release) (map[string]gh.Asset, error) {
+	live, _, err := c.assetsOf(ctx, rel)
+	return live, err
 }
 
 // ---- 小工具 -----------------------------------------------------------------

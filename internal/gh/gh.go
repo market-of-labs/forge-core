@@ -126,13 +126,31 @@ type Release struct {
 
 // Asset 是一个 Release asset。
 type Asset struct {
-	ID                 int64  `json:"id"`
-	Name               string `json:"name"`
-	Size               int64  `json:"size"`
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+	// State 是上传状态。只有 `uploaded` 的 asset 背后真的有字节 —— 见 Downloadable。
+	State              string `json:"state"`
 	CreatedAt          string `json:"created_at"`
 	UpdatedAt          string `json:"updated_at"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
+
+// Downloadable 报告这个 asset 背后**真的有字节**。
+//
+// GitHub 会给"上传开始了、但从未 finalize"的 asset 标 `state=starter`。2026-09-17 在
+// store 的 `dev.thejaustin.obtainiumplus` 上实测到一个：它有名字、有 size（83 MB）、
+// 出现在 `GET /releases/{id}/assets` 里，`browser_download_url` 也印得出来，但 blob
+// 根本不存在 —— 下载回 `404 BlobNotFound`。⚠️ 而 `GET /releases/tags/{tag}` 的**内联**
+// `assets` 数组**不列它**，所以两个端点看到的集合本来就不一样（`ListAssets` 走的是前者）。
+//
+// 一个幽灵足以让整条链路**静默**卡死，而且不止一处：它骗过"按 asset 名判幂等"的镜像
+// 闸门（名字被占了 ⇒ 那一版永远不重传）、被 `BuildIndex` 记进账本（⇒ 水位线一跳就跳过
+// 它）、被 `placeAPKs` 当成可下载的分片（⇒ 404）。所以**凡是"这个 asset 在不在"的判断
+// 都必须过这一关**；解析出来的名字再像真的也不算数。
+//
+// 空 State 当作可下载：只有手工构造的结构体才没有这个字段，真实 API 一定给。
+func (a Asset) Downloadable() bool { return a.State == "" || a.State == "uploaded" }
 
 // Issue 是 issue 里我们关心的字段（03 §2.5）。
 type Issue struct {

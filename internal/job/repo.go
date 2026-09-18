@@ -281,10 +281,12 @@ func downloadNewest(ctx context.Context, c *Ctx, src *model.Source, missing []re
 	for _, f := range missing {
 		a, ok := assets[f.name]
 		if !ok {
-			// 账本说该有、Release 里没有。**不猜**（不按前缀找近似名）：这种情况只可能
-			// 来自"账本比 Release 新"，而那是某次回写没落地。猜错的后果是把一个
-			// 不属于这个版本的字节放进索引。
-			c.Log("Release %s 里没有 asset %q（账本里有）—— 跳过", rel.TagName, f.name)
+			// 账本说该有、Release 里没有。**不猜**（不按前缀找近似名）：只可能来自
+			// "账本比 Release 新"（某次回写没落地），或那个名字此刻被一个**幽灵**占着
+			// —— 上传从未完成、取不到字节，已经被 ReleaseAssets 滤掉了
+			// （见 gh.Asset.Downloadable）。猜错的后果是把一个不属于这个版本的字节放进索引。
+			// 后一种这里处置不了，镜像那一步会点名它（mirrorPlan 的硬错误）；这里只说结果。
+			c.Log("Release %s 里没有可下载的 asset %q（账本里有）—— 跳过", rel.TagName, f.name)
 			continue
 		}
 		if err := fetchAsset(ctx, c, a, filepath.Join(dir, f.name)); err != nil {

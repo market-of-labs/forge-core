@@ -86,6 +86,19 @@ func BuildIndex(ctx context.Context, c *Ctx) (*model.Report, error) {
 			return nil, fmt.Errorf("列 Release %s 的 asset：%w", rel.TagName, err)
 		}
 		for _, a := range assets {
+			if !a.Downloadable() {
+				// 幽灵：名字在、字节不在（上传从未 finalize，见 gh.Asset.Downloadable）。
+				//
+				// **必须在这里挡住**，因为账本是水位线的事实源：记进去之后
+				// `pickTargets` 会把它当成"已镜像"，于是水位线一跳就跳过它，而它下面
+				// 更新的那些版本（真正的目标）永远轮不到 —— 2026-09-17 那个 p26 就是这么
+				// 把 p27…p35 一起卡住的，卡了整整一晚，而每一轮都是绿的。
+				rep.Warnf(rel.TagName, "asset %q **不可下载**（id=%d，state=%q），不计入账本："+
+					"上传从未完成，它占了名字却没有字节。"+
+					"留着它会让水位线跳过这一版（gh.Asset.Downloadable 有完整来龙去脉）",
+					a.Name, a.ID, a.State)
+				continue
+			}
 			version, abi, err := naming.Split(rel.TagName, a.Name)
 			if err != nil {
 				// 手传的、或改名改坏了的 asset。跳过而不是猜 ——

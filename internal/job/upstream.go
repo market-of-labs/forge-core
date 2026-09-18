@@ -291,19 +291,71 @@ func MirrorUpstream(ctx context.Context, c *Ctx, plans []Plan, opts MirrorOption
 	return out, nil
 }
 
+// gateVerdict 是镜像对"目标名能不能写"的裁决。
+type gateVerdict int
+
+const (
+	// gateUpload：名字空着，传。
+	gateUpload gateVerdict = iota
+	// gateSkip：名字被一个**真的有字节**的 asset 占着 → 跳过（规则 3 的幂等）。
+	gateSkip
+	// gateGhost：名字被一个**幽灵**占着（上传从未完成）→ 必须中断，见 mirrorGate。
+	gateGhost
+)
+
+// mirrorGate 裁决一个目标名能不能写，并回传占着它的那个 asset（没人占则是零值）。
+//
+// 抽成纯函数是因为这里恰好是 2026-09-17 那次事故的**唯一开关**，而它当时判错了：
+// `existing` 里混进了幽灵，"名字在"于是被当成"文件在" ⇒ `gateSkip` ⇒ 那一版永远不重传。
+// 两种"名字被占"必须分开判，这就是这个函数存在的全部理由：
+//
+//   - **真文件占着 → 跳过是对的**。`--clobber` 会让正在下载的客户端拿到半个文件（03 §3.1），
+//     而 D13 全保留语义下"同名"必然意味着"同内容"。
+//   - **幽灵占着 → 跳过是错的**，且是**静默**的错：这一版一个字节都没落地，那个动作却
+//     顺手把它记进了账本，于是 `pickTargets` 把它当"已镜像"、水位线一跳跳过它，它下面
+//     更新的那些版本永远轮不到（p26 卡住 p27…p35 整整一晚，而每一轮都是绿的）。
+//     它传不上去（同名不能覆盖）、也不能替人删（D13：正式 Release 的 asset 只由人删），
+//     所以只剩**硬错误**一条路 —— 见 ghostRefusal。
+//
+// ghosts 只可能来自 assetsOf，它已经把两组分开了。
+func mirrorGate(target string, existing, ghosts map[string]gh.Asset) (gateVerdict, gh.Asset) {
+	if g, ok := ghosts[target]; ok {
+		return gateGhost, g
+	}
+	if prev, ok := existing[target]; ok {
+		return gateSkip, prev
+	}
+	return gateUpload, gh.Asset{}
+}
+
+// ghostRefusal 是撞上幽灵时的硬错误（经 mirrorPlan → MirrorUpstream 记成一条 ERROR）。
+//
+// 措辞要给足"为什么"与"怎么办"：整轮是绿的，报告与日志是它唯一的痕迹，而且这一轮之后
+// **每一轮都会再来一次**（账本不再记它 ⇒ pickTargets 每轮都把它当待镜像）—— 人看到的
+// 第一句话就得够他做决定。给的是可直接粘贴的一条命令，不带占位符。
+func (c *Ctx) ghostRefusal(appID, target string, g gh.Asset) error {
+	return fmt.Errorf(
+		"%s：目标名 %s 被一个「上传从未完成」的 asset 占着（id=%d，state=%q，创建于 %s）—— "+
+			"同名不能覆盖（03 §3.1 禁止 --clobber），本流程也不能替人删"+
+			"（D13：正式 Release 的 asset 只由人删），所以这一版**传不上去**。"+
+			"处置：gh api --method DELETE repos/%s/releases/assets/%d —— 删掉之后下一轮对账会自动补上",
+		appID, target, g.ID, g.State, g.CreatedAt, c.Env.StoreRepo, g.ID)
+}
+
 func (c *Ctx) mirrorPlan(ctx context.Context, p *Plan, opts MirrorOptions, out *MirrorReport) error {
 	appID := p.Source.ID
 	c.Log("%s：镜像上游 %s", appID, p.Release.TagName)
 
 	var rel *gh.Release
 	existing := map[string]gh.Asset{}
+	var ghosts map[string]gh.Asset
 	if !opts.DryRun {
 		var err error
 		rel, err = c.EnsureRelease(ctx, appID, p.Source.Name)
 		if err != nil {
 			return fmt.Errorf("准备 %s 的 Release：%w", appID, err)
 		}
-		existing, err = c.ReleaseAssets(ctx, rel)
+		existing, ghosts, err = c.assetsOf(ctx, rel)
 		if err != nil {
 			return fmt.Errorf("列 %s 的 asset：%w", appID, err)
 		}
@@ -375,14 +427,17 @@ func (c *Ctx) mirrorPlan(ctx context.Context, p *Plan, opts MirrorOptions, out *
 			return fmt.Errorf("渲染 %s 的目标文件名：%w", appID, err)
 		}
 
-		// 幂等闸门（规则 3）：目标名已存在就跳过，**绝不 --clobber** ——
-		// 覆盖会让正在下载的客户端拿到半个文件。
-		if _, dup := existing[target]; dup {
+		switch v, prev := mirrorGate(target, existing, ghosts); v {
+		case gateGhost:
+			return c.ghostRefusal(appID, target, prev)
+		case gateSkip:
 			c.Log("  %s → %s：目标已存在，跳过（幂等）", a.Name, target)
 			out.Skipped++
-		} else if opts.DryRun {
-			c.Log("  [dry-run] %s → %s（%d 字节，内容判 %s）", a.Name, target, a.Size, contentABI)
-		} else {
+		default: // gateUpload
+			if opts.DryRun {
+				c.Log("  [dry-run] %s → %s（%d 字节，内容判 %s）", a.Name, target, a.Size, contentABI)
+				break
+			}
 			if err := c.uploadAsset(ctx, p.Source.Upstream.Repo, rel, target, a); err != nil {
 				return err
 			}

@@ -323,3 +323,126 @@ func TestSyncReleaseBodyFromUpstreamReadme(t *testing.T) {
 		t.Fatalf("README 读取次数 = %d，期望 2", reads)
 	}
 }
+
+// TestAssetsOfSplitsGhosts 钉住"名字在 ⟺ 文件在"这条不变量**在读取处**就被恢复。
+//
+// 幽灵（state=starter：上传开始了、从未 finalize，有名字有 size 却没字节）不能在更下游
+// 被各处理一遍 —— 那样每多一个消费者就多一处可能忘掉，而 2026-09-17 那次事故里正好
+// 有三个消费者同时被骗（BuildIndex 记进账本、镜像按名跳过、placeAPKs 去下它）。
+// 在这里分开之后，ReleaseAssets 的契约才回到 03 §3.1 那条规则的前提上：那条规则说
+// "幂等按 asset 名判断"，而它默认名字意味着文件。
+func TestAssetsOfSplitsGhosts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 三条：一个正常资产、一个幽灵、一个**没给 state** 的（老 fake / 手工构造的样子，
+		// 必须仍然算可下载，否则这次改动会把所有既有 fixture 一起判成幽灵）。
+		io.WriteString(w, `[
+			{"id":1,"name":"com.x-1.0-universal.apk","size":10,"state":"uploaded"},
+			{"id":2,"name":"com.x-1.1-universal.apk","size":83336512,"state":"starter"},
+			{"id":3,"name":"com.x-1.0-arm64-v8a.apk","size":9}
+		]`)
+	}))
+	defer srv.Close()
+
+	ghc, err := gh.New(gh.Config{Token: "t", BaseURL: srv.URL, UploadBaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("建客户端：%v", err)
+	}
+	c := &Ctx{Env: &Env{StoreRepo: "o/store"}, GH: ghc, Log: func(string, ...any) {}}
+	rel := &gh.Release{ID: 7}
+
+	live, ghosts, err := c.assetsOf(context.Background(), rel)
+	if err != nil {
+		t.Fatalf("assetsOf：%v", err)
+	}
+	if len(live) != 2 || len(ghosts) != 1 {
+		t.Fatalf("分组不对：live=%d ghosts=%d（live=%v ghosts=%v）", len(live), len(ghosts), live, ghosts)
+	}
+	if _, ok := live["com.x-1.1-universal.apk"]; ok {
+		t.Error("幽灵进了 live —— 这正是 2026-09-17 那次事故的起点")
+	}
+	if g, ok := ghosts["com.x-1.1-universal.apk"]; !ok || g.ID != 2 {
+		t.Errorf("幽灵没被单独收好（它是唯一需要被点名处置的那一个）：%+v", ghosts)
+	}
+
+	// ReleaseAssets 是给绝大多数调用方的那一面：它必须看不见幽灵。
+	only, err := c.ReleaseAssets(context.Background(), rel)
+	if err != nil {
+		t.Fatalf("ReleaseAssets：%v", err)
+	}
+	if len(only) != 2 {
+		t.Fatalf("ReleaseAssets 只该给可下载的：%+v", only)
+	}
+	if _, ok := only["com.x-1.1-universal.apk"]; ok {
+		t.Error("ReleaseAssets 把幽灵给了出去 —— 它的契约是「名字在 ⟺ 文件在」")
+	}
+}
+
+// TestMirrorGateSeparatesGhostFromRealAsset 钉住那次事故的**唯一开关**。
+//
+// 2026-09-17：`existing` 里混进了一个幽灵，"名字在"于是被当成"文件在" ⇒ 判成
+// "跳过（幂等）" ⇒ 那一版永远不重传，而同一个动作还把它记进了账本 ⇒ `pickTargets`
+// 把它当"已镜像"，水位线一跳跳过它，它下面更新的那些版本（p27…p35）一个都轮不到。
+// 整整一晚，每一轮都是绿的，只有两条 WARN。
+//
+// 所以这个判定必须把"真文件占名"与"幽灵占名"分开，而后者**绝不能**是 gateSkip。
+// 真文件那一条是从前唯一的行为，必须原样保住（`--clobber` 会让正在下载的客户端拿到
+// 半个文件，03 §3.1）。
+func TestMirrorGateSeparatesGhostFromRealAsset(t *testing.T) {
+	real := gh.Asset{ID: 1, Name: "com.x-1.0-universal.apk", State: "uploaded"}
+	ghost := gh.Asset{ID: 2, Name: "com.x-1.1-universal.apk", State: "starter"}
+	existing := map[string]gh.Asset{real.Name: real}
+	ghosts := map[string]gh.Asset{ghost.Name: ghost}
+
+	cases := []struct {
+		target string
+		want   gateVerdict
+	}{
+		{real.Name, gateSkip},                   // 真文件占着 → 幂等跳过
+		{ghost.Name, gateGhost},                 // 幽灵占着 → 硬错误，绝不能是 skip
+		{"com.x-1.2-universal.apk", gateUpload}, // 空着 → 传
+	}
+	for _, tc := range cases {
+		got, who := mirrorGate(tc.target, existing, ghosts)
+		if got != tc.want {
+			t.Errorf("%s：verdict 错了（want %d got %d）", tc.target, tc.want, got)
+			continue
+		}
+		if got == gateUpload {
+			if who.ID != 0 {
+				t.Errorf("%s：没人占着，却回传了一个 occupant：%+v", tc.target, who)
+			}
+			continue
+		}
+		if who.Name != tc.target {
+			t.Errorf("%s：回传的 occupant 是 %q（处置那条命令要用它的 id，指错了会删错东西）",
+				tc.target, who.Name)
+		}
+	}
+}
+
+// TestGhostRefusalNamesTheAssetToDelete 钉住那条硬错误**可执行**。
+//
+// 整轮是绿的，这条 ERROR 是唯一痕迹；而它每一轮都会再来一次，直到有人处置。所以它必须
+// 自带一条能直接粘贴的命令、且带上 asset id —— 光说"有个 asset 占着名字"等于没说，
+// 人还得自己去翻 API。
+func TestGhostRefusalNamesTheAssetToDelete(t *testing.T) {
+	c := &Ctx{Env: &Env{StoreRepo: "market-of-labs/store"}}
+	g := gh.Asset{ID: 571176931, Name: "dev.thejaustin.obtainiumplus-1.6.10-p26-universal.apk",
+		State: "starter", CreatedAt: "2026-09-17T21:27:19Z"}
+
+	err := c.ghostRefusal("dev.thejaustin.obtainiumplus", g.Name, g)
+	if err == nil {
+		t.Fatal("撞上幽灵必须报错（跳过就是 2026-09-17 那次事故本身）")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"571176931",            // asset id：处置命令要用它
+		"starter",              // 状态：人据此确认"上传从未完成"
+		"2026-09-17T21:27:19Z", // 创建时间：用来判断是不是自己刚才传的
+		"repos/market-of-labs/store/releases/assets/571176931", // 可直接粘贴的那条命令
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("硬错误里缺 %q：\n%s", want, msg)
+		}
+	}
+}

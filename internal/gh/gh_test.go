@@ -557,3 +557,54 @@ func TestReadme(t *testing.T) {
 		t.Errorf("没有 README 时应为空串，得到 %q", empty)
 	}
 }
+
+// TestAssetDownloadable 钉住"名字在 ≠ 字节在"这条判据。
+//
+// 不是形式检查。2026-09-17 在 store 的 `dev.thejaustin.obtainiumplus` 上实测到一个
+// `state=starter` 的 asset（id 571176931，83 MB）：名字齐全、出现在 assets 端点里、
+// `browser_download_url` 也印得出来，下载回 `404 BlobNotFound`。当晚它把那一版永久卡住，
+// 而链条上每一处用的都是"名字在不在"。
+func TestAssetDownloadable(t *testing.T) {
+	cases := []struct {
+		state string
+		want  bool
+		why   string
+	}{
+		{"uploaded", true, "正常资产"},
+		{"", true, "只有手工构造的结构体才没这个字段，真实 API 一定给"},
+		{"starter", false, "上传开始了但从未 finalize：有名字没字节"},
+		{"open", false, "别的状态一律先当成没有字节 —— 宁可多下一次，也别把幽灵当文件"},
+	}
+	for _, tc := range cases {
+		if got := (gh.Asset{State: tc.state}).Downloadable(); got != tc.want {
+			t.Errorf("State=%q：want %v got %v（%s）", tc.state, tc.want, got, tc.why)
+		}
+	}
+}
+
+// TestListAssetsParsesState 钉住 state 真的从 JSON 里解出来了。
+//
+// 上面那条测的是纯函数，字段名拼错（`State` 对不上 `state`）它照样绿 —— 而线上会静默
+// 退化成"什么都当可下载"，也就是这次修复完全没生效却看不出任何异常。
+func TestListAssetsParsesState(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `[
+			{"id":1,"name":"com.x-1.0-universal.apk","size":10,"state":"uploaded"},
+			{"id":2,"name":"com.x-1.1-universal.apk","size":83336512,"state":"starter"}
+		]`)
+	})
+
+	as, err := c.ListAssets(context.Background(), "o/store", 7)
+	if err != nil {
+		t.Fatalf("ListAssets：%v", err)
+	}
+	if len(as) != 2 {
+		t.Fatalf("want 2 个 asset，got %d", len(as))
+	}
+	if as[1].State != "starter" {
+		t.Fatalf("State 没从 JSON 里解出来（字段名对不上 `state`）：%q", as[1].State)
+	}
+	if !as[0].Downloadable() || as[1].Downloadable() {
+		t.Fatalf("Downloadable 判反了：%+v", as)
+	}
+}

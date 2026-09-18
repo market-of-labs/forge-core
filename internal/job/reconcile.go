@@ -3,16 +3,17 @@ package job
 import (
 	"context"
 	"fmt"
-	"path/filepath"
-	"strings"
 
 	"github.com/market-of-labs/forge-core/internal/model"
-	"github.com/market-of-labs/forge-core/internal/store"
 )
 
 // ReconcileOptions 调 reconcile 的选项。
 type ReconcileOptions struct {
-	// OnlyID 非空时只收敛这一个 appId（03 §4.3 的 push 分支）。
+	// OnlyID 非空时只收敛这一个 appId。
+	//
+	// 今天只有两个来源：`forge reconcile -only`，以及 newsource 收录完一张新增单之后的
+	// 那一次。从前它还服务过 §4.3 的 `push` 分支（一次提交改了哪个源就只收敛那一个），
+	// 那条路已随分派器一起删掉。
 	OnlyID string
 	// DryRun 只解析、不下载不推送不写盘。
 	DryRun bool
@@ -33,9 +34,9 @@ type ReconcileResult struct {
 // Reconcile 是 03 §4.4 的幂等全量对账，也是**唯一的"日常收敛"入口**。
 //
 // 它把 §4.4 的四步串起来：解析上游 → 镜像缺失版本 → 重建索引（并重跑一次仓库生成）→ 回写。
-// `handle-dispatch` 的 push / workflow_dispatch 分支最终都调它，区别只在 OnlyID；
-// `issues` 分支在收录完一张新增单之后也调它一次 —— 那次只带刚收录的那一个 appId，
-// 好让新应用在设备端"一分钟内可装"，而不是等到明天。
+// 调用它的只有两处：`forge reconcile` 动词（可带 `-only`），以及 newsource 在收录完一张
+// 新增单之后的那一次 —— 那次只带刚收录的那一个 appId，好让新应用在设备端"一分钟内可装"，
+// 而不是等到明天。从前 `handle-dispatch` 的三个分支也调它，那个分派器已随 §4.7 第 5 步删掉。
 //
 // # 它只做这一件事
 //
@@ -174,152 +175,4 @@ func RebuildAndCheck(ctx context.Context, c *Ctx) error {
 		return fmt.Errorf("自检发现硬错误，已放弃本次回写（03 §5.3）：%w", chkRep.Err())
 	}
 	return nil
-}
-
-// ---- handle-dispatch：事件分派（03 §4.3） -----------------------------------
-
-// DispatchResult 是一次事件处理的摘要。
-type DispatchResult struct {
-	Event     string
-	IssueNo   int
-	Intake    *IntakeDecision
-	Incoming  *IncomingResult
-	Reconcile *ReconcileResult
-	Commited  bool
-}
-
-// HandleDispatch 按 `client_payload.event` 分派（03 §4.3）。
-//
-// payload 只被当作**信标**：它带来的 event 名、issue 号、sha 都是标识而非内容，
-// 内容一律由 forge 自己用 API 去 store 读（§2.6 的切面）。于是"外部字符串进入
-// 执行环境"这条路径在这里依然是不通的。
-//
-// 四个分支：
-//
-//	issues            → 处理 issue（§2.5 入口乙）：新增单**当场**收录并只同步它自己
-//	intake-incoming   → 搬 _incoming（§3.2）：人点手动按钮，或上传 CI 发一个信标
-//	push              → 只对该 appId 收敛（§4.3）
-//	workflow_dispatch → 全量对账（同 §4.4）
-func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
-	res := &DispatchResult{Event: c.Env.Event}
-	switch c.Env.Event {
-
-	case "issues":
-		res.IssueNo = c.Env.Issue
-		if res.IssueNo <= 0 {
-			// payload 里的 issue 号缺失。这不是攻击，是 store 侧转发写错了；
-			// 猜一个号比报错危险得多（可能去改一张无关的单）。
-			return res, fmt.Errorf("event=issues 但 client_payload.issue 是 %d，无法定位 issue", c.Env.Issue)
-		}
-		// 整条链（新增单含落盘与单项目同步）在 IntakeIssue 里一次跑完，
-		// 提交与否也随之确定：变更单看 CommitBack 的返回，新增单看落盘与后续同步的或。
-		d, r, err := IntakeIssue(ctx, c, res.IssueNo)
-		res.Intake, res.Reconcile = d, r
-		if d != nil {
-			res.Commited = d.Committed
-		}
-		return res, err
-
-	case "intake-incoming":
-		// §3.2 的搬运。**没有闸门要过**：这条路只有两种来源 —— 人在 Actions 页点了
-		// 手动按钮（store 的 intake-incoming.yml 或 forge 的同名文件，都要仓库写
-		// 权限），或上传 CI 发的信标。两者都明确指名了"搬 _incoming"，不像从前那个
-		// `release: published` 事件，什么 Release 发布都会打进来、必须自己筛
-		// （旧闸门就是为了筛它）。
-		//
-		// 整件事（搬 → 重建 → 回写，含空队列守卫）在 IntakeIncoming 里 —— 这里从前
-		// 自己抄了一遍后半段，与 main.go 那个同名动词抄得不一样。分支本身在本轮
-		// 灰度结束后连同 HandleDispatch 一起删掉。
-		inc, committed, err := IntakeIncoming(ctx, c)
-		res.Incoming = inc
-		res.Commited = committed
-		return res, err
-
-	case "push":
-		// 只收敛被改动的那一个来源。改动文件列表不在 payload 里，只能按 sha 反查。
-		only, err := affectedAppID(ctx, c)
-		if err != nil {
-			// 反查失败**退化到全量**而不是报错：全量对账是幂等的，多跑一遍的代价
-			// 只是多打几个上游的 API；而"这次什么都不做"会让一次配置改动
-			// 一直不生效，直到下一天的 cron —— 那是个难查得多的症状。
-			c.Log("无法从提交反查改动的来源（%v），退化为全量对账", err)
-			only = ""
-		}
-		if only == "" {
-			c.Log("这次 push 没有改动任何单个来源文件，做全量对账")
-		}
-		r, err := Reconcile(ctx, c, ReconcileOptions{OnlyID: only})
-		res.Reconcile = r
-		if r != nil {
-			res.Commited = r.Commited
-		}
-		return res, err
-
-	case "workflow_dispatch", "reconcile":
-		// 手动按钮的另一个选项（verb=reconcile）。和 workflow_dispatch 同义：
-		// 两者的意思都是"人主动要一次全量对账"，没必要分成两条路。
-		r, err := Reconcile(ctx, c, ReconcileOptions{})
-		res.Reconcile = r
-		if r != nil {
-			res.Commited = r.Commited
-		}
-		return res, err
-
-	default:
-		// 不认识的 event 一律拒绝而不是"当作全量对账"：store 侧将来新增事件类型时，
-		// 静默地按全量处理会掩盖"forge 还没支持这个事件"这件事。
-		return res, fmt.Errorf("不认识的事件 %q（03 §4.3 只定义了 issues / intake-incoming / push / workflow_dispatch / reconcile）",
-			c.Env.Event)
-	}
-}
-
-// affectedAppID 从 `push` 的 sha 反查被改动的来源 id。
-//
-// 返回 "" 表示"应该按全量处理"：没改任何 sources/ 文件，或者改了**多个**
-// （批量改动时逐个收敛反而更慢、更容易撞上并发上传）。
-//
-// 只看 `sources/{appId}.json` 这一种形状 —— 根 `repo/` 与 `store/fdroid/metadata/`
-// 都是 forge 自己的产物，它们的 push 只会来自 forge 自己的回写，而那已经带着
-// [skip-dispatch] 被 store 侧挡掉了（规则 7）。真收到了，说明有人在手改产物，
-// 那更该全量重算把它盖回去。
-//
-// sources/ 里的文件现在**一半是输入、一半是产物**（`versions` 账本是 forge 写的，
-// D48），所以"改了 sources"既可能是人改了元数据、也可能是 forge 回写了账本 ——
-// 两者都该收敛到这**一个** app，所以这里不需要区分。
-func affectedAppID(ctx context.Context, c *Ctx) (string, error) {
-	if c.Env.SHA == "" {
-		return "", fmt.Errorf("payload 里没有 sha")
-	}
-	files, err := c.GH.CommitFiles(ctx, c.Env.StoreRepo, c.Env.SHA)
-	if err != nil {
-		return "", err
-	}
-
-	var hit []string
-	for _, f := range files {
-		// 正斜杠是 API 返回的固定形状（即使在 Windows 上跑）。
-		if filepath.Dir(filepath.ToSlash(f)) != store.SourcesDirName {
-			continue
-		}
-		base := filepath.Base(filepath.ToSlash(f))
-		if !strings.HasSuffix(base, ".json") {
-			continue
-		}
-		hit = append(hit, strings.TrimSuffix(base, ".json"))
-	}
-	switch len(hit) {
-	case 0:
-		return "", nil
-	case 1:
-		if c.Source(hit[0]) == nil {
-			// 提交删掉了这个来源文件。没有上游要解析，全量重算把它的 metadata 清掉、
-			// 索引里那个包自然就没了（见 BuildRepo 的 metadata 清理）。
-			c.Log("来源 %s 已被删除，走全量重算把它从清单里去掉", hit[0])
-			return "", nil
-		}
-		return hit[0], nil
-	default:
-		c.Log("这次 push 改了 %d 个来源文件，走全量对账", len(hit))
-		return "", nil
-	}
 }

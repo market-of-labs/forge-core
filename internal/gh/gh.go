@@ -591,15 +591,19 @@ type commitDetail struct {
 
 // CommitFiles 返回一次提交里改动过的文件路径（相对仓库根）。
 //
-// 用途只有一个：`push` 分支要"只对该 appId 做一次收敛"（03 §4.3），
-// 而 dispatch 的 payload 里带的只是 sha —— 事件里没有"改了哪些文件"这个信息，
-// 只能反查。为此多打一次 API 是值得的：一个来源文件的编辑不该引发一次全量对账
-// （那会去打每一个上游的 API）。
+// # 它现在**没有调用方** —— 这是留着的，不是漏删
+//
+// 它服务过 03 §4.3 那条 `push` 分支：dispatch 的 payload 里只有一个 sha，
+// 事件里没有"改了哪些文件"这个信息，只能反查 —— 为的是"改一个来源文件就只对该
+// appId 收敛一次"，而不是去打每一个上游的 API。那条分支随运行期分派器一起删了
+// （03 §4.7 第 5 步），于是它成了这个包里唯一一个没有调用方的导出方法。
+//
+// 保留它的理由与 job.SkipDispatch 是同一条（见那个常量的注释）：删掉它省不下任何
+// 东西，而"push 即对账"这个念头将来很可能回来 —— 回来时没有这个反查，就只剩全量
+// 对账一个选择，而那恰好是它当初被写出来的原因。
 //
 // **翻页**：GitHub 的 commits 端点默认只回最多 300 个文件的第一页。一次手改
 // 通常就一两个文件，但"批量导入 200 个来源"的提交会超 —— 所以这里跟着 Link 头翻完。
-// 翻丢了不会出错，只会退化成"没识别出该收敛哪个 appId"，而调用方对此的兜底是
-// 全量对账（见 job.HandleDispatch 的 push 分支），所以这里失败不致命。
 func (c *Client) CommitFiles(ctx context.Context, repo, sha string) ([]string, error) {
 	next := c.repoURL(repo, "commits", sha) + "?per_page=100"
 	var out []string

@@ -63,7 +63,12 @@ const (
 	// 这里**没有** releaseTag / prerelease：它们只服务过 `release: published`
 	// 那条自动发车的路（闸门靠 tag 判断"这次发布是不是 _incoming"）。队列改成
 	// 常驻 draft + 显式触发之后，那类事件根本不会打到 forge，两个字段就没有输入了。
-	EnvEvent = "EVENT"
+	//
+	// `EVENT` 是同理的第三样（2026-09-18 删，03 §4.7 第 5 步）：它只服务过按这个
+	// 字符串分派的 `handle-dispatch`。事件类型现在由 `repository_dispatch` 的
+	// `types:` 在**编译期**表达，执行体这边不再有"事件名"这个输入 —— 随之消失的
+	// 还有"store 打过来一个 forge 不认识的事件"这条路径（从前靠 `default:` 硬错报警，
+	// 现在它根本到不了 workflow 里）。
 	EnvIssue = "ISSUE"
 	EnvSHA   = "SHA"
 	EnvRef   = "REF"
@@ -91,7 +96,6 @@ type Env struct {
 	APIBase    string
 	UploadBase string
 
-	Event string
 	Issue int
 	SHA   string
 	Ref   string
@@ -120,10 +124,9 @@ func FromEnv() (*Env, error) {
 		APIBase:    firstNonEmpty(os.Getenv(EnvAPIBase), os.Getenv("GITHUB_API_URL"), DefaultAPIBase),
 		UploadBase: os.Getenv(EnvUploadBase),
 
-		Event: strings.TrimSpace(os.Getenv(EnvEvent)),
-		SHA:   os.Getenv(EnvSHA),
-		Ref:   os.Getenv(EnvRef),
-		InCI:  os.Getenv("GITHUB_ACTIONS") == "true",
+		SHA:  os.Getenv(EnvSHA),
+		Ref:  os.Getenv(EnvRef),
+		InCI: os.Getenv("GITHUB_ACTIONS") == "true",
 
 		APKCacheDir: strings.TrimSpace(os.Getenv(EnvAPKCacheDir)),
 
@@ -248,8 +251,8 @@ func (e *Env) Sanitized() string {
 		cache = "无（老版本不会进索引）"
 	}
 	return fmt.Sprintf(
-		"event=%q issue=%d sha=%q store=%s forge=%s api=%s %s %s %s cache=%s",
-		e.Event, e.Issue, shortSHA(e.SHA),
+		"issue=%d sha=%q store=%s forge=%s api=%s %s %s %s cache=%s",
+		e.Issue, shortSHA(e.SHA),
 		e.StoreRepo, e.ForgeRepo, e.APIBase,
 		secret("token", e.Token), secret("keystore", e.KeystoreB64),
 		secret("pass", e.KeystorePass), cache)

@@ -35,7 +35,8 @@ type versionAcc struct {
 
 // ResolveOptions 调 resolve-upstream 的选项。
 type ResolveOptions struct {
-	// OnlyID 非空时只处理这一个 appId（handle-dispatch 的 push 分支用）。
+	// OnlyID 非空时只处理这一个 appId。调用方是 Reconcile（它把 OnlyID 原样传下来），
+	// 所以真正决定"只收敛一个"的地方见 ReconcileOptions.OnlyID。
 	OnlyID string
 }
 

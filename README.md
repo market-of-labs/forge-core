@@ -27,11 +27,14 @@ reconcile        → reconcile        全量对账：解析上游 → 补齐缺�
 schedule（每日） → reconcile        同上（这条不经事件，是 forge 侧的 cron 直接跑）
 ```
 
-从前这三件事挤在一个 `handle-dispatch` 里按 payload 里的一个字符串分派，那个动词**本轮删掉**：
-路由一旦能靠一个外部字符串决定，"跑哪一件事"就成了一件运行期要读代码才知道的事。
-⚠️ 它属**灰度的最后一步**（market-spec 03 §4.7 第 5 步）—— `handle-dispatch` 与
-`forge/.github/workflows/on-dispatch.yml` 同生共死，而后者要活到 `_incoming` 的 tag 引用被刷过一次
-之后（`release` 事件跑的是 tag 所指提交上的文件）。所以**此刻代码里那个动词还在**。
+从前这三件事挤在一个 `handle-dispatch` 里按 payload 里的一个字符串分派，那个动词已在
+**2026-09-18 删掉**（market-spec 03 §4.7 第 5 步）：路由一旦能靠一个外部字符串决定，
+"跑哪一件事"就成了一件要读代码才知道的事。
+
+它与 `forge/.github/workflows/on-dispatch.yml` **同生共死** —— 那是它唯一的调用方，
+两个文件在同一个提交里一起删。删之前先等了一件事：`_incoming` 的 tag 引用**被刷过一次**
+（`release` 事件跑的是 **tag 所指提交**上的 workflow 文件，所以只有等引用被重建，
+删掉的旧文件才真的不会再被解析到）。这一步在 2026-09-18 验证通过。
 
 **幂等 = 漏跑自愈。** 对账不依赖"上一次跑到哪"，每次都重新比对全量状态。所以某天
 runner 挂了、cron 被跳过、dispatch 丢了，第二天自然补齐，不需要任何补偿逻辑。
@@ -76,8 +79,8 @@ go test ./...
 | `resolve-upstream` | `-only ID` 只算出该镜像哪些版本并打印计划，**不下载不上传** |
 | `mirror-upstream` | `-only ID` `-dry-run` 下载 → 按内容判 ABI → 改名 → 幂等上传 |
 | `build-index` | 从 Release 现状重建各 `sources/` 条目的 `versions` 账本（无开关，零下载；缺的元数据由下一轮镜像补，见 D56） |
-| `build-manifest` | 由 sources（自带账本）+ endpoints 合成 `apps.json` |
-| `check-manifest` | 跑 02 §2.8 自检 + 阈值告警 |
+| `build-repo` | 渲染 metadata → 凑齐 APK → `fdroid update` → 产物进 `repo/`。**必须在容器里跑** |
+| `check-repo` | 读回磁盘上的产物跑 02 §2.8 自检 + 阈值告警。也要容器（`jarsigner -verify`） |
 | `reconcile` | `-only ID` `-dry-run` 幂等全量对账（§4.4） |
 | `commit-back` | `-m MSG` 按固定路径提交并推送（自动加 `[skip-dispatch]`） |
 
@@ -142,14 +145,16 @@ cmd/forge/            子命令分发、环境读取、退出码
 internal/
   naming/             文件名的契约：{appId}-{version}-{abi}.apk
   apkmeta/            纯 Go 读 APK：package / versionName / versionCode / ABI
+  apksig/             读 APK 里**上游开发者**的签名证书指纹（02 §2.7）。
+                      ⚠️ 目前**没有任何调用方** —— 指纹还没接进账本与自检
   model/              清单、来源（含版本账本）、地址模板的类型与校验
   issue/              issue 正文的表单解析（纯数据，绝不 eval）
   upstream/           从上游 Release 里挑该镜像哪些文件
-  manifest/           sources + index + endpoints → apps.json
+  fdroid/             fdroid 侧的固定枚举与渲染（metadata / index 的输入输出）
   gh/                 GitHub API 封装
   gitx/               git 封装（凭据经 -c credential.helper 一次性传入）
   store/              store 工作副本的读写
-  job/                把上面这些拼成"一次维护动作"（十个动词）
+  job/                把上面这些拼成"一次维护动作"（九个动词）
 ```
 
 分层的规矩很简单：下面一层不知道上面一层的存在。`job` 不碰 `os.Args`、不决定退出码、
@@ -177,8 +182,9 @@ internal/
 go test ./...
 ```
 
-纯逻辑那几个包（`naming` / `apkmeta` / `model` / `issue` / `upstream` / `manifest`）
-都是无 IO 的，测试直接调用。`job` 里被重点覆盖的是**判断**那部分
+纯逻辑那几个包（`naming` / `model` / `issue` / `upstream`）完全无 IO，测试直接调用；
+`apkmeta` / `apksig` 也只多一层"路径 → 字节"的薄壳，核心收在 `io.Reader` 上，
+所以真 APK 的字节塞进去就能跑。`job` 里被重点覆盖的是**判断**那部分
 （`DecideIntake` / `pickTargets`）—— 它们同样是纯函数，
 把最难的那部分（该不该做）从网络那部分（怎么做）里切了出来。
 

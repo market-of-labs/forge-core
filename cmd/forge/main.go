@@ -1,6 +1,6 @@
 // Command forge 是市场维护侧的单一可执行文件。
 //
-// 03 §4.1 列的是九个 `scripts/*.sh`，这里把它们实现成**一个二进制 + 十个子命令**。
+// 03 §4.1 列的是九个 `scripts/*.sh`，这里把它们实现成**一个二进制 + 九个动词**。
 // 换成 Go 之后"安装依赖"这一步整个消失了（纯 Go 解析 APK，不需要 aapt），
 // 所以每个 workflow 的 "Install deps" 步骤也随之删掉 —— 那不是省事，
 // 而是少了一个"runner 镜像换了、aapt 装不上了"的故障面。
@@ -92,13 +92,6 @@ func run(args []string) int {
 // dispatch 跑一个动词。返回的 code 在 err 非 nil 时才是退出码。
 func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log func(string, ...any)) (int, error) {
 	switch verb {
-
-	case "handle-dispatch":
-		res, err := job.HandleDispatch(ctx, c)
-		if res != nil {
-			log("事件 %s 处理完毕（committed=%v）", res.Event, res.Commited)
-		}
-		return exitFailed, err
 
 	case "intake-issue":
 		fs := newFlagSet(verb)
@@ -225,7 +218,9 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 		if err := fs.Parse(args); err != nil {
 			return exitUsage, err
 		}
-		// 报告由 Reconcile 自己在出口打（放这儿只有这一个动词能打，handle-dispatch 打不着）。
+		// 报告由 Reconcile 自己在出口打 —— 它不止一个调用方（newsource 收录完一张新增单
+		// 之后也调它），放在调用方就得写两遍，而"漏写一处"的症状是那一轮的硬错误
+		// 只在日志里，没有任何一层会为此报错。
 		res, err := job.Reconcile(ctx, c, job.ReconcileOptions{OnlyID: *only, DryRun: *dry})
 		if err != nil {
 			return exitFailed, err
@@ -268,7 +263,6 @@ func newFlagSet(name string) *flag.FlagSet {
 // verbDoc 是子命令表。用有序切片而不是 map，好让 usage 的输出稳定 ——
 // 一份每次顺序都不同的帮助文本没法被 diff、也没法被文档引用。
 var verbDoc = []struct{ name, doc string }{
-	{"handle-dispatch", "按 client_payload.event 分派（03 §4.3）。CI 的入口"},
 	{"intake-issue", "读 issue → 校验 → 落盘 → （新增单）探身份并同步它自己 → 回评关单（§2.5）"},
 	{"intake-incoming", "搬 _incoming 的 asset 到正式 Release 并清场（§3.2 / §4.6）"},
 	{"resolve-upstream", "只算出该镜像哪些版本，打印计划（不下载不上传）"},
@@ -304,8 +298,9 @@ func usage() {
 	fmt.Fprintf(w, "  FORGE_REPO          forge 仓库 owner/name（默认 %s）\n", job.DefaultForgeRepo)
 	fmt.Fprintf(w, "  STORE_DIR           已 checkout 的 store 工作副本；为空则自己浅克隆到临时目录\n")
 	fmt.Fprintf(w, "  FORGE_API_BASE      API 根地址（默认 %s；Actions 里自动取 $GITHUB_API_URL）\n", job.DefaultAPIBase)
-	fmt.Fprintf(w, "  EVENT / ISSUE / SHA / REF\n")
-	fmt.Fprintf(w, "                      事件字段（03 §2.6）；手动按钮走 EVENT\n")
+	fmt.Fprintf(w, "  ISSUE / SHA / REF\n")
+	fmt.Fprintf(w, "                      事件字段（03 §2.6）。事件**类型**不在这里 —— 它由\n")
+	fmt.Fprintf(w, "                      repository_dispatch 的 types: 在编译期决定（03 §4.7）\n")
 	fmt.Fprintf(w, "  APK_CACHE_DIR       跨轮持久的 APK 目录；为空 = 索引里只会有最新版本\n")
 	fmt.Fprintf(w, "  REPO_KEYSTORE_B64   签名 keystore 的 base64（build-repo 必需，03 §5.1）\n")
 	fmt.Fprintf(w, "  REPO_KEYSTORE_PASS  它的口令\n")

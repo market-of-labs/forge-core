@@ -73,7 +73,7 @@ type IntakeDecision struct {
 	//
 	// 裁决阶段必然为假 —— 那时候还什么都没写。它由 IntakeIssue 填，因为"提交了没有"
 	// 只有真正落盘的那几步知道（内容没变时 CommitBack 会安静地不提交），
-	// 而调用方（`handle-dispatch` 的摘要行）只能从裁决结果上读。
+	// 而调用方（`intake-issue` 动词的摘要行）只能从裁决结果上读。
 	Committed bool
 	// Summary 一行摘要，给日志与提交信息用。
 	Summary string
@@ -911,9 +911,11 @@ func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int
 		// `intake-incoming.yml` 去解析触发器 —— 默认分支上怎么改都看不见。删掉它，
 		// Publish 会在当时的默认分支 HEAD 上重建，队列这条路才跟得上默认分支。
 		//
-		// 本轮的拆工作流正好踩在这条上：store 那边的入口从 forward.yml 改成了
-		// intake-incoming.yml，而这份改动**只有等这个引用被删过一次**才会在这条路上
-		// 生效。所以灰度期间旧的 on-dispatch.yml 要留到确认引用刷过之后再删。
+		// 2026-09-18 那次拆工作流正好踩在这条上：store 那边的入口从 forward.yml 改成了
+		// intake-incoming.yml，而这份改动**只有等这个引用被删过一次**才会在这条路上生效
+		// —— 所以当时的灰度顺序是「先删 store 侧旧文件 → 等引用确实被删过一次 → 才轮到
+		// 删 forge 侧那个旧的 on-dispatch.yml」。如今引用已经刷过（路走通了），
+		// 旧文件也删了；留这段是因为**下一次**改这个文件名时会同样卡在这儿。
 		//
 		// 位置的两条约束：在 Unpublish **之后**（之前 Release 还挂在这个引用上，删引用
 		// 等于把现场拆了），且只在 Unpublish 成功时删（失败就说明队列还是 published 的，

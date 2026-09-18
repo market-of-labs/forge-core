@@ -253,9 +253,9 @@ func buildLedger(src *model.Source, groups []assetGroup) ([]model.Version, *mode
 			rep.Warnf(id, "版本 %s 没解析出 versionCode：清单会缺该字段，check-manifest 将判**失败**（规则 6），"+
 				"而这一轮的回写会连同**别的应用**一起放弃。它要么来自「上传成功但账本没落盘」"+
 				"（最新的那个版本下一轮镜像会补回），要么来自上游那个 APK 里真的没有 versionCode"+
-				"（不会自己好：得改 sources/%s.json 那条记录，或回滚它 —— 改完要点一次 store 的手动"+
-				"按钮 verb=reconcile 才会重算。人手改 sources/ 不再自动触发：forward.yml 那条 push "+
-				"触发器已经删了）", it.version, id)
+				"（不会自己好：得改 sources/%s.json 那条记录，或回滚它 —— 改完要点一次 store 的"+
+				"`reconcile.yml` 手动按钮才会重算。人手改 sources/ 不再自动触发：那条 push "+
+				"触发器 2026-09-16 已经删了）", it.version, id)
 		}
 
 		assets := make([]model.Asset, 0, len(b.assets))

@@ -91,7 +91,7 @@ func TestCommitCreatesCommitWithMessage(t *testing.T) {
 	if !strings.Contains(msg, "重建清单") {
 		t.Errorf("提交信息里没有我们的内容：%q", msg)
 	}
-	// 规则 7 靠这个标记抑制自激，它是**子串匹配**（forward.yml 里 contains），
+	// 规则 7 靠这个标记抑制自激，而判定它是**子串匹配**（`contains(...)`），
 	// 所以只要在信息里出现即可 —— 但必须在，否则一次回写会触发一次 dispatch，
 	// 无限循环。
 	if !strings.Contains(msg, "[skip-dispatch]") {

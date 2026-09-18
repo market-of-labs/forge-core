@@ -246,7 +246,7 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 			f := newFakeStore(t, tc.assets, false)
 			c := f.ctx(t)
 
-			res, err := IntakeIncoming(context.Background(), c)
+			res, err := moveIncoming(context.Background(), c)
 			if err != nil {
 				t.Fatalf("IntakeIncoming：%v", err)
 			}
@@ -272,7 +272,7 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 			}
 			// 复位成功 ⇒ 顺手删掉队列的 tag 引用（D57）。与搬没搬成无关：这个引用是
 			// `release` 事件的解析依据，而它一旦建立就不再移动 —— 留着它，"Publish 即
-			// 发车"那条路会一直解析到一份旧的 forward.yml（症状：Publish 了却没反应，
+			// 发车"那条路会一直解析到一份旧的 intake-incoming.yml（症状：Publish 了却没反应，
 			// 而 Actions 页面干干净净）。删掉它，下一次 Publish 在当时的默认分支 HEAD 上重建。
 			if n := f.deletedIncomingRef(); n != 1 {
 				t.Errorf("复位成功后该删掉队列的 tag 引用（恰好一次），实际 %d 次，请求：%v",
@@ -289,6 +289,42 @@ func TestIntakeIncoming_RearmsQueueEvenWhenNothingMoved(t *testing.T) {
 				t.Errorf("正常路径不该报 tag 名没留住：\n%s", logs)
 			}
 		})
+	}
+}
+
+// 空队列**不许提交**。
+//
+// 这是本轮拆工作流时顺手修掉的那个缺陷的回归测试：这件事从前有两个入口（运行期
+// 路由器 `handle-dispatch` 与独立动词 `intake-incoming`），**只有前者有这条守卫**。
+// 于是"点一次按钮、但队列是空的"——乱点、或者上一轮刚搬完又点一次——在动词那条路上
+// 会一路走到 `CommitBack`，而它是**无条件**提交的：产出一次内容为空的提交。日志绿的、
+// 索引没变，只有 git 历史在长，一天点几次就攒几个（§3.2 的流程本就没有"提交个空的"
+// 这种状态）。
+//
+// ⚠️ 少了守卫时这条用例**必然**是红的，而且红在第一句：缺了守卫就会往下走到
+// `RebuildAndCheck`，那一步要重新读一遍 store 的 Release 列表，而本用例的假 store
+// 没有那个端点（未知请求一律回一段 APK 内容）⇒ 解析失败、当场报错。实测过：把守卫
+// 短路掉，报的是「列 Release … 的 asset：解析响应」。想把守卫改坏的人会先在这里看到
+// `err != nil`。
+//
+// 队列**照样要被复位**（moveIncoming 的 defer 无条件做这件事）—— 所以"什么都不提交"
+// 不等于"什么都不做"：少了下面那两条断言，"提前 return、什么都没干"也会算通过。
+func TestIntakeIncoming_EmptyQueueDoesNotCommit(t *testing.T) {
+	f := newFakeStore(t, nil, false)
+	c := f.ctx(t)
+
+	inc, committed, err := IntakeIncoming(context.Background(), c)
+	if err != nil {
+		t.Fatalf("空队列不该报错（但那个 ctx 的 Root 是空的，所以在这里报错＝守卫没了）：%v", err)
+	}
+	if committed {
+		t.Fatal("空队列提交了一次 —— 那是一个内容为空的提交，点几次按钮就攒几个")
+	}
+	if inc == nil {
+		t.Fatal("inc 不该是 nil：调用方要用它报告搬了几个、留了几个")
+	}
+	if !inc.Cleaned {
+		t.Error("队列没被复位：空队列也要留在干净的 draft 上，否则下一次 Publish 解析不到它")
 	}
 }
 
@@ -332,7 +368,7 @@ func TestIntakeIncoming_RedWhenQueueCannotBeRearmed(t *testing.T) {
 	f := newFakeStore(t, nil, true)
 	c := f.ctx(t)
 
-	res, err := IntakeIncoming(context.Background(), c)
+	res, err := moveIncoming(context.Background(), c)
 	if err == nil {
 		t.Fatal("清场失败必须报出来，否则这次运行是绿的")
 	}
@@ -357,7 +393,7 @@ func TestIntakeIncoming_PrimaryErrorWinsOverCleanupError(t *testing.T) {
 	f.assetsErr = true
 	c := f.ctx(t)
 
-	_, err := IntakeIncoming(context.Background(), c)
+	_, err := moveIncoming(context.Background(), c)
 	if err == nil {
 		t.Fatal("列 asset 失败该报错")
 	}
@@ -383,7 +419,7 @@ func TestIntakeIncoming_RedWhenQueueMissing(t *testing.T) {
 	f.noQueue = true
 	c := f.ctx(t)
 
-	res, err := IntakeIncoming(context.Background(), c)
+	res, err := moveIncoming(context.Background(), c)
 	if err == nil {
 		t.Fatal("认不出队列必须报错，否则这次运行的结论是绿色")
 	}

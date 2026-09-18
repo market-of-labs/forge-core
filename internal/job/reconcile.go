@@ -222,28 +222,16 @@ func HandleDispatch(ctx context.Context, c *Ctx) (*DispatchResult, error) {
 
 	case "intake-incoming":
 		// §3.2 的搬运。**没有闸门要过**：这条路只有两种来源 —— 人在 Actions 页点了
-		// 手动按钮（store 的 forward-to-forge 或 forge 的 on-dispatch，都要仓库写
+		// 手动按钮（store 的 intake-incoming.yml 或 forge 的同名文件，都要仓库写
 		// 权限），或上传 CI 发的信标。两者都明确指名了"搬 _incoming"，不像从前那个
 		// `release: published` 事件，什么 Release 发布都会打进来、必须自己筛
 		// （旧闸门就是为了筛它）。
-		inc, err := IntakeIncoming(ctx, c)
+		//
+		// 整件事（搬 → 重建 → 回写，含空队列守卫）在 IntakeIncoming 里 —— 这里从前
+		// 自己抄了一遍后半段，与 main.go 那个同名动词抄得不一样。分支本身在本轮
+		// 灰度结束后连同 HandleDispatch 一起删掉。
+		inc, committed, err := IntakeIncoming(ctx, c)
 		res.Incoming = inc
-		if err != nil {
-			return res, err
-		}
-		// 搬完必须重建清单与索引，否则新版本在 Release 里但清单看不见（§3.2 的流程）。
-		// 什么都不用重建时（空队列）就跳过，免得制造一个无意义的提交。
-		if inc == nil || (len(inc.Moved) == 0 && len(inc.Kept) == 0) {
-			return res, nil
-		}
-		if err := RebuildAndCheck(ctx, c); err != nil {
-			return res, err
-		}
-		msg := fmt.Sprintf("搬运 _incoming：%d 个 asset", len(inc.Moved))
-		if len(inc.Kept) > 0 {
-			msg += fmt.Sprintf("（%d 个未安置，保留待人工）", len(inc.Kept))
-		}
-		committed, err := c.CommitBack(ctx, msg)
 		res.Commited = committed
 		return res, err
 

@@ -2,7 +2,7 @@ version: 2
 
 # 三个仓库需要这个文件（依赖在哪，升级就该配在哪）：
 #   - 本仓库（`forge-core`）：build.yml 里三个 action + go.mod 依赖；
-#   - `store`：forward.yml 里 `actions/github-script`（它自己那一份在
+#   - `store`：beacon 复合动作里的 `actions/github-script`（它自己那一份在
 #     store/.github/dependabot.yml）；
 #   - 公有的 `forge`：取执行体那个 action（`robinraju/release-downloader@v1`，
 #     它自己那一份在 forge/.github/dependabot.yml）。

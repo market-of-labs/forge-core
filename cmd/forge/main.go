@@ -121,17 +121,19 @@ func dispatch(ctx context.Context, c *job.Ctx, verb string, args []string, log f
 
 	case "intake-incoming":
 		// 手动搬一次 §3.2 的队列。**没有闸门要过**：这条路只有人主动叫才会走到 ——
-		// 点 Actions 页的按钮，或 store 侧上传 CI 发信标（见 HandleDispatch 同名分支）。
-		// 从前那个 `release: published` 事件流需要筛，现在不存在了，闸门也就跟着没了。
-		inc, err := job.IntakeIncoming(ctx, c)
+		// 点 `intake-incoming.yml` 的按钮，或 store 侧上传 CI 发信标。
+		//
+		// 搬队列、重建索引、回写这三件事全在 job.IntakeIncoming 里，这里只负责
+		// 报告结果 —— 从前它们散在这个 case 与 HandleDispatch 的同名分支里，两份
+		// 还不一样（这份漏了空队列守卫），见那个函数的注释。
+		inc, committed, err := job.IntakeIncoming(ctx, c)
 		if err != nil {
 			return exitFailed, err
 		}
-		log("搬运 %d 个，保留 %d 个", len(inc.Moved), len(inc.Kept))
-		if err := job.RebuildAndCheck(ctx, c); err != nil {
-			return exitFailed, err
+		if inc != nil {
+			log("搬运 %d 个，保留 %d 个", len(inc.Moved), len(inc.Kept))
 		}
-		_, err = c.CommitBack(ctx, fmt.Sprintf("搬运 _incoming：%d 个 asset", len(inc.Moved)))
+		log("committed=%v", committed)
 		return exitFailed, err
 
 	case "resolve-upstream":

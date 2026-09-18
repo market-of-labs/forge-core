@@ -17,15 +17,21 @@
 
 ## 它在做什么
 
-事件由公有的 workflow 交给 `handle-dispatch`，它按 `$EVENT` 分派：
+**一个功能一个子命令，路由在文件名上。** 公有的 `forge` 仓库里三个入口文件各自只认一个
+`repository_dispatch` 事件类型，进来后直接调自己那一个动词 —— 没有任何"按事件名分派"的一层：
 
 ```
-issues            → 解析 issue 正文 → 校验 → 写 sources/{appId}.json → 回评并关闭
-intake-incoming   → 搬 _incoming 的 APK 到正式 Release → 清场（人点手动按钮，或 CI 发信标）
-push              → 只对该 appId 收敛一次（解析上游 → 镜像 → 重建清单）
-workflow_dispatch → 全量对账（同下；手动按钮的另一个选项 reconcile 走同一条路）
-schedule（每日）   → 全量对账：解析上游 → 补齐缺失版本 → 重建 index 与清单 → 自检 → 回写
+source-change    → intake-issue     解析 issue 正文 → 校验 → 写 sources/{appId}.json → 回评并关闭
+intake-incoming  → intake-incoming  搬 _incoming 的 APK 到正式 Release → 重建索引 → 清场
+reconcile        → reconcile        全量对账：解析上游 → 补齐缺失版本 → 重建 index 与清单 → 自检 → 回写
+schedule（每日） → reconcile        同上（这条不经事件，是 forge 侧的 cron 直接跑）
 ```
+
+从前这三件事挤在一个 `handle-dispatch` 里按 payload 里的一个字符串分派，那个动词**本轮删掉**：
+路由一旦能靠一个外部字符串决定，"跑哪一件事"就成了一件运行期要读代码才知道的事。
+⚠️ 它属**灰度的最后一步**（market-spec 03 §4.7 第 5 步）—— `handle-dispatch` 与
+`forge/.github/workflows/on-dispatch.yml` 同生共死，而后者要活到 `_incoming` 的 tag 引用被刷过一次
+之后（`release` 事件跑的是 tag 所指提交上的文件）。所以**此刻代码里那个动词还在**。
 
 **幂等 = 漏跑自愈。** 对账不依赖"上一次跑到哪"，每次都重新比对全量状态。所以某天
 runner 挂了、cron 被跳过、dispatch 丢了，第二天自然补齐，不需要任何补偿逻辑。
@@ -56,7 +62,7 @@ go test ./...
 | `FORGE_REPO` | 公有的**运行器**仓库 `owner/name`，默认 `market-of-labs/forge` |
 | `STORE_DIR` | 一个**已经 checkout 好**的 store 工作副本。留空则自己浅克隆到临时目录（用完删掉） |
 | `FORGE_API_BASE` | API 根地址。Actions 里自动用 `$GITHUB_API_URL` |
-| `EVENT` `ISSUE` `SHA` `REF` | 事件字段（03 §2.6）。手动按钮走 `EVENT`（值就是 `verb`），没有 `client_payload` |
+| `ISSUE` | issue 编号，只有 `intake-issue` 读它（03 §2.6）。文件里没有就得到 0，由二进制硬错 |
 
 `STORE_DIR` 那一条是给本地调试用的：指一个你的真实工作副本，动词就会直接改它，
 不克隆也不删（`Close` 对"调用方给的副本"什么都不做 —— 那可能是你的工作区）。
@@ -65,9 +71,8 @@ go test ./...
 
 | 子命令 | 干什么 |
 |---|---|
-| `handle-dispatch` | 按 `$EVENT` 分派（CI 的入口） |
-| `intake-issue` | `-issue N` 处理一张申请单 |
-| `intake-incoming` | 搬 `_incoming` 并清场。**没有闸门** —— 这条路只有人主动叫才会走到（D53） |
+| `intake-issue` | `-issue N` 处理一张申请单（`source-change.yml` 的入口） |
+| `intake-incoming` | 搬 `_incoming`、重建索引、清场。**没有闸门** —— 这条路只有人主动叫才会走到（D53）；空队列不提交 |
 | `resolve-upstream` | `-only ID` 只算出该镜像哪些版本并打印计划，**不下载不上传** |
 | `mirror-upstream` | `-only ID` `-dry-run` 下载 → 按内容判 ABI → 改名 → 幂等上传 |
 | `build-index` | 从 Release 现状重建各 `sources/` 条目的 `versions` 账本（无开关，零下载；缺的元数据由下一轮镜像补，见 D56） |

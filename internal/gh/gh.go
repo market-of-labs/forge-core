@@ -493,8 +493,8 @@ func (c *Client) DeleteAsset(ctx context.Context, repo string, assetID int64) er
 // workflow 的方式：**它跑的是 tag 所指提交上的那份文件，不是默认分支 HEAD 上的**。
 // 而这个引用一旦建立就再也不动 —— 实测撞上过：`_incoming` 的引用建于 09-12，09-16
 // 的发布还在用它（两次 run 的 head_sha 都停在四天前那个提交上）。于是默认分支上给
-// forward.yml 改触发器，队列这条路**永远看不见**：Publish 会触发一个事件、解析到一份
-// 没有该触发器的 workflow、然后什么都不发生，而 Actions 页面干干净净 —— 与"传了却没
+// `intake-incoming.yml` 改触发器，队列这条路**永远看不见**：Publish 会触发一个事件、
+// 解析到一份没有该触发器的 workflow、然后什么都不发生，而 Actions 页面干干净净 —— 与"传了却没
 // 反应"是同一类故障，且更难查。删掉之后，下一次 Publish 会在**当时的**默认分支 HEAD
 // 上把它重建出来（`target_commitish` 是分支名 `master`，不是 sha，所以每次都取当下），
 // 跑的就永远是最新那份。

@@ -442,15 +442,18 @@ func TestDispatchPayloadShape(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	err := c.Dispatch(context.Background(), "market-of-labs/forge", "store-event",
-		map[string]any{"event": "release", "issue": 0})
+	// 事件类型现在是 per-功能 的一个词（`intake-incoming` / `source-change` / `reconcile`），
+	// 不再是那个什么事件都塞进去的 `store-event` —— 这里用一个真实取值，免得 fixture
+	// 里留着一个 grep 扫不干净的旧名字。
+	err := c.Dispatch(context.Background(), "market-of-labs/forge", "intake-incoming",
+		map[string]any{"issue": 0})
 	if err != nil {
 		t.Fatalf("Dispatch：%v", err)
 	}
 	if gotPath != "/repos/market-of-labs/forge/dispatches" {
 		t.Errorf("路径 = %q", gotPath)
 	}
-	if !strings.Contains(gotBody, `"event_type":"store-event"`) {
+	if !strings.Contains(gotBody, `"event_type":"intake-incoming"`) {
 		t.Errorf("缺 event_type：%s", gotBody)
 	}
 	if !strings.Contains(gotBody, `"client_payload"`) {

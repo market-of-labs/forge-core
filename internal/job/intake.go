@@ -503,13 +503,57 @@ type IncomingResult struct {
 	Cleaned bool     // 是否成功清场（改回 draft + 删除已搬运的 asset）
 }
 
-// IntakeIncoming 搬 `_incoming` 的 asset 到各自的正式 Release，然后清场。
+// IntakeIncoming 跑完 `intake-incoming` 这个动词的**整件事**：搬队列 → 重建索引 → 回写。
+//
+// 它是这个功能的**唯一出口**，`moveIncoming` 刻意不导出 —— 见那个函数的说明。
+//
+// 返回的 committed 在"队列是空的"时是 false：那时什么都不该提交，见下面的守卫。
+func IntakeIncoming(ctx context.Context, c *Ctx) (res *IncomingResult, committed bool, err error) {
+	inc, err := moveIncoming(ctx, c)
+	if err != nil {
+		return inc, false, err
+	}
+
+	// ⚠️ **空队列必须在这里停住**，不能往下走去重建+回写。
+	//
+	// 乱点一次按钮、或上一轮刚搬完又点一次，都会走到这儿。而重建之后 `CommitBack`
+	// 是**无条件**提交的：没有这条守卫，一次空搬运会产出一个内容为空的提交，
+	// 一天点几次就攒几个 —— 日志绿的、索引没变，只有 git 历史在长。
+	//
+	// 这条守卫曾经只存在于被删掉的那个运行期路由器里，而直接调 `intake-incoming`
+	// 动词的那条路没有 —— 两条路走同一个功能却行为不同，正是本轮拆工作流时
+	// 顺手修掉的缺陷（跟着钉在 intake_incoming_test.go 里）。
+	if inc == nil || (len(inc.Moved) == 0 && len(inc.Kept) == 0) {
+		return inc, false, nil
+	}
+
+	// 搬完必须重建索引，否则新版本在 Release 里但 F-Droid 索引看不见（§3.2 的流程）。
+	if err := RebuildAndCheck(ctx, c); err != nil {
+		return inc, false, err
+	}
+
+	msg := fmt.Sprintf("搬运 _incoming：%d 个 asset", len(inc.Moved))
+	if len(inc.Kept) > 0 {
+		// 把"有东西没安置"写进提交信息：那条留在队列里的 asset 是**现场**，
+		// 而提交信息是它唯一会被人顺手读到的地方（§3.2 不静默丢弃）。
+		msg += fmt.Sprintf("（%d 个未安置，保留待人工）", len(inc.Kept))
+	}
+	committed, err = c.CommitBack(ctx, msg)
+	return inc, committed, err
+}
+
+// moveIncoming 搬 `_incoming` 的 asset 到各自的正式 Release，然后清场。
+//
+// ⚠️ **刻意不导出。** 它只做了这个功能的**前半段**：搬完不重建索引、不回写，
+// 于是新版本进了 Release 却在索引里看不见。从前它是导出的 `IntakeIncoming`，
+// 结果两个调用方各自补了后半段、还补得不一样（一个漏了空队列守卫）。现在唯一的
+// 门是上面那个同名的导出函数，想绕开它得多写一个 `//export` 不可。
 //
 // # 谁来叫它
 //
-// **显式触发，没有"自动"这回事**（§3.2）：人传完文件点一次手动按钮（`store` 的
-// `forward-to-forge` 或 `forge` 的 `on-dispatch`，两者等效 —— 前者转发一手），或让 CI
-// 发一个 repository_dispatch。队列**不经过"发布"这个动作** —— 它是常驻 draft，而 draft
+// **显式触发，没有"自动"这回事**（§3.2）：人传完文件点一次手动按钮
+// （`store` 的 `intake-incoming.yml`，或 `forge` 的同名文件，两者等效 —— 前者转发一手），
+// 或让 CI 发一个 `repository_dispatch: intake-incoming`。队列**不经过"发布"这个动作** —— 它是常驻 draft，而 draft
 // 不会产生任何 `release` 事件，往它上传/改名/删 asset 也不产生（§3.3）。所以
 // "上传之后什么都没发生"是**设计**，不是故障；这一节存在的意义就是把这句话钉在
 // 读代码的人眼前，免得下一个人又去接一个永远不会响的钩子。
@@ -532,7 +576,7 @@ type IncomingResult struct {
 // 删除是单向的：删掉就没了，而"这个 asset 有别的问题"正是最需要人来看一眼的情况。
 // 所以本函数只删除**确认已安置**的 asset，其余的原样留在 `_incoming` 里并逐个
 // 说明原因（§3.2：不静默丢弃）。
-func IntakeIncoming(ctx context.Context, c *Ctx) (res *IncomingResult, err error) {
+func moveIncoming(ctx context.Context, c *Ctx) (res *IncomingResult, err error) {
 	if err := c.Env.RequireToken("搬运 _incoming"); err != nil {
 		return nil, err
 	}
@@ -864,8 +908,12 @@ func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int
 		//
 		// `release` 事件跑的是 tag 所指提交上的 workflow，而引用一旦建立就不再移动
 		// （详见 gh.DeleteTagRef 的说明）。留着它，下一次 Publish 就会拿一份旧的
-		// forward.yml 去解析触发器 —— 默认分支上怎么改都看不见。删掉它，Publish 会在
-		// 当时的默认分支 HEAD 上重建，队列这条路才跟得上默认分支。
+		// `intake-incoming.yml` 去解析触发器 —— 默认分支上怎么改都看不见。删掉它，
+		// Publish 会在当时的默认分支 HEAD 上重建，队列这条路才跟得上默认分支。
+		//
+		// 本轮的拆工作流正好踩在这条上：store 那边的入口从 forward.yml 改成了
+		// intake-incoming.yml，而这份改动**只有等这个引用被删过一次**才会在这条路上
+		// 生效。所以灰度期间旧的 on-dispatch.yml 要留到确认引用刷过之后再删。
 		//
 		// 位置的两条约束：在 Unpublish **之后**（之前 Release 还挂在这个引用上，删引用
 		// 等于把现场拆了），且只在 Unpublish 成功时删（失败就说明队列还是 published 的，
@@ -874,7 +922,7 @@ func (c *Ctx) cleanIncoming(ctx context.Context, rel *gh.Release, movedIDs []int
 		// 删不掉不让整次搬运失败 —— 与下面删 asset 同一条理由：内容已经安顿好了，
 		// 剩下的是"下次 Publish 可能仍旧跑不动"，而那是下一次的事。
 		if err := c.GH.DeleteTagRef(ctx, c.Env.StoreRepo, model.IncomingTag); err != nil {
-			c.Log("删除 `%s` 的 tag 引用失败：下一次 Publish 可能仍旧解析到旧的 forward.yml"+
+			c.Log("删除 `%s` 的 tag 引用失败：下一次 Publish 可能仍旧解析到旧的 intake-incoming.yml"+
 				"（症状是「Publish 了却没反应」）：%v", model.IncomingTag, err)
 		}
 	}

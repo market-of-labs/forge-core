@@ -95,7 +95,7 @@ func Reconcile(ctx context.Context, c *Ctx, opts ReconcileOptions) (*ReconcileRe
 	}
 
 	if opts.DryRun {
-		c.Log("[dry-run] 到此为止：不重建索引、不重建清单、不回写")
+		c.Log("[dry-run] 到此为止：不重建账本、不重建索引、不回写")
 		return res, nil
 	}
 

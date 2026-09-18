@@ -112,9 +112,9 @@ func BuildIndex(ctx context.Context, c *Ctx) (*model.Report, error) {
 			//
 			// 这不丢东西：移除一个来源只删文件，Release 与它的 asset 按 D13 全保留，
 			// 重新收录之后下一次 build-index 会把它们再认回来。但仍然要说一声，
-			// 免得有人以为清单漏了。
+			// 免得有人以为索引漏了。
 			rep.Warnf(id, "Release 里有它的 asset，但 sources/ 里没有这个条目：账本无处可写，"+
-				"清单也不会收录它。若这是刚被「移除」的来源，属正常（D13 全保留，资产不删）")
+				"索引里也不会出现它。若这是刚被「移除」的来源，属正常（D13 全保留，资产不删）")
 			continue
 		}
 		versions, appRep, err := buildLedger(src, byApp[id])
@@ -235,7 +235,7 @@ func buildLedger(src *model.Source, groups []assetGroup) ([]model.Version, *mode
 			v.UpstreamTag = oldVer.UpstreamTag
 			// releaseNote 同属这一串：它只在上游的 Release 里，我们自己的 Release 元数据
 			// 里没有 —— 忘了继承，症状是"每轮重建之后更新说明就没了"，而且是静默的
-			// （清单照样合法、check-manifest 照样过）。
+			// （自检照样过 —— `check-repo` 读回的是索引，看不见账本里的更新说明）。
 			v.ReleaseNote = oldVer.ReleaseNote
 		}
 
@@ -250,8 +250,15 @@ func buildLedger(src *model.Source, groups []assetGroup) ([]model.Version, *mode
 				"下一轮对账会重新镜像一遍并把元数据填回来（重读上游 APK），更老的版本不会", it.version)
 		}
 		if v.VersionCode == 0 {
-			rep.Warnf(id, "版本 %s 没解析出 versionCode：清单会缺该字段，check-manifest 将判**失败**（规则 6），"+
-				"而这一轮的回写会连同**别的应用**一起放弃。它要么来自「上传成功但账本没落盘」"+
+			// ⚠️ 这条告警**不承诺任何后续的硬失败**（它从前承诺过：那时 versionCode 写进
+			// 清单，由 check-manifest 的规则 6 判。D58 之后清单没有了，索引里的 versionCode
+			// 是 fdroidserver 从真实 APK **现读**的 —— 账本根本不参与渲染，见 fdroid.Render）
+			// ⇒ 自检（`check-repo`）对账本里的这个缺口是**看不见**的，它只认索引里那份
+			// （repo.go 那条 `VersionCode <= 0` 查的正是索引）。所以这是一条**只有人看得见**
+			// 的告警，措辞里不要把"哪天有东西会替你红一下"写进去。
+			rep.Warnf(id, "版本 %s 没解析出 versionCode：账本里这一条缺那个字段（02 §2.4），"+
+				"而那是个**没有下游会替你报**的缺口（索引里的值由 fdroidserver 从 APK 现读）。"+
+				"它要么来自「上传成功但账本没落盘」"+
 				"（最新的那个版本下一轮镜像会补回），要么来自上游那个 APK 里真的没有 versionCode"+
 				"（不会自己好：得改 sources/%s.json 那条记录，或回滚它 —— 改完要点一次 store 的"+
 				"`reconcile.yml` 手动按钮才会重算。人手改 sources/ 不再自动触发：那条 push "+

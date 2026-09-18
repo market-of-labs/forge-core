@@ -11,7 +11,8 @@ import (
 //
 // 账本是**每次对账整段重写**的，而 releaseNote 只在上游的 Release 里（我们自己的
 // Release 正文放的是 README）—— 忘了从旧账本继承，症状是"每轮对账之后更新说明就没了"，
-// 而且是静默的：清单照样合法、check-manifest 照样过。同一个坑 publishedAt 踩过一次。
+// 而且是静默的：自检照样过（`check-repo` 读回的是索引，看不见账本里的更新说明）。
+// 同一个坑 publishedAt 踩过一次。
 func TestBuildLedgerKeepsReleaseNote(t *testing.T) {
 	const note = "修了三个 bug，另加 arm64 分片"
 	src := &model.Source{

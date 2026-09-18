@@ -389,4 +389,3 @@ func TestLandedReply(t *testing.T) {
 		t.Errorf("来源确实落盘了，回评不能改口说没收录：\n%s", bad)
 	}
 }
-
